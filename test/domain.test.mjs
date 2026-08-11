@@ -14,8 +14,9 @@ test("task state machine rejects an unsafe jump", () => {
   assert.throws(() => assertTransition("queued", "done"), /Invalid task transition/);
 });
 
-test("roles lead to appropriate automated and human workflow states", () => {
-  assert.equal(finalStatusForRole("planner"), "awaiting_human");
+test("roles complete automatically by default and retain manual workflow states when requested", () => {
+  assert.equal(finalStatusForRole("planner"), "done");
+  assert.equal(finalStatusForRole("planner", { autonomous: false }), "awaiting_human");
   assert.equal(finalStatusForRole("backend"), "done");
   assert.equal(finalStatusForRole("qa"), "done");
   assert.equal(finalStatusForRole("security"), "done");
