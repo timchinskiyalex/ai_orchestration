@@ -700,7 +700,17 @@ export class SwarmRouter extends EventEmitter {
       overlayContext = await this.#refreshProjectOverlayFromWorktree(worktree);
       const missingRoots = (overlayContext.overlay.components ?? []).filter((component) => component.state !== "scaffolded").map((component) => component.root);
       if (!missingRoots.length) return { overlayContext, resultText };
-      if (attempt === maxRepairTurns) throw new Error(`Scaffold incomplete after ${maxRepairTurns} corrective turns: required product roots are still unscaffolded: ${missingRoots.join(", ")}`);
+      if (attempt === maxRepairTurns) {
+        this.#lifecycle("deterministic scaffold fallback started", { taskId: task.id, missingRoots });
+        await this.#provisionMissingScaffoldRoots(worktree, missingRoots);
+        overlayContext = await this.#refreshProjectOverlayFromWorktree(worktree);
+        const remainingRoots = (overlayContext.overlay.components ?? []).filter((component) => component.state !== "scaffolded").map((component) => component.root);
+        if (!remainingRoots.length) {
+          this.#lifecycle("deterministic scaffold fallback completed", { taskId: task.id, roots: missingRoots });
+          return { overlayContext, resultText: "Controller provisioned the remaining declared product roots with allowlisted stack adapters." };
+        }
+        throw new Error(`Scaffold incomplete after ${maxRepairTurns} corrective turns and deterministic fallback: ${remainingRoots.join(", ")}`);
+      }
       this.#lifecycle("scaffold completion retry", { taskId: task.id, threadId, attempt: attempt + 1, missingRoots });
       const retry = await client.startTurn({
         threadId,
@@ -720,6 +730,33 @@ export class SwarmRouter extends EventEmitter {
       if (watched.overlayContext) overlayContext = watched.overlayContext;
     }
     throw new Error("Scaffold completion retry loop terminated unexpectedly");
+  }
+
+  async #provisionMissingScaffoldRoots(worktree, missingRoots) {
+    const configured = new Map((this.config.project.productRoots ?? []).map((component) => [component.path, component]));
+    for (const root of missingRoots) {
+      const component = configured.get(root);
+      if (!component) throw new Error(`No allowlisted scaffold adapter is configured for '${root}'`);
+      if (component.adapter === "next-node") {
+        const npx = process.platform === "win32" ? "npx.cmd" : "npx";
+        await exec(npx, ["create-next-app@latest", root, "--ts", "--eslint", "--app", "--src-dir", "--use-npm", "--yes"], { cwd: worktree, timeout: 300_000, windowsHide: true });
+        const packagePath = join(worktree, root, "package.json");
+        const packageJson = JSON.parse(readFileSync(packagePath, "utf8"));
+        packageJson.scripts ??= {};
+        packageJson.scripts.test ??= "node --test";
+        writeFileSync(packagePath, `${JSON.stringify(packageJson, null, 2)}\n`, "utf8");
+      } else if (component.adapter === "dotnet") {
+        const projectName = String(component.id ?? "Product").replace(/[^A-Za-z0-9]/g, "") || "Product";
+        const solutionPath = join(root, `${projectName}.sln`);
+        const apiPath = join(root, "src", `${projectName}.Api`);
+        const testPath = join(root, "tests", `${projectName}.Api.Tests`);
+        await exec("dotnet", ["new", "sln", "--name", projectName, "--output", root], { cwd: worktree, timeout: 120_000, windowsHide: true });
+        await exec("dotnet", ["new", "webapi", "--name", `${projectName}.Api`, "--output", apiPath, "--no-https"], { cwd: worktree, timeout: 180_000, windowsHide: true });
+        await exec("dotnet", ["new", "xunit", "--name", `${projectName}.Api.Tests`, "--output", testPath], { cwd: worktree, timeout: 180_000, windowsHide: true });
+        await exec("dotnet", ["sln", solutionPath, "add", join(apiPath, `${projectName}.Api.csproj`), join(testPath, `${projectName}.Api.Tests.csproj`)], { cwd: worktree, timeout: 120_000, windowsHide: true });
+        await exec("dotnet", ["add", join(testPath, `${projectName}.Api.Tests.csproj`), "reference", join(apiPath, `${projectName}.Api.csproj`)], { cwd: worktree, timeout: 120_000, windowsHide: true });
+      } else throw new Error(`No production scaffold adapter for '${component.adapter}' at '${root}'`);
+    }
   }
 
   async #waitForScaffoldTurn(client, task, threadId, turnId, worktree) {
