@@ -6,6 +6,10 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { StateStore } from "../src/state-store.mjs";
 
+function createDelivery(store, id, ownerSessionId = "session-a") {
+  return store.createDeliveryRun({ id, ownerPid: 4242, ownerSessionId });
+}
+
 test("state store claims, transitions and records usage", () => {
   const dir = mkdtempSync(join(tmpdir(), "codex-swarm-store-"));
   const store = new StateStore(join(dir, "state.sqlite"));
@@ -95,4 +99,32 @@ test("read-only status remains available for a pre-migration runtime database", 
     reader = new StateStore(path, { readOnly: true });
     assert.equal(reader.weeklyUsageSince("2000-01-01T00:00:00.000Z").used, 0);
   } finally { reader?.close(); try { legacy.close(); } catch {} rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("delivery lease is compare-and-set and preserves a fresh owner", () => {
+  const dir = mkdtempSync(join(tmpdir(), "codex-swarm-delivery-lease-")); const store = new StateStore(join(dir, "state.sqlite"));
+  try {
+    createDelivery(store, "run-a", "session-a");
+    assert.throws(() => store.claimDeliveryLease("run-a", { ownerPid: 5252, ownerSessionId: "session-b" }), /Delivery already owned/);
+    const run = store.deliveryRun("run-a");
+    assert.equal(run.ownerPid, 4242);
+    assert.equal(run.ownerSessionId, "session-a");
+  } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("atomic delivery creation records the initial lease and permits only one active run", () => {
+  const dir = mkdtempSync(join(tmpdir(), "codex-swarm-delivery-create-")); const path = join(dir, "state.sqlite");
+  const first = new StateStore(path); const second = new StateStore(path);
+  try {
+    const run = createDelivery(first, "run-a", "session-a");
+    assert.equal(run.ownerSessionId, "session-a");
+    assert.ok(run.heartbeatAt);
+    assert.throws(() => createDelivery(second, "run-b", "session-b"), /Delivery already owned/);
+    assert.equal(first.db.prepare("SELECT COUNT(*) AS count FROM delivery_runs WHERE state = 'running'").get().count, 1);
+    assert.deepEqual(first.recoverStaleDeliveryRuns({ staleAfterMs: 60_000, isProcessAlive: (pid) => pid === 4242 }), []);
+    first.updateDeliveryRun("run-a", { state: "failed" });
+    const terminal = first.deliveryRun("run-a");
+    assert.equal(terminal.ownerPid, null);
+    assert.equal(terminal.ownerSessionId, null);
+  } finally { second.close(); first.close(); rmSync(dir, { recursive: true, force: true }); }
 });

@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import readline from "node:readline";
 import { appServerInvocation } from "./app-server-invocation.mjs";
+import { terminateProcessTree } from "./managed-process-runner.mjs";
 
 const TRACE_LIMIT = 100;
 const STDERR_LIMIT = 4_000;
@@ -59,7 +60,7 @@ function safeEvent({ direction, message = {}, extra = {} }) {
 }
 
 export class AppServerClient extends EventEmitter {
-  constructor({ cwd, serviceName = "codex-swarm-router", requestTimeoutMs = 30_000, fallbackReadTimeoutMs = 2_500, spawnProcess = spawn, appServerLauncher = appServerInvocation } = {}) {
+  constructor({ cwd, serviceName = "codex-swarm-router", requestTimeoutMs = 30_000, fallbackReadTimeoutMs = 2_500, spawnProcess = spawn, appServerLauncher = appServerInvocation, platform = process.platform, terminate = terminateProcessTree } = {}) {
     super();
     this.cwd = cwd;
     this.serviceName = serviceName;
@@ -67,6 +68,8 @@ export class AppServerClient extends EventEmitter {
     this.fallbackReadTimeoutMs = fallbackReadTimeoutMs;
     this.spawnProcess = spawnProcess;
     this.appServerLauncher = appServerLauncher;
+    this.platform = platform;
+    this.terminate = terminate;
     this.nextId = 1;
     this.pending = new Map();
     this.completedTurns = new Map();
@@ -77,6 +80,7 @@ export class AppServerClient extends EventEmitter {
     this.process = { alive: false, exited: false, code: null, signal: null };
     this.closed = false;
     this.failure = null;
+    this.shutdownPromise = null;
   }
 
   async connect() {
@@ -189,10 +193,16 @@ export class AppServerClient extends EventEmitter {
   }
 
   shutdown() {
-    if (this.closed) return;
+    if (this.shutdownPromise) return this.shutdownPromise;
     this.closed = true;
     this.#fail(new Error("App Server client closed"));
-    if (this.proc && !this.proc.killed) this.proc.kill();
+    const proc = this.proc;
+    // App Server is launched through cmd.exe on Windows. Killing only that
+    // launcher can leave Codex and its server descendants alive, so always
+    // await the full process-tree termination request.
+    this.shutdownPromise = Promise.resolve(this.terminate({ pid: proc?.pid, platform: this.platform, spawnProcess: this.spawnProcess, child: proc }))
+      .catch((error) => ({ attempted: true, error: String(error.message) }));
+    return this.shutdownPromise;
   }
 
   ingestStderr(chunk) {

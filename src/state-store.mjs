@@ -446,12 +446,15 @@ export class StateStore {
     return row ? { path: row.report_path, report: JSON.parse(row.report_json) } : null;
   }
 
-  createDeliveryRun({ id, source = null, bootstrapTaskId = null, confirmRemotePush = false }) {
+  createDeliveryRun({ id, source = null, bootstrapTaskId = null, confirmRemotePush = false, ownerPid, ownerSessionId }) {
+    if (!Number.isInteger(ownerPid) || ownerPid < 1 || typeof ownerSessionId !== "string" || !ownerSessionId) throw new Error("Delivery run requires an initial owner lease");
     const timestamp = now();
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      this.db.prepare("INSERT INTO delivery_runs(id, schema_version, state, source, bootstrap_task_id, confirm_remote_push, created_at, updated_at) VALUES (?, 1, 'running', ?, ?, ?, ?, ?)").run(id, source, bootstrapTaskId, confirmRemotePush ? 1 : 0, timestamp, timestamp);
-      this.#insertEvent(bootstrapTaskId, "delivery/created", { deliveryRunId: id, confirmRemotePush: Boolean(confirmRemotePush) });
+      const active = this.db.prepare("SELECT id FROM delivery_runs WHERE state IN ('running','awaiting_human','awaiting_human_remote_handoff') LIMIT 1").get();
+      if (active) throw new Error(`Delivery already owned by active run: ${active.id}`);
+      this.db.prepare("INSERT INTO delivery_runs(id, schema_version, state, source, bootstrap_task_id, confirm_remote_push, owner_pid, owner_session_id, heartbeat_at, created_at, updated_at) VALUES (?, 1, 'running', ?, ?, ?, ?, ?, ?, ?, ?)").run(id, source, bootstrapTaskId, confirmRemotePush ? 1 : 0, ownerPid, ownerSessionId, timestamp, timestamp, timestamp);
+      this.#insertEvent(bootstrapTaskId, "delivery/created", { deliveryRunId: id, confirmRemotePush: Boolean(confirmRemotePush), ownerPid, ownerSessionId, heartbeatAt: timestamp });
       this.db.exec("COMMIT");
     } catch (error) { this.db.exec("ROLLBACK"); throw error; }
     return this.deliveryRun(id);
@@ -472,7 +475,12 @@ export class StateStore {
     const next = { state: state ?? current.state, integrationPath: integrationPath ?? current.integrationPath, publish: publish ?? current.publish, confirmRemotePush: confirmRemotePush ?? current.confirmRemotePush };
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      this.db.prepare("UPDATE delivery_runs SET state = ?, integration_path = ?, publish_json = ?, confirm_remote_push = ?, updated_at = ? WHERE id = ?").run(next.state, next.integrationPath, next.publish ? JSON.stringify(next.publish) : null, next.confirmRemotePush ? 1 : 0, now(), id);
+      const terminal = !["running", "awaiting_human", "awaiting_human_remote_handoff"].includes(next.state);
+      if (!terminal) {
+        const active = this.db.prepare("SELECT id FROM delivery_runs WHERE state IN ('running','awaiting_human','awaiting_human_remote_handoff') AND id != ? LIMIT 1").get(id);
+        if (active) throw new Error(`Delivery already owned by active run: ${active.id}`);
+      }
+      this.db.prepare("UPDATE delivery_runs SET state = ?, integration_path = ?, publish_json = ?, confirm_remote_push = ?, owner_pid = CASE WHEN ? THEN NULL ELSE owner_pid END, owner_session_id = CASE WHEN ? THEN NULL ELSE owner_session_id END, heartbeat_at = CASE WHEN ? THEN NULL ELSE heartbeat_at END, updated_at = ? WHERE id = ?").run(next.state, next.integrationPath, next.publish ? JSON.stringify(next.publish) : null, next.confirmRemotePush ? 1 : 0, terminal ? 1 : 0, terminal ? 1 : 0, terminal ? 1 : 0, now(), id);
       this.#insertEvent(current.bootstrapTaskId, "delivery/state", { deliveryRunId: id, state: next.state, confirmRemotePush: next.confirmRemotePush });
       this.db.exec("COMMIT");
     } catch (error) { this.db.exec("ROLLBACK"); throw error; }
@@ -481,10 +489,13 @@ export class StateStore {
 
   claimDeliveryLease(id, { ownerPid, ownerSessionId }) {
     const timestamp = now();
-    const current = this.deliveryRun(id); if (!current) throw new Error(`Delivery run not found: ${id}`);
+    if (!Number.isInteger(ownerPid) || ownerPid < 1 || typeof ownerSessionId !== "string" || !ownerSessionId) throw new Error("Delivery lease requires owner pid and session");
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      this.db.prepare("UPDATE delivery_runs SET owner_pid = ?, owner_session_id = ?, heartbeat_at = ?, updated_at = ? WHERE id = ?").run(ownerPid, ownerSessionId, timestamp, timestamp, id);
+      const current = this.deliveryRun(id); if (!current) throw new Error(`Delivery run not found: ${id}`);
+      if (!["running", "awaiting_human", "awaiting_human_remote_handoff"].includes(current.state)) throw new Error(`Delivery run is terminal: ${id}`);
+      if (current.ownerSessionId && current.ownerSessionId !== ownerSessionId) throw new Error(`Delivery already owned: ${id}`);
+      this.db.prepare("UPDATE delivery_runs SET owner_pid = ?, owner_session_id = ?, heartbeat_at = ?, updated_at = ? WHERE id = ? AND (owner_session_id IS NULL OR owner_session_id = ?)").run(ownerPid, ownerSessionId, timestamp, timestamp, id, ownerSessionId);
       this.#insertEvent(current.bootstrapTaskId, "delivery/lease-claimed", { deliveryRunId: id, ownerPid, ownerSessionId, heartbeatAt: timestamp });
       this.db.exec("COMMIT");
     } catch (error) { this.db.exec("ROLLBACK"); throw error; }

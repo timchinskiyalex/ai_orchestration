@@ -241,3 +241,36 @@ test("shutdown settles a pending turn waiter", async () => {
   client.shutdown();
   await assert.rejects(waiting, /App Server client closed/);
 });
+
+test("Windows shutdown terminates the launcher process tree exactly once and clears RPC and turn waiters", async () => {
+  const calls = [];
+  const client = new AppServerClient({
+    cwd: process.cwd(), platform: "win32",
+    spawnProcess(command, args, options) {
+      calls.push({ command, args, options });
+      const killer = new EventEmitter();
+      killer.kill = () => {};
+      queueMicrotask(() => killer.emit("close", 0, null));
+      return killer;
+    }
+  });
+  client.proc = { pid: 8123, stdin: { writable: true, write() { return true; } } };
+  client.process.alive = true;
+  const request = client.request("thread/start", {});
+  const waiting = client.waitForTurn("thread-1", "turn-1", 60_000);
+  const first = client.shutdown();
+  const second = client.shutdown();
+  assert.equal(first, second);
+  await first;
+  await assert.rejects(request, /App Server client closed/);
+  await assert.rejects(waiting, /App Server client closed/);
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0].args, ["/PID", "8123", "/T", "/F"]);
+  assert.equal(calls[0].command, "taskkill");
+  assert.equal(calls[0].options.shell, false);
+  assert.equal(client.pending.size, 0);
+  assert.equal(client.awaitedTurnsByThread.size, 0);
+  assert.equal(client.listenerCount("notification"), 0);
+  assert.equal(client.listenerCount("fatal"), 0);
+  assert.equal(client.listenerCount("exit"), 0);
+});
