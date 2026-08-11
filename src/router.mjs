@@ -178,6 +178,7 @@ export class SwarmRouter extends EventEmitter {
       activeTurns: tasks.filter((task) => task.status === "running").map((task) => ({ taskId: task.id, threadId: task.threadId, turnId: task.turnId })),
       realConcurrency: tasks.filter((task) => task.status === "running").length,
       localBudget: readiness.localBudget,
+      localBudgetEnforcement: this.#enforcesLocalBudget() ? "enforced" : "tracking_only",
       localForecast: readiness.localForecast,
       appServerQuotaWindows: readiness.accountQuota.quotaWindows ?? [],
       quotaThrottle: readiness.quotaThrottle,
@@ -195,7 +196,8 @@ export class SwarmRouter extends EventEmitter {
     const usedPercent = Number(((usage.used / limit) * 100).toFixed(2));
     const projectedPercent = Number((((usage.used + usage.estimate) / limit) * 100).toFixed(2));
     return {
-      label: `local rolling ${this.config.budget.weeklyWindowDays}-day budget`, windowStartedAt: since, weeklyTokenLimit: limit, usedTokens: usage.used,
+      label: `local rolling ${this.config.budget.weeklyWindowDays}-day ${this.#enforcesLocalBudget() ? "budget" : "usage tracking"}`, windowStartedAt: since, weeklyTokenLimit: limit, usedTokens: usage.used,
+      enforcement: this.#enforcesLocalBudget() ? "enforced" : "tracking_only",
       usedPercent, plannedTokens: usage.estimate, reservedTokens: usage.reserved,
       projectedTokens: usage.used + usage.estimate,
       projectedPercent, remainingTokens: Math.max(0, limit - usage.used),
@@ -446,7 +448,7 @@ export class SwarmRouter extends EventEmitter {
   async #runTask(client, task) {
     const roleConfig = this.config.roles[task.role];
     const localBudget = this.#localBudgetDecision(task);
-    if (!localBudget.allowed) {
+    if (this.#enforcesLocalBudget() && !localBudget.allowed) {
       this.store.transition(task.id, "blocked_budget", { error: `Local scheduler hard cap blocks this task: projected ${localBudget.projected} exceeds ${localBudget.limit}` });
       this.#lifecycle("budget preflight blocked", { taskId: task.id, scope: localBudget.scope, projected: localBudget.projected, limit: localBudget.limit, reservation: task.tokenBudget });
       return;
@@ -455,12 +457,12 @@ export class SwarmRouter extends EventEmitter {
     const rootId = this.#rootId(task);
     const usage = this.store.usageForRoot(rootId);
     const decision = this.governor.canStart({ task, alreadyUsed: usage.used, alreadyReserved: Math.max(0, usage.reserved - task.tokenBudget), parentBudget: this.config.router.defaultParentBudget });
-    if (!decision.allowed) {
+    if (this.#enforcesLocalBudget() && !decision.allowed) {
       this.store.transition(task.id, "blocked_budget", { error: `Projected ${decision.projected} exceeds budget ${decision.budget}` });
       return;
     }
     const runtimeBudget = this.#runtimeBudgetFor(task, localBudget);
-    if (runtimeBudget.interruptThresholdTokens < 1) {
+    if (this.#enforcesLocalBudget() && runtimeBudget.interruptThresholdTokens < 1) {
       this.store.transition(task.id, "blocked_budget", { error: "Local scheduler hard cap leaves no runtime token budget for this task" });
       return;
     }
@@ -617,7 +619,10 @@ export class SwarmRouter extends EventEmitter {
     return { allowed: true, scope: "run", projected: runProjected, limit: hardRunTokenLimit, used: runUsage.used, reservedWithoutCurrent: runReservedWithoutCurrent, weeklyUsed: usage.used, weeklyProjected };
   }
 
+  #enforcesLocalBudget() { return this.config.budget?.enforceLocalLimits === true; }
+
   #runtimeBudgetFor(task, localBudget) {
+    if (!this.#enforcesLocalBudget()) return { interruptThresholdTokens: null, configuredBudgetCap: null };
     const safetyMargin = this.config.budget.interruptSafetyMarginTokens ?? 0;
     const configuredBudgetCap = task.tokenBudget;
     const configuredThreshold = this.config.roles[task.role].interruptThresholdTokens ?? Math.max(1, configuredBudgetCap - safetyMargin);
@@ -882,6 +887,7 @@ export class SwarmRouter extends EventEmitter {
   }
 
   async #enforceUsageBudget(taskId, actualTokens) {
+    if (!this.#enforcesLocalBudget()) return;
     const task = this.store.getTask(taskId);
     if (!task?.threadId || !task.turnId || task.status !== "running") return;
     const threshold = task.interruptThresholdTokens;

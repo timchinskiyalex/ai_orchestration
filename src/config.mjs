@@ -36,6 +36,9 @@ export function loadConfig(configPath) {
   config.budget.weeklyWindowDays ??= 7;
   config.budget.hardRunTokenLimit ??= 200000;
   config.budget.interruptSafetyMarginTokens ??= 12000;
+  // Local numbers are accounting by default. Enabling this is an explicit
+  // emergency policy, not a prerequisite for autonomous delivery.
+  config.budget.enforceLocalLimits ??= false;
   config.quota ??= {};
   config.quota.throttleAtUsedPercent ??= 90;
   config.quota.throttleWhenUnavailable ??= false;
@@ -91,6 +94,7 @@ export function loadConfig(configPath) {
   if (!Number.isInteger(config.budget.weeklyWindowDays) || config.budget.weeklyWindowDays < 1) throw new Error("budget.weeklyWindowDays must be a positive integer");
   if (!Number.isInteger(config.budget.hardRunTokenLimit) || config.budget.hardRunTokenLimit < 1 || config.budget.hardRunTokenLimit > config.budget.weeklyTokenLimit) throw new Error("budget.hardRunTokenLimit must be a positive integer no greater than budget.weeklyTokenLimit");
   if (!Number.isInteger(config.budget.interruptSafetyMarginTokens) || config.budget.interruptSafetyMarginTokens < 0 || config.budget.interruptSafetyMarginTokens >= config.budget.hardRunTokenLimit) throw new Error("budget.interruptSafetyMarginTokens must be a non-negative integer smaller than budget.hardRunTokenLimit");
+  if (typeof config.budget.enforceLocalLimits !== "boolean") throw new Error("budget.enforceLocalLimits must be boolean");
   if (!Number.isInteger(config.quota.throttleAtUsedPercent) || config.quota.throttleAtUsedPercent < 1 || config.quota.throttleAtUsedPercent > 100) throw new Error("quota.throttleAtUsedPercent must be an integer from 1 to 100");
   if (typeof config.quota.throttleWhenUnavailable !== "boolean") throw new Error("quota.throttleWhenUnavailable must be boolean");
   if (!Number.isInteger(config.delivery.maxRemediationRounds) || config.delivery.maxRemediationRounds < 0 || config.delivery.maxRemediationRounds > 10) throw new Error("delivery.maxRemediationRounds must be an integer from 0 to 10");
