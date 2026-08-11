@@ -24,8 +24,17 @@ Start-Process -FilePath 'powershell.exe' -WorkingDirectory $projectRoot -Argumen
 )
 
 function Get-DeliveryStatus {
-  $raw = & node src/index.mjs status --json 2>$null
-  if ($LASTEXITCODE -ne 0) { throw "Could not read delivery status" }
+  # Windows PowerShell can promote Node's harmless experimental SQLite warning
+  # to NativeCommandError when the launcher uses ErrorActionPreference=Stop.
+  $previousErrorActionPreference = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try {
+    $raw = & node src/index.mjs status --json 2>$null
+    $exitCode = $LASTEXITCODE
+  } finally {
+    $ErrorActionPreference = $previousErrorActionPreference
+  }
+  if ($exitCode -ne 0) { throw "Could not read delivery status" }
   return (($raw -join "`n") | ConvertFrom-Json)
 }
 

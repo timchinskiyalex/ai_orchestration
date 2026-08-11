@@ -3,13 +3,14 @@ param(
   [int]$IntervalMs = 1000
 )
 
-$ErrorActionPreference = 'Stop'
+$ErrorActionPreference = 'Continue'
 $projectRoot = Split-Path -Parent $PSScriptRoot
 Set-Location -LiteralPath $projectRoot
 
 while ($true) {
   Clear-Host
-  & node src/index.mjs status --json
+  $raw = & node src/index.mjs status --json 2>$null
   if ($LASTEXITCODE -ne 0) { throw "Could not read autonomous delivery status" }
+  $raw
   Start-Sleep -Milliseconds $IntervalMs
 }
