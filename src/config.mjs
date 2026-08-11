@@ -34,6 +34,8 @@ export function loadConfig(configPath) {
   config.budget ??= {};
   config.budget.weeklyTokenLimit ??= 500000;
   config.budget.weeklyWindowDays ??= 7;
+  config.budget.hardRunTokenLimit ??= 200000;
+  config.budget.interruptSafetyMarginTokens ??= 12000;
   config.quota ??= {};
   config.quota.throttleAtUsedPercent ??= 90;
   config.quota.throttleWhenUnavailable ??= false;
@@ -42,6 +44,9 @@ export function loadConfig(configPath) {
   config.integration.pullRequestExtension ??= null;
   config.delivery ??= {};
   config.delivery.maxRemediationRounds ??= config.autonomy.maxRemediationRounds;
+  config.delivery.leaseHeartbeatMs ??= 5000;
+  config.delivery.staleLeaseMs ??= 30000;
+  config.delivery.shutdownGraceMs ??= 3000;
   config.remote ??= {};
   config.remote.enabled ??= false;
   config.remote.remoteName ??= "origin";
@@ -84,9 +89,12 @@ export function loadConfig(configPath) {
   if (!Number.isInteger(config.router.maxPlanTasks) || config.router.maxPlanTasks < 1) throw new Error("router.maxPlanTasks must be a positive integer");
   if (!Number.isInteger(config.budget.weeklyTokenLimit) || config.budget.weeklyTokenLimit < 1) throw new Error("budget.weeklyTokenLimit must be a positive integer");
   if (!Number.isInteger(config.budget.weeklyWindowDays) || config.budget.weeklyWindowDays < 1) throw new Error("budget.weeklyWindowDays must be a positive integer");
+  if (!Number.isInteger(config.budget.hardRunTokenLimit) || config.budget.hardRunTokenLimit < 1 || config.budget.hardRunTokenLimit > config.budget.weeklyTokenLimit) throw new Error("budget.hardRunTokenLimit must be a positive integer no greater than budget.weeklyTokenLimit");
+  if (!Number.isInteger(config.budget.interruptSafetyMarginTokens) || config.budget.interruptSafetyMarginTokens < 0 || config.budget.interruptSafetyMarginTokens >= config.budget.hardRunTokenLimit) throw new Error("budget.interruptSafetyMarginTokens must be a non-negative integer smaller than budget.hardRunTokenLimit");
   if (!Number.isInteger(config.quota.throttleAtUsedPercent) || config.quota.throttleAtUsedPercent < 1 || config.quota.throttleAtUsedPercent > 100) throw new Error("quota.throttleAtUsedPercent must be an integer from 1 to 100");
   if (typeof config.quota.throttleWhenUnavailable !== "boolean") throw new Error("quota.throttleWhenUnavailable must be boolean");
   if (!Number.isInteger(config.delivery.maxRemediationRounds) || config.delivery.maxRemediationRounds < 0 || config.delivery.maxRemediationRounds > 10) throw new Error("delivery.maxRemediationRounds must be an integer from 0 to 10");
+  for (const key of ["leaseHeartbeatMs", "staleLeaseMs", "shutdownGraceMs"]) if (!Number.isInteger(config.delivery[key]) || config.delivery[key] < 250) throw new Error(`delivery.${key} must be an integer of at least 250`);
   if (config.autonomy.mode === "autonomous" && config.delivery.maxRemediationRounds !== config.autonomy.maxRemediationRounds) throw new Error("delivery.maxRemediationRounds must match autonomy.maxRemediationRounds in autonomous mode");
   if (typeof config.remote.enabled !== "boolean" || typeof config.remote.requireCi !== "boolean") throw new Error("remote.enabled and remote.requireCi must be boolean");
   if (typeof config.remote.remoteName !== "string" || !Array.isArray(config.remote.allowedRemotes) || !config.remote.allowedRemotes.every((item) => typeof item === "string") || !config.remote.allowedRemotes.includes(config.remote.remoteName)) throw new Error("remote.remoteName must be included in remote.allowedRemotes");
@@ -100,6 +108,8 @@ export function loadConfig(configPath) {
     if (!config.roles?.[role]) throw new Error(`Missing role configuration: ${role}`);
     const roleConfig = config.roles[role];
     if (!Number.isInteger(roleConfig.tokenBudget) || roleConfig.tokenBudget < 1) throw new Error(`roles.${role}.tokenBudget must be positive`);
+    roleConfig.interruptThresholdTokens ??= Math.max(1, roleConfig.tokenBudget - config.budget.interruptSafetyMarginTokens);
+    if (!Number.isInteger(roleConfig.interruptThresholdTokens) || roleConfig.interruptThresholdTokens < 1 || roleConfig.interruptThresholdTokens > roleConfig.tokenBudget) throw new Error(`roles.${role}.interruptThresholdTokens must be an integer from 1 to roles.${role}.tokenBudget`);
     if (!["read-only", "workspace-write"].includes(roleConfig.sandbox)) throw new Error(`roles.${role}.sandbox must be read-only or workspace-write`);
     if (roleConfig.approvalPolicy !== "never") throw new Error(`roles.${role}.approvalPolicy must be never`);
     if (roleConfig.sandbox === "workspace-write" && roleConfig.usesWorktree !== true) throw new Error(`roles.${role}.workspace-write requires usesWorktree=true`);

@@ -6,6 +6,7 @@ param(
 $ErrorActionPreference = 'Continue'
 $projectRoot = Split-Path -Parent $PSScriptRoot
 Set-Location -LiteralPath $projectRoot
+$env:NODE_NO_WARNINGS = '1'
 
 while ($true) {
   Clear-Host

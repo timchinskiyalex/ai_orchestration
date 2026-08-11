@@ -7,6 +7,7 @@ $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $source = Join-Path $projectRoot 'docs\project-specifications'
 $watchScript = Join-Path $PSScriptRoot 'watch-delivery.ps1'
+$env:NODE_NO_WARNINGS = '1'
 
 if (-not (Test-Path -LiteralPath $source -PathType Container)) { throw "Project documentation directory is missing: $source" }
 
@@ -38,18 +39,24 @@ function Get-DeliveryStatus {
   return (($raw -join "`n") | ConvertFrom-Json)
 }
 
+Write-Host "Checking stale delivery leases before starting."
+$recovery = & node src/index.mjs recover
+if ($LASTEXITCODE -ne 0) { throw "Could not recover stale delivery state" }
+if ($recovery) { Write-Host ($recovery -join "`n") }
+
 $status = Get-DeliveryStatus
-$terminal = @('completed_merged', 'failed', 'blocked_budget', 'blocked_quota', 'blocked_credentials', 'blocked_ci', 'blocked_branch_protection', 'conflict_blocked')
+$terminal = @('completed_merged', 'failed', 'interrupted', 'blocked_budget', 'blocked_quota', 'blocked_credentials', 'blocked_ci', 'blocked_branch_protection', 'conflict_blocked')
 $resume = $status.deliveryRun -and -not ($terminal -contains $status.deliveryRun.state)
 $deliveryArgs = @('src/index.mjs', 'deliver')
 if ($resume) { $deliveryArgs += '--resume' } else { $deliveryArgs += @('--source', $source) }
 
-Write-Host "Live monitor opened in a separate PowerShell window. Starting autonomous delivery."
+Write-Host "Live monitor opened in a separate PowerShell window. Main window will print stage and budget progress. Starting autonomous delivery."
 & node @deliveryArgs
 if ($LASTEXITCODE -ne 0) { throw "Delivery command failed with exit code $LASTEXITCODE" }
 
 $final = Get-DeliveryStatus
 if (-not $final.deliveryRun) { throw "Delivery state was not found after execution" }
 Write-Host "Delivery state: $($final.deliveryRun.state)"
+if ($final.deliveryRun.state -eq 'interrupted') { Write-Host "Ctrl+C or controller exit was recovered. Thread/turn/token history remains in runtime state." }
 if ($final.deliveryRun.state -notin $terminal) { throw "Delivery ended without a machine-readable terminal state: $($final.deliveryRun.state)" }
 if ($final.deliveryRun.state -ne 'completed_merged') { exit 1 }

@@ -1,19 +1,20 @@
 export const ENGINEERING_DOMAINS = new Set(["backend", "frontend", "database", "qa", "security", "devops"]);
 export const ROLES = new Set(["bootstrap", "planner", ...ENGINEERING_DOMAINS]);
 
-export const TERMINAL_STATUSES = new Set(["done", "failed", "cancelled"]);
+export const TERMINAL_STATUSES = new Set(["done", "failed", "cancelled", "blocked_budget", "interrupted"]);
 
 const transitions = {
-  queued: new Set(["preparing", "awaiting_human", "cancelled", "blocked_budget"]),
-  preparing: new Set(["running", "failed", "cancelled", "blocked_budget"]),
-  running: new Set(["awaiting_approval", "awaiting_review", "awaiting_human", "done", "failed", "cancelled", "blocked_budget"]),
-  awaiting_approval: new Set(["queued", "cancelled", "failed"]),
-  awaiting_review: new Set(["queued", "awaiting_human", "done", "failed", "cancelled"]),
-  awaiting_human: new Set(["queued", "done", "failed", "cancelled"]),
-  blocked_budget: new Set(["queued", "cancelled"]),
+  queued: new Set(["preparing", "awaiting_human", "cancelled", "blocked_budget", "interrupted"]),
+  preparing: new Set(["running", "failed", "cancelled", "blocked_budget", "interrupted"]),
+  running: new Set(["awaiting_approval", "awaiting_review", "awaiting_human", "done", "failed", "cancelled", "blocked_budget", "interrupted"]),
+  awaiting_approval: new Set(["queued", "cancelled", "failed", "interrupted"]),
+  awaiting_review: new Set(["queued", "awaiting_human", "done", "failed", "cancelled", "interrupted"]),
+  awaiting_human: new Set(["queued", "done", "failed", "cancelled", "interrupted"]),
+  blocked_budget: new Set(["queued", "cancelled", "interrupted"]),
   failed: new Set(["queued", "cancelled"]),
   done: new Set(),
-  cancelled: new Set()
+  cancelled: new Set(),
+  interrupted: new Set()
 };
 
 export function assertRole(role) {

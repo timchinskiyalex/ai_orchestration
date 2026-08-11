@@ -61,6 +61,12 @@ export class SwarmRouter extends EventEmitter {
     this.lifecycleTrace = [];
     this.lastAppServerDiagnostics = null;
     this.lifecyclePath = join(config.runtimeDir, "lifecycle.jsonl");
+    this.activeDeliveryRunId = null;
+    this.activeDeliverySessionId = null;
+    this.stopRequested = false;
+    this.expectedClientShutdown = false;
+    this.budgetInterruptedTasks = new Set();
+    this.activeTurns = new Map();
   }
 
   init() {
@@ -74,6 +80,46 @@ export class SwarmRouter extends EventEmitter {
     if (this.activeClient) this.lastAppServerDiagnostics = this.activeClient.diagnostics();
     this.activeClient?.shutdown();
   }
+
+  async requestShutdown(reason = "interrupted_controller_exit") {
+    if (this.stopRequested) return;
+    this.stopRequested = true;
+    const client = this.activeClient;
+    const active = [...this.activeTurns.values()];
+    this.#lifecycle("controller shutdown requested", { reason, activeTurns: active.map(({ taskId, threadId, turnId }) => ({ taskId, threadId, turnId })) });
+    if (client) {
+      await Promise.race([
+        Promise.allSettled(active.map(({ threadId, turnId }) => client.interruptTurn({ threadId, turnId }))),
+        new Promise((resolve) => setTimeout(resolve, this.config.delivery?.shutdownGraceMs ?? 3_000))
+      ]);
+    }
+    this.#markInterrupted(reason, { activeTurns: active.map(({ taskId, threadId, turnId }) => ({ taskId, threadId, turnId })) });
+    client?.shutdown();
+  }
+
+  #markInterrupted(reason, recovery = {}) {
+    if (!this.activeDeliveryRunId) {
+      for (const active of this.activeTurns.values()) {
+        const task = this.store.getTask(active.taskId);
+        if (task?.status === "running") this.store.transition(task.id, "interrupted", { error: reason });
+      }
+      return null;
+    }
+    const run = this.store.deliveryRun(this.activeDeliveryRunId);
+    if (run && !["interrupted", "completed_merged", "failed", "blocked_budget", "blocked_quota", "blocked_credentials", "blocked_ci", "blocked_branch_protection", "conflict_blocked"].includes(run.state)) return this.store.interruptDeliveryRun(run.id, { reason, recovery });
+    return run;
+  }
+
+  recoverStaleDeliveries() {
+    const staleAfterMs = this.config.delivery?.staleLeaseMs ?? 30_000;
+    const recovered = this.store.recoverStaleDeliveryRuns({ staleAfterMs, isProcessAlive: (pid) => {
+      try { process.kill(pid, 0); return true; } catch { return false; }
+    } });
+    for (const run of recovered) this.#lifecycle("stale delivery recovered", { deliveryRunId: run.id, state: run.state, recovery: run.recovery });
+    return recovered;
+  }
+
+  activateDeliveryRun(runId) { this.activeDeliveryRunId = runId; }
 
   lifecycleEvents() { return [...this.lifecycleTrace]; }
 
@@ -97,7 +143,7 @@ export class SwarmRouter extends EventEmitter {
     return { task, threadRead, ...this.appServerDiagnostics() };
   }
 
-  enqueue({ role, title, prompt, parentTaskId = null, allowedPaths = [], acceptanceChecks = [], dependencies = [], estimatedTokens = null, humanApprovalRequired = false, riskFlags = [], supportingDomains = [], artifactBaseSha = null, artifactDependencies = [], remediationRound = 0, sourceWriterTaskId = null }) {
+  enqueue({ role, title, prompt, parentTaskId = null, allowedPaths = [], acceptanceChecks = [], dependencies = [], estimatedTokens = null, humanApprovalRequired = false, riskFlags = [], supportingDomains = [], artifactBaseSha = null, artifactDependencies = [], remediationRound = 0, sourceWriterTaskId = null, deliveryRunId = this.activeDeliveryRunId }) {
     assertRole(role);
     if (!title?.trim() || !prompt?.trim()) throw new Error("title and prompt are required");
     const roleConfig = this.config.roles[role];
@@ -108,7 +154,7 @@ export class SwarmRouter extends EventEmitter {
     return this.store.createTask({
       id: randomUUID(), parentTaskId, role, title: title.trim(), prompt: prompt.trim(),
       allowedPaths, acceptanceChecks, dependencies, humanApprovalRequired, estimatedTokens: estimate, tokenBudget: roleConfig.tokenBudget, maxAttempts: 1,
-      riskFlags, supportingDomains, artifactBaseSha, artifactDependencies, remediationRound, sourceWriterTaskId
+      riskFlags, supportingDomains, artifactBaseSha, artifactDependencies, remediationRound, sourceWriterTaskId, deliveryRunId
     });
   }
 
@@ -122,7 +168,7 @@ export class SwarmRouter extends EventEmitter {
     return {
       schemaVersion: 1,
       generatedAt: new Date().toISOString(),
-      tasks: tasks.map((task) => ({ id: task.id, title: task.title, role: task.role, status: task.status, dependencies: task.dependencies, blocker: task.error ?? null, tokenUsed: task.tokenUsed, estimatedTokens: task.estimatedTokens, threadId: task.threadId, turnId: task.turnId, worktree: task.worktree, remediationRound: task.remediationRound })),
+      tasks: tasks.map((task) => ({ id: task.id, title: task.title, role: task.role, status: task.status, dependencies: task.dependencies, blocker: task.error ?? null, tokenUsed: task.tokenUsed, estimatedTokens: task.estimatedTokens, tokenBudget: task.tokenBudget, interruptThresholdTokens: task.interruptThresholdTokens, configuredBudgetCap: task.configuredBudgetCap, budgetInterrupt: task.budgetInterrupt, threadId: task.threadId, turnId: task.turnId, worktree: task.worktree, remediationRound: task.remediationRound })),
       activeTurns: tasks.filter((task) => task.status === "running").map((task) => ({ taskId: task.id, threadId: task.threadId, turnId: task.turnId })),
       realConcurrency: tasks.filter((task) => task.status === "running").length,
       localBudget: readiness.localBudget,
@@ -272,9 +318,10 @@ export class SwarmRouter extends EventEmitter {
   startProject() {
     const inventory = join(this.config.repository, this.config.project.documentationDir, "inventory.json");
     if (!existsSync(inventory)) throw new Error(`Project documentation has not been imported: ${inventory}`);
-    const existingBootstrap = this.store.listTasks().find((task) => task.role === "bootstrap" && !task.parentTaskId);
+    const existingBootstrap = this.store.listTasks().find((task) => task.role === "bootstrap" && !task.parentTaskId && !["done", "failed", "cancelled", "blocked_budget", "interrupted"].includes(task.status));
     if (existingBootstrap) return existingBootstrap;
-    if (this.store.listTasks().length) throw new Error("This instance already has orchestration tasks; create a fresh instance for another project run");
+    const activeTasks = this.store.listTasks().filter((task) => !["done", "failed", "cancelled", "blocked_budget", "interrupted"].includes(task.status));
+    if (activeTasks.length) throw new Error("This instance already has active orchestration tasks; recover or wait for the active delivery before starting another run");
     return this.enqueue({
       role: "bootstrap",
       title: `Bootstrap ${this.config.project.name}`,
@@ -316,37 +363,56 @@ export class SwarmRouter extends EventEmitter {
     return { task, override: this.store.budgetOverride(taskId), readiness };
   }
 
-  async runUntilIdle() {
+  async runUntilIdle({ deliveryRunId = this.activeDeliveryRunId } = {}) {
     await this.worktrees.verifyRepository();
     this.#validateWorkerOverlays();
     const client = this.config.appServerClientFactory?.({ cwd: this.config.repository }) ?? new AppServerClient({ cwd: this.config.repository });
     this.activeClient = client;
+    this.activeDeliveryRunId = deliveryRunId ?? null;
+    this.stopRequested = false;
+    this.expectedClientShutdown = false;
+    this.budgetInterruptedTasks.clear();
+    this.activeTurns.clear();
+    this.activeDeliverySessionId = deliveryRunId ? randomUUID() : null;
+    if (deliveryRunId) this.store.claimDeliveryLease(deliveryRunId, { ownerPid: process.pid, ownerSessionId: this.activeDeliverySessionId });
     client.on("notification", (message) => this.#onNotification(message));
     client.on("serverRequest", (message) => this.#onServerRequest(client, message));
     client.on("protocol", (event) => this.#onProtocolEvent(event));
     client.on("fatal", (error) => {
       if (error.message !== "App Server client closed") this.#lifecycle("app-server error", { error: "App Server client failure" });
     });
-    client.on("exit", ({ code, signal }) => this.#lifecycle("app-server exited", { code, signal }));
+    client.on("exit", ({ code, signal }) => {
+      this.#lifecycle("app-server exited", { code, signal });
+      if (!this.stopRequested && !this.expectedClientShutdown && this.activeDeliveryRunId) this.#markInterrupted("interrupted_controller_exit: App Server process exited", { code, signal });
+    });
+    const onSigint = () => { this.requestShutdown("interrupted_controller_exit: SIGINT received").catch(() => {}); };
+    process.once("SIGINT", onSigint);
+    const heartbeat = deliveryRunId ? setInterval(() => this.store.heartbeatDeliveryLease(deliveryRunId, this.activeDeliverySessionId), this.config.delivery?.leaseHeartbeatMs ?? 5_000) : null;
     try {
       await client.connect();
       this.#lifecycle("app-server connected");
       const snapshot = await this.account.refresh(client);
       this.#lifecycle(snapshot.diagnostics?.length ? "account read failed" : "account read completed", { diagnostics: snapshot.diagnostics?.length ?? 0 });
-      const scheduler = { active: 0, blockedQuota: false };
+      const scheduler = { active: 0, blockedQuota: false, blockedBudget: false };
       const workers = Array.from({ length: this.config.router.maxConcurrentTasks }, () => this.#worker(client, scheduler));
       await Promise.all(workers);
-      return { blockedQuota: scheduler.blockedQuota, quota: this.quotaThrottleStatus() };
+      return { blockedQuota: scheduler.blockedQuota, blockedBudget: scheduler.blockedBudget || this.budgetInterruptedTasks.size > 0, interrupted: this.stopRequested, quota: this.quotaThrottleStatus() };
     } finally {
+      if (heartbeat) clearInterval(heartbeat);
+      process.removeListener("SIGINT", onSigint);
       this.lastAppServerDiagnostics = client.diagnostics();
+      this.expectedClientShutdown = true;
       client.shutdown();
       this.lastAppServerDiagnostics = client.diagnostics();
       if (this.activeClient === client) this.activeClient = null;
+      this.activeTurns.clear();
+      this.activeDeliverySessionId = null;
     }
   }
 
   async #worker(client, scheduler) {
     while (true) {
+      if (this.stopRequested || this.budgetInterruptedTasks.size) { scheduler.blockedBudget ||= this.budgetInterruptedTasks.size > 0; return; }
       if (this.quotaThrottleStatus().throttled) { scheduler.blockedQuota = true; return; }
       const task = this.store.claimNext();
       if (!task) {
@@ -358,7 +424,7 @@ export class SwarmRouter extends EventEmitter {
       try { await this.#runTask(client, task); }
       catch (error) {
         const current = this.store.getTask(task.id);
-        if (current && !["awaiting_approval", "cancelled"].includes(current.status)) {
+        if (current && !["awaiting_approval", "cancelled", "blocked_budget", "interrupted"].includes(current.status)) {
           let recovery = null;
           if (current.worktree) {
             try { recovery = await this.worktrees.recovery(current.worktree); }
@@ -376,6 +442,7 @@ export class SwarmRouter extends EventEmitter {
     const localBudget = this.#localBudgetDecision(task);
     if (!localBudget.allowed) {
       this.store.transition(task.id, "blocked_budget", { error: `Local scheduler hard cap blocks this task: projected ${localBudget.projected} exceeds ${localBudget.limit}` });
+      this.#lifecycle("budget preflight blocked", { taskId: task.id, scope: localBudget.scope, projected: localBudget.projected, limit: localBudget.limit, reservation: task.tokenBudget });
       return;
     }
     let overlayContext = ENGINEERING_DOMAINS.has(task.role) ? this.#workerOverlayContext() : null;
@@ -384,6 +451,11 @@ export class SwarmRouter extends EventEmitter {
     const decision = this.governor.canStart({ task, alreadyUsed: usage.used, alreadyReserved: Math.max(0, usage.reserved - task.tokenBudget), parentBudget: this.config.router.defaultParentBudget });
     if (!decision.allowed) {
       this.store.transition(task.id, "blocked_budget", { error: `Projected ${decision.projected} exceeds budget ${decision.budget}` });
+      return;
+    }
+    const runtimeBudget = this.#runtimeBudgetFor(task, localBudget);
+    if (runtimeBudget.interruptThresholdTokens < 1) {
+      this.store.transition(task.id, "blocked_budget", { error: "Local scheduler hard cap leaves no runtime token budget for this task" });
       return;
     }
 
@@ -401,6 +473,7 @@ export class SwarmRouter extends EventEmitter {
       else ({ worktree, branch } = await this.worktrees.create(task.id));
     }
     this.store.transition(task.id, "running", { worktree, branch });
+    this.store.setRuntimeBudget(task.id, runtimeBudget);
 
     const sourceDir = fileURLToPath(new URL(".", import.meta.url));
     const developerInstructions = this.#developerInstructions(sourceDir, task.role);
@@ -416,18 +489,24 @@ export class SwarmRouter extends EventEmitter {
     this.threadTasks.set(threadId, task.id);
     this.#lifecycle("thread started", { taskId: task.id, threadId });
     await client.setGoal({ threadId, objective: `${task.title}\n\n${task.prompt}`, status: "active", tokenBudget: task.tokenBudget });
-    const turnResult = await client.startTurn({ threadId, input: [{ type: "text", text: this.#taskPrompt(task, worktree, overlayContext?.snapshot) }] });
+    const turnOptions = { threadId, input: [{ type: "text", text: this.#taskPrompt(task, worktree, overlayContext?.snapshot) }] };
+    // The generated App Server schema explicitly allows `effort`; it does not
+    // expose any server-side max-token field for turn/start.
+    if (["bootstrap", "planner"].includes(task.role)) turnOptions.effort = "low";
+    const turnResult = await client.startTurn(turnOptions);
     const turnId = turnResult.turn.id;
     this.store.setThread(task.id, { threadId, turnId });
+    this.activeTurns.set(task.id, { taskId: task.id, threadId, turnId });
     this.#lifecycle("turn started", { taskId: task.id, threadId, turnId });
     const turn = await client.waitForTurn(threadId, turnId, this.config.router.turnTimeoutMs);
+    this.activeTurns.delete(task.id);
     const resolvedTurnId = turn.id ?? turnId;
     if (resolvedTurnId !== turnId) {
       this.store.setThread(task.id, { threadId, turnId: resolvedTurnId });
       this.#lifecycle("turn id alias resolved", { taskId: task.id, threadId, requestedTurnId: turnId, resolvedTurnId });
     }
     const current = this.store.getTask(task.id);
-    if (current.status === "awaiting_approval") return;
+    if (["awaiting_approval", "blocked_budget", "interrupted"].includes(current.status)) return;
     if (turn.status === "completed") {
       const resultText = await this.#readAgentResult(client, threadId, resolvedTurnId);
       let resultPath;
@@ -468,7 +547,7 @@ export class SwarmRouter extends EventEmitter {
       this.store.transition(task.id, finalStatusForRole(task.role, { autonomous: this.isAutonomous() }));
       if (task.role === "bootstrap" && this.isAutonomous()) this.#enqueuePlanner(task);
     }
-    else if (turn.status === "interrupted") this.store.transition(task.id, "cancelled", { error: "Turn interrupted" });
+    else if (turn.status === "interrupted") this.store.transition(task.id, "interrupted", { error: "Turn interrupted" });
     else this.store.transition(task.id, "failed", { error: turn.error?.message ?? "Turn failed" });
   }
 
@@ -476,7 +555,7 @@ export class SwarmRouter extends EventEmitter {
     return [
       formatTaskPrompt({ task, worktree, project: this.config.project, overlaySnapshot, documentationAvailable: existsSync(join(this.config.repository, this.config.project.documentationDir, "inventory.json")) }),
       this.#structuredOutputContract(task.role),
-      "Do not create child agents. Do not merge, push, modify Router configuration, or bypass approval/sandbox policy."
+      "Bounded execution: do only the required scoped work, do not create child agents, avoid long explanations, and return the required structured result. Do not merge, push, modify Router configuration, or bypass approval/sandbox policy."
     ].join("\n");
   }
 
@@ -525,8 +604,22 @@ export class SwarmRouter extends EventEmitter {
     const since = new Date(Date.now() - this.config.budget.weeklyWindowDays * 86_400_000).toISOString();
     const usage = this.store.weeklyUsageSince(since);
     const reservedWithoutCurrent = Math.max(0, usage.reserved - task.tokenBudget);
-    const projected = usage.used + reservedWithoutCurrent + task.estimatedTokens;
-    return { allowed: projected <= this.config.budget.weeklyTokenLimit, projected, limit: this.config.budget.weeklyTokenLimit, used: usage.used, reservedWithoutCurrent };
+    const weeklyProjected = usage.used + reservedWithoutCurrent + task.tokenBudget;
+    if (weeklyProjected > this.config.budget.weeklyTokenLimit) return { allowed: false, scope: "weekly", projected: weeklyProjected, limit: this.config.budget.weeklyTokenLimit, used: usage.used, reservedWithoutCurrent };
+    const hardRunTokenLimit = this.config.budget.hardRunTokenLimit ?? this.config.budget.weeklyTokenLimit;
+    const runUsage = task.deliveryRunId ? this.store.usageForDeliveryRun(task.deliveryRunId) : { used: 0, reserved: 0 };
+    const runReservedWithoutCurrent = Math.max(0, runUsage.reserved - task.tokenBudget);
+    const runProjected = runUsage.used + runReservedWithoutCurrent + task.tokenBudget;
+    if (runProjected > hardRunTokenLimit) return { allowed: false, scope: "run", projected: runProjected, limit: hardRunTokenLimit, used: runUsage.used, reservedWithoutCurrent: runReservedWithoutCurrent };
+    return { allowed: true, scope: "run", projected: runProjected, limit: hardRunTokenLimit, used: runUsage.used, reservedWithoutCurrent: runReservedWithoutCurrent, weeklyUsed: usage.used, weeklyProjected };
+  }
+
+  #runtimeBudgetFor(task, localBudget) {
+    const safetyMargin = this.config.budget.interruptSafetyMarginTokens ?? 0;
+    const configuredBudgetCap = task.tokenBudget;
+    const configuredThreshold = this.config.roles[task.role].interruptThresholdTokens ?? Math.max(1, configuredBudgetCap - safetyMargin);
+    const runRemaining = Math.max(0, localBudget.limit - localBudget.used - localBudget.reservedWithoutCurrent);
+    return { interruptThresholdTokens: Math.min(configuredThreshold, runRemaining), configuredBudgetCap };
   }
 
   #writerReviewPassed(writerId) {
@@ -713,19 +806,19 @@ export class SwarmRouter extends EventEmitter {
     for (const { item, elevatedGate, securityRequired, dependencyPlanIds } of dispatch) {
       const primary = assertRoute(item.primaryDomain, item.estimatedTokens);
       const primaryId = primaryIds.get(item.id);
-      specs.push({ id: primaryId, role: item.primaryDomain, parentTaskId: plannerTask.id, title: item.title, prompt: item.id === "scaffold-product" ? `[[product-scaffold]]\n${item.prompt}` : item.prompt, allowedPaths: item.allowedPaths, acceptanceChecks: item.acceptanceChecks, dependencies: [plannerTask.id, ...dependencyPlanIds.map((dependency) => primaryIds.get(dependency))], estimatedTokens: item.estimatedTokens, tokenBudget: primary.tokenBudget, maxAttempts: 1, humanApprovalRequired: elevatedGate, riskFlags: item.riskFlags, supportingDomains: item.supportingDomains });
+      specs.push({ id: primaryId, role: item.primaryDomain, parentTaskId: plannerTask.id, title: item.title, prompt: item.id === "scaffold-product" ? `[[product-scaffold]]\n${item.prompt}` : item.prompt, allowedPaths: item.allowedPaths, acceptanceChecks: item.acceptanceChecks, dependencies: [plannerTask.id, ...dependencyPlanIds.map((dependency) => primaryIds.get(dependency))], estimatedTokens: item.estimatedTokens, tokenBudget: primary.tokenBudget, maxAttempts: 1, humanApprovalRequired: elevatedGate, riskFlags: item.riskFlags, supportingDomains: item.supportingDomains, deliveryRunId: plannerTask.deliveryRunId ?? this.activeDeliveryRunId });
       let predecessorId = primaryId;
       const mandatoryReview = primary.sandbox === "workspace-write";
       if ((mandatoryReview || securityRequired) && item.primaryDomain !== "security") {
         const estimate = Math.min(this.config.roles.security?.tokenBudget ?? 0, Math.max(1000, Math.ceil(item.estimatedTokens * 0.35)));
         const security = assertRoute("security", estimate);
         predecessorId = randomUUID();
-        specs.push({ id: predecessorId, role: "security", parentTaskId: primaryId, title: `Security review: ${item.title}`, prompt: `Review finalized writer artifact '${item.title}' for declared risk flags: ${item.riskFlags.join(", ") || "none"}. Return the required SecurityGateReport only.`, allowedPaths: item.allowedPaths, acceptanceChecks: item.acceptanceChecks, dependencies: [primaryId], estimatedTokens: estimate, tokenBudget: security.tokenBudget, maxAttempts: 1, humanApprovalRequired: false, riskFlags: item.riskFlags, supportingDomains: ["security"], sourceWriterTaskId: primaryId });
+        specs.push({ id: predecessorId, role: "security", parentTaskId: primaryId, title: `Security review: ${item.title}`, prompt: `Review finalized writer artifact '${item.title}' for declared risk flags: ${item.riskFlags.join(", ") || "none"}. Return the required SecurityGateReport only.`, allowedPaths: item.allowedPaths, acceptanceChecks: item.acceptanceChecks, dependencies: [primaryId], estimatedTokens: estimate, tokenBudget: security.tokenBudget, maxAttempts: 1, humanApprovalRequired: false, riskFlags: item.riskFlags, supportingDomains: ["security"], sourceWriterTaskId: primaryId, deliveryRunId: plannerTask.deliveryRunId ?? this.activeDeliveryRunId });
       }
       if ((mandatoryReview || item.supportingDomains.includes("qa")) && item.primaryDomain !== "qa") {
         const estimate = Math.min(this.config.roles.qa?.tokenBudget ?? 0, Math.max(1000, Math.ceil(item.estimatedTokens * 0.4)));
         const qa = assertRoute("qa", estimate);
-        specs.push({ id: randomUUID(), role: "qa", parentTaskId: predecessorId, title: `QA: ${item.title}`, prompt: `Verify finalized writer artifact '${item.title}' against acceptance checks. Return the required QualityGateReport only.`, allowedPaths: item.allowedPaths, acceptanceChecks: item.acceptanceChecks, dependencies: [predecessorId], estimatedTokens: estimate, tokenBudget: qa.tokenBudget, maxAttempts: 1, humanApprovalRequired: false, riskFlags: item.riskFlags, supportingDomains: ["qa"], sourceWriterTaskId: primaryId });
+        specs.push({ id: randomUUID(), role: "qa", parentTaskId: predecessorId, title: `QA: ${item.title}`, prompt: `Verify finalized writer artifact '${item.title}' against acceptance checks. Return the required QualityGateReport only.`, allowedPaths: item.allowedPaths, acceptanceChecks: item.acceptanceChecks, dependencies: [predecessorId], estimatedTokens: estimate, tokenBudget: qa.tokenBudget, maxAttempts: 1, humanApprovalRequired: false, riskFlags: item.riskFlags, supportingDomains: ["qa"], sourceWriterTaskId: primaryId, deliveryRunId: plannerTask.deliveryRunId ?? this.activeDeliveryRunId });
       }
     }
     this.store.createTasks(specs);
@@ -764,7 +857,30 @@ export class SwarmRouter extends EventEmitter {
     if (message.method !== "thread/tokenUsage/updated") return;
     const taskId = this.threadTasks.get(message.params.threadId);
     if (!taskId) return;
-    this.store.setTokenUsage(taskId, this.governor.normalizeUsage(message.params));
+    const reportedTokenUsed = this.governor.normalizeUsage(message.params);
+    this.store.setTokenUsage(taskId, reportedTokenUsed);
+    const tokenUsed = this.store.getTask(taskId)?.tokenUsed ?? reportedTokenUsed;
+    this.#enforceUsageBudget(taskId, tokenUsed).catch((error) => this.#lifecycle("budget watchdog failed", { taskId, error: String(error.message).slice(0, 300) }));
+  }
+
+  async #enforceUsageBudget(taskId, actualTokens) {
+    const task = this.store.getTask(taskId);
+    if (!task?.threadId || !task.turnId || task.status !== "running") return;
+    const threshold = task.interruptThresholdTokens;
+    if (!Number.isInteger(threshold) || actualTokens < threshold) return;
+    if (this.budgetInterruptedTasks.has(taskId) || this.store.budgetInterruption(taskId)) return;
+    this.budgetInterruptedTasks.add(taskId);
+    const interruption = this.store.recordBudgetInterruption({
+      taskId, deliveryRunId: task.deliveryRunId, threadId: task.threadId, turnId: task.turnId,
+      actualTokens, interruptThresholdTokens: threshold, configuredBudgetCap: task.configuredBudgetCap ?? task.tokenBudget,
+      reason: "budget_interrupt"
+    });
+    this.#lifecycle("budget interrupt requested", { taskId, threadId: task.threadId, turnId: task.turnId, actualTokens, threshold, configuredCap: task.configuredBudgetCap ?? task.tokenBudget, overshoot: interruption.capOvershootTokens });
+    // Persist terminal state before requesting the best-effort upstream interrupt;
+    // late token notifications can therefore only enrich the recorded overshoot.
+    this.store.transition(taskId, "blocked_budget", { error: `budget_interrupt: actual ${actualTokens}, threshold ${threshold}, configured cap ${task.configuredBudgetCap ?? task.tokenBudget}` });
+    if (task.deliveryRunId) this.store.updateDeliveryRun(task.deliveryRunId, { state: "blocked_budget", publish: { reason: "budget_interrupt", taskId, interruption, recovery: { action: "Inspect persisted budget interruption and begin a fresh delivery run after increasing limits or reducing scope." } } });
+    await this.activeClient?.interruptTurn({ threadId: task.threadId, turnId: task.turnId });
   }
 
   #onProtocolEvent(event) {

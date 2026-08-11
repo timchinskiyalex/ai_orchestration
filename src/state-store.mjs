@@ -43,7 +43,10 @@ export class StateStore {
         artifact_base_sha TEXT,
         artifact_dependencies_json TEXT NOT NULL DEFAULT '[]',
         remediation_round INTEGER NOT NULL DEFAULT 0,
-        source_writer_task_id TEXT
+        source_writer_task_id TEXT,
+        delivery_run_id TEXT,
+        interrupt_threshold_tokens INTEGER,
+        configured_budget_cap INTEGER
       );
       CREATE TABLE IF NOT EXISTS events (
         sequence INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -112,6 +115,11 @@ export class StateStore {
         integration_path TEXT,
         publish_json TEXT,
         confirm_remote_push INTEGER NOT NULL DEFAULT 0,
+        owner_pid INTEGER,
+        owner_session_id TEXT,
+        heartbeat_at TEXT,
+        interrupted_at TEXT,
+        recovery_json TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
@@ -122,6 +130,19 @@ export class StateStore {
         payload_json TEXT NOT NULL,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS budget_interruptions (
+        task_id TEXT PRIMARY KEY REFERENCES tasks(id),
+        delivery_run_id TEXT,
+        thread_id TEXT,
+        turn_id TEXT,
+        actual_tokens INTEGER NOT NULL,
+        interrupt_threshold_tokens INTEGER NOT NULL,
+        configured_budget_cap INTEGER NOT NULL,
+        threshold_overshoot_tokens INTEGER NOT NULL,
+        cap_overshoot_tokens INTEGER NOT NULL,
+        reason TEXT NOT NULL,
+        interrupted_at TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status, created_at);
       CREATE INDEX IF NOT EXISTS idx_tasks_thread ON tasks(thread_id);
@@ -138,6 +159,14 @@ export class StateStore {
     this.#addColumnIfMissing("tasks", "artifact_dependencies_json", "TEXT NOT NULL DEFAULT '[]'");
     this.#addColumnIfMissing("tasks", "remediation_round", "INTEGER NOT NULL DEFAULT 0");
     this.#addColumnIfMissing("tasks", "source_writer_task_id", "TEXT");
+    this.#addColumnIfMissing("tasks", "delivery_run_id", "TEXT");
+    this.#addColumnIfMissing("tasks", "interrupt_threshold_tokens", "INTEGER");
+    this.#addColumnIfMissing("tasks", "configured_budget_cap", "INTEGER");
+    this.#addColumnIfMissing("delivery_runs", "owner_pid", "INTEGER");
+    this.#addColumnIfMissing("delivery_runs", "owner_session_id", "TEXT");
+    this.#addColumnIfMissing("delivery_runs", "heartbeat_at", "TEXT");
+    this.#addColumnIfMissing("delivery_runs", "interrupted_at", "TEXT");
+    this.#addColumnIfMissing("delivery_runs", "recovery_json", "TEXT");
   }
 
   close() { this.db.close(); }
@@ -149,12 +178,12 @@ export class StateStore {
     this.#mutate(task.id, `task/${initialStatus}`, { role: task.role, title: task.title, humanApprovalRequired: Boolean(task.humanApprovalRequired) }, () => this.db.prepare(`INSERT INTO tasks (
       id, parent_task_id, role, title, prompt, status, allowed_paths_json,
       acceptance_checks_json, dependencies_json, human_approval_required, token_budget, estimated_tokens, max_attempts, created_at, updated_at,
-      risk_flags_json, supporting_domains_json, artifact_base_sha, artifact_dependencies_json, remediation_round, source_writer_task_id
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      risk_flags_json, supporting_domains_json, artifact_base_sha, artifact_dependencies_json, remediation_round, source_writer_task_id, delivery_run_id
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
       task.id, task.parentTaskId ?? null, task.role, task.title, task.prompt,
       initialStatus, json(task.allowedPaths), json(task.acceptanceChecks), json(task.dependencies), task.humanApprovalRequired ? 1 : 0, task.tokenBudget, task.estimatedTokens ?? task.tokenBudget,
       task.maxAttempts, timestamp, timestamp, json(task.riskFlags), json(task.supportingDomains), task.artifactBaseSha ?? null,
-      json(task.artifactDependencies), task.remediationRound ?? 0, task.sourceWriterTaskId ?? null
+      json(task.artifactDependencies), task.remediationRound ?? 0, task.sourceWriterTaskId ?? null, task.deliveryRunId ?? null
     ));
     return this.getTask(task.id);
   }
@@ -177,12 +206,12 @@ export class StateStore {
         this.db.prepare(`INSERT INTO tasks (
           id, parent_task_id, role, title, prompt, status, allowed_paths_json,
           acceptance_checks_json, dependencies_json, human_approval_required, token_budget, estimated_tokens, max_attempts, created_at, updated_at,
-          risk_flags_json, supporting_domains_json, artifact_base_sha, artifact_dependencies_json, remediation_round, source_writer_task_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)` ).run(
+          risk_flags_json, supporting_domains_json, artifact_base_sha, artifact_dependencies_json, remediation_round, source_writer_task_id, delivery_run_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)` ).run(
           task.id, task.parentTaskId ?? null, task.role, task.title, task.prompt,
           initialStatus, json(task.allowedPaths), json(task.acceptanceChecks), json(task.dependencies), task.humanApprovalRequired ? 1 : 0,
           task.tokenBudget, task.estimatedTokens ?? task.tokenBudget, task.maxAttempts ?? 1, timestamp, timestamp,
-          json(task.riskFlags), json(task.supportingDomains), task.artifactBaseSha ?? null, json(task.artifactDependencies), task.remediationRound ?? 0, task.sourceWriterTaskId ?? null
+          json(task.riskFlags), json(task.supportingDomains), task.artifactBaseSha ?? null, json(task.artifactDependencies), task.remediationRound ?? 0, task.sourceWriterTaskId ?? null, task.deliveryRunId ?? null
         );
         this.#insertEvent(task.id, `task/${initialStatus}`, { role: task.role, title: task.title, humanApprovalRequired: Boolean(task.humanApprovalRequired) });
       }
@@ -256,7 +285,34 @@ export class StateStore {
   }
 
   setTokenUsage(taskId, tokenUsed) {
-    this.#mutate(taskId, "thread/tokenUsage", { tokenUsed }, () => this.db.prepare("UPDATE tasks SET token_used = ?, updated_at = ? WHERE id = ?").run(tokenUsed, now(), taskId));
+    const current = this.getTask(taskId);
+    const measured = Math.max(current?.tokenUsed ?? 0, Number(tokenUsed) || 0);
+    this.#mutate(taskId, "thread/tokenUsage", { tokenUsed: measured }, () => this.db.prepare("UPDATE tasks SET token_used = ?, updated_at = ? WHERE id = ?").run(measured, now(), taskId));
+  }
+
+  setRuntimeBudget(taskId, { interruptThresholdTokens, configuredBudgetCap }) {
+    this.#mutate(taskId, "budget/runtime-configured", { interruptThresholdTokens, configuredBudgetCap }, () => this.db.prepare("UPDATE tasks SET interrupt_threshold_tokens = ?, configured_budget_cap = ?, updated_at = ? WHERE id = ?").run(interruptThresholdTokens, configuredBudgetCap, now(), taskId));
+  }
+
+  linkTaskToDelivery(taskId, deliveryRunId) {
+    this.#mutate(taskId, "delivery/task-linked", { deliveryRunId }, () => this.db.prepare("UPDATE tasks SET delivery_run_id = ?, updated_at = ? WHERE id = ?").run(deliveryRunId, now(), taskId));
+    return this.getTask(taskId);
+  }
+
+  recordBudgetInterruption({ taskId, deliveryRunId = null, threadId, turnId, actualTokens, interruptThresholdTokens, configuredBudgetCap, reason = "budget_interrupt" }) {
+    const interruptedAt = now();
+    const thresholdOvershootTokens = Math.max(0, actualTokens - interruptThresholdTokens);
+    const capOvershootTokens = Math.max(0, actualTokens - configuredBudgetCap);
+    const payload = { taskId, deliveryRunId, threadId, turnId, actualTokens, interruptThresholdTokens, configuredBudgetCap, thresholdOvershootTokens, capOvershootTokens, reason, interruptedAt };
+    this.#mutate(taskId, "budget/interrupt", payload, () => this.db.prepare(`INSERT OR IGNORE INTO budget_interruptions(
+      task_id, delivery_run_id, thread_id, turn_id, actual_tokens, interrupt_threshold_tokens, configured_budget_cap, threshold_overshoot_tokens, cap_overshoot_tokens, reason, interrupted_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(taskId, deliveryRunId, threadId, turnId, actualTokens, interruptThresholdTokens, configuredBudgetCap, thresholdOvershootTokens, capOvershootTokens, reason, interruptedAt));
+    return this.budgetInterruption(taskId);
+  }
+
+  budgetInterruption(taskId) {
+    const row = this.db.prepare("SELECT * FROM budget_interruptions WHERE task_id = ?").get(taskId);
+    return row ? { taskId: row.task_id, deliveryRunId: row.delivery_run_id, threadId: row.thread_id, turnId: row.turn_id, actualTokens: row.actual_tokens, interruptThresholdTokens: row.interrupt_threshold_tokens, configuredBudgetCap: row.configured_budget_cap, thresholdOvershootTokens: row.threshold_overshoot_tokens, capOvershootTokens: row.cap_overshoot_tokens, reason: row.reason, interruptedAt: row.interrupted_at } : null;
   }
 
   setResultPath(taskId, resultPath) {
@@ -278,6 +334,12 @@ export class StateStore {
       COALESCE(SUM(estimated_tokens), 0) AS estimate,
       COALESCE(SUM(CASE WHEN status IN ('queued','preparing','running','awaiting_approval','awaiting_human') THEN token_budget ELSE 0 END), 0) AS reserved
       FROM tasks WHERE created_at >= ?`).get(since);
+  }
+
+  usageForDeliveryRun(deliveryRunId) {
+    return this.db.prepare(`SELECT COALESCE(SUM(token_used), 0) AS used,
+      COALESCE(SUM(CASE WHEN status IN ('queued','preparing','running','awaiting_approval','awaiting_human') THEN token_budget ELSE 0 END), 0) AS reserved
+      FROM tasks WHERE delivery_run_id = ?`).get(deliveryRunId);
   }
 
   recordEvent(taskId, type, payload) {
@@ -389,6 +451,58 @@ export class StateStore {
     return this.deliveryRun(id);
   }
 
+  claimDeliveryLease(id, { ownerPid, ownerSessionId }) {
+    const timestamp = now();
+    const current = this.deliveryRun(id); if (!current) throw new Error(`Delivery run not found: ${id}`);
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.prepare("UPDATE delivery_runs SET owner_pid = ?, owner_session_id = ?, heartbeat_at = ?, updated_at = ? WHERE id = ?").run(ownerPid, ownerSessionId, timestamp, timestamp, id);
+      this.#insertEvent(current.bootstrapTaskId, "delivery/lease-claimed", { deliveryRunId: id, ownerPid, ownerSessionId, heartbeatAt: timestamp });
+      this.db.exec("COMMIT");
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    return this.deliveryRun(id);
+  }
+
+  heartbeatDeliveryLease(id, ownerSessionId) {
+    const timestamp = now();
+    const current = this.deliveryRun(id); if (!current || current.ownerSessionId !== ownerSessionId) return null;
+    this.db.prepare("UPDATE delivery_runs SET heartbeat_at = ?, updated_at = ? WHERE id = ? AND owner_session_id = ?").run(timestamp, timestamp, id, ownerSessionId);
+    return this.deliveryRun(id);
+  }
+
+  interruptDeliveryRun(id, { reason, recovery = null } = {}) {
+    const current = this.deliveryRun(id); if (!current) throw new Error(`Delivery run not found: ${id}`);
+    const timestamp = now();
+    const nextRecovery = { ...(current.recovery ?? {}), reason, ...(recovery ?? {}), interruptedAt: timestamp };
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.prepare("UPDATE delivery_runs SET state = 'interrupted', interrupted_at = ?, recovery_json = ?, owner_pid = NULL, owner_session_id = NULL, heartbeat_at = NULL, updated_at = ? WHERE id = ?").run(timestamp, JSON.stringify(nextRecovery), timestamp, id);
+      const active = this.db.prepare("SELECT id, status, thread_id, turn_id, token_used FROM tasks WHERE (delivery_run_id = ? OR id = ?) AND status IN ('preparing','running','awaiting_approval')").all(id, current.bootstrapTaskId);
+      for (const task of active) {
+        this.db.prepare("UPDATE tasks SET status = 'interrupted', error = ?, updated_at = ? WHERE id = ?").run(reason, timestamp, task.id);
+        this.#insertEvent(task.id, "task/status", { from: task.status, to: "interrupted", error: reason, threadId: task.thread_id, turnId: task.turn_id, tokenUsed: task.token_used });
+      }
+      this.#insertEvent(current.bootstrapTaskId, "delivery/interrupted", { deliveryRunId: id, reason, recovery: nextRecovery, interruptedTasks: active.map((task) => task.id) });
+      this.db.exec("COMMIT");
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    return this.deliveryRun(id);
+  }
+
+  recoverStaleDeliveryRuns({ isProcessAlive, staleAfterMs }) {
+    const cutoff = Date.now() - staleAfterMs;
+    const candidates = this.db.prepare("SELECT * FROM delivery_runs WHERE state IN ('running','awaiting_human','awaiting_human_remote_handoff') ORDER BY created_at ASC").all();
+    const recovered = [];
+    for (const row of candidates) {
+      const run = this.#mapDeliveryRun(row);
+      const heartbeat = run.heartbeatAt ? Date.parse(run.heartbeatAt) : 0;
+      const ownerAlive = Number.isInteger(run.ownerPid) && isProcessAlive(run.ownerPid);
+      if (ownerAlive && heartbeat > cutoff) continue;
+      const reason = !run.ownerPid ? "interrupted_controller_exit: missing owner lease" : ownerAlive ? "interrupted_controller_exit: stale owner heartbeat" : "interrupted_controller_exit: owner process is not alive";
+      recovered.push(this.interruptDeliveryRun(run.id, { reason, recovery: { previousOwnerPid: run.ownerPid, previousOwnerSessionId: run.ownerSessionId, previousHeartbeatAt: run.heartbeatAt, staleAfterMs } }));
+    }
+    return recovered;
+  }
+
   recordExternalAction({ idempotencyKey, kind, status, payload = {} }) {
     const existing = this.db.prepare("SELECT payload_json, status FROM external_actions WHERE idempotency_key = ?").get(idempotencyKey);
     if (existing) return { duplicate: true, status: existing.status, payload: JSON.parse(existing.payload_json) };
@@ -453,12 +567,14 @@ export class StateStore {
       error: row.error, resultPath: row.result_path,
       riskFlags: parse(row.risk_flags_json, []), supportingDomains: parse(row.supporting_domains_json, []),
       artifactBaseSha: row.artifact_base_sha, artifactDependencies: parse(row.artifact_dependencies_json, []),
-      remediationRound: row.remediation_round, sourceWriterTaskId: row.source_writer_task_id
+      remediationRound: row.remediation_round, sourceWriterTaskId: row.source_writer_task_id,
+      deliveryRunId: row.delivery_run_id, interruptThresholdTokens: row.interrupt_threshold_tokens, configuredBudgetCap: row.configured_budget_cap,
+      budgetInterrupt: this.budgetInterruption(row.id)
     };
   }
 
   #mapDeliveryRun(row) {
-    return { id: row.id, schemaVersion: row.schema_version, state: row.state, source: row.source, bootstrapTaskId: row.bootstrap_task_id, integrationPath: row.integration_path, publish: parse(row.publish_json, null), confirmRemotePush: Boolean(row.confirm_remote_push), createdAt: row.created_at, updatedAt: row.updated_at };
+    return { id: row.id, schemaVersion: row.schema_version, state: row.state, source: row.source, bootstrapTaskId: row.bootstrap_task_id, integrationPath: row.integration_path, publish: parse(row.publish_json, null), confirmRemotePush: Boolean(row.confirm_remote_push), ownerPid: row.owner_pid, ownerSessionId: row.owner_session_id, heartbeatAt: row.heartbeat_at, interruptedAt: row.interrupted_at, recovery: parse(row.recovery_json, null), createdAt: row.created_at, updatedAt: row.updated_at };
   }
 
   #addColumnIfMissing(table, column, definition) {
