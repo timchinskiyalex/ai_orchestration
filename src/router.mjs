@@ -49,10 +49,10 @@ export function agentResultForTurn(response, turnId) {
 }
 
 export class SwarmRouter extends EventEmitter {
-  constructor(config) {
+  constructor(config, { readOnly = false } = {}) {
     super();
     this.config = config;
-    this.store = new StateStore(join(config.runtimeDir, "swarm.sqlite"));
+    this.store = new StateStore(join(config.runtimeDir, "swarm.sqlite"), { readOnly });
     this.governor = new BudgetGovernor(config.router);
     this.worktrees = new WorktreeManager(config);
     this.threadTasks = new Map();

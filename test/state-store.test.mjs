@@ -54,3 +54,13 @@ test("SQLite lifecycle and external-action idempotency survive a restart", () =>
     assert.equal(store.events({ after: 0, limit: 500 }).length >= 153, true, "bounded in-memory traces cannot erase persisted lifecycle history");
   } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
 });
+
+test("read-only StateStore reads an active runtime without schema writes", () => {
+  const dir = mkdtempSync(join(tmpdir(), "codex-swarm-readonly-")); const path = join(dir, "state.sqlite");
+  const writer = new StateStore(path); let reader;
+  try {
+    writer.createTask({ id: "task", role: "planner", title: "Plan", prompt: "Plan", tokenBudget: 10, maxAttempts: 1 });
+    reader = new StateStore(path, { readOnly: true });
+    assert.equal(reader.getTask("task").title, "Plan");
+  } finally { reader?.close(); writer.close(); rmSync(dir, { recursive: true, force: true }); }
+});

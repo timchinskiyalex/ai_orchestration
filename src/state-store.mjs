@@ -8,10 +8,11 @@ const json = (value) => JSON.stringify(value ?? []);
 const parse = (value, fallback) => (value ? JSON.parse(value) : fallback);
 
 export class StateStore {
-  constructor(filePath) {
+  constructor(filePath, { readOnly = false } = {}) {
     const isNewDatabase = !existsSync(filePath);
-    mkdirSync(dirname(filePath), { recursive: true });
-    this.db = new DatabaseSync(filePath);
+    if (!readOnly) mkdirSync(dirname(filePath), { recursive: true });
+    this.db = new DatabaseSync(filePath, { readOnly });
+    if (readOnly) return;
     // Switching journal mode takes an exclusive SQLite lock. Do it once at
     // database creation, never in every short-lived status/watch reader.
     if (isNewDatabase) this.db.exec("PRAGMA journal_mode = WAL;");

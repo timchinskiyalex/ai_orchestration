@@ -55,7 +55,7 @@ try {
     process.exit(0);
   }
   const { SwarmRouter } = await import("./router.mjs");
-  const router = new SwarmRouter(loadConfig(configPath));
+  const router = new SwarmRouter(loadConfig(configPath), { readOnly: ["status", "watch"].includes(command) });
   try {
     if (command === "init") console.log(router.init());
     else if (command === "recover") {
