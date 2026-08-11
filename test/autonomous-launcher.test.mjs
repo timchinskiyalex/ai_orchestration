@@ -15,8 +15,13 @@ test("autonomous launcher has no interactive prompt and starts the complete deli
   assert.match(script, /Checking stale delivery leases before starting/);
   assert.match(script, /src\/index\.mjs', 'deliver/);
   assert.match(script, /completed_merged/);
+  assert.match(script, /\$resumable = @\('interrupted', 'blocked_credentials', 'blocked_ci', 'blocked_branch_protection'/);
+  assert.match(script, /\$resume = \$status\.deliveryRun -and \(\$resumable -contains \$status\.deliveryRun\.state\)/);
+  assert.doesNotMatch(script, /\$resumable = @[^\n]*'failed'/);
   assert.match(script, /docs\/orchestration-generated/);
   const index = readFileSync(join(root, "src", "index.mjs"), "utf8");
   assert.match(index, /"deterministic scaffold started": "scaffold started"/);
   assert.match(index, /"budget interrupt requested": "budget interrupt"/);
+  assert.match(index, /FINAL DELIVERY SUMMARY/);
+  assert.match(index, /process\.exitCode = deliveryExitCode\(delivery\)/);
 });

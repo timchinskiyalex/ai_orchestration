@@ -111,23 +111,58 @@ export class RemoteCiAdapter {
 }
 
 export class GitHubCiAdapter {
-  constructor({ repository, github = null, execute = exec, timeoutMs = 900000, pollIntervalMs = 10000 } = {}) {
-    this.github = github ?? new GitHubAdapter({ repository, execute }); this.timeoutMs = timeoutMs; this.pollIntervalMs = pollIntervalMs;
+  constructor({ repository, github = null, execute = exec, timeoutMs = 900000, pollIntervalMs = 10000, requiredContexts = [] } = {}) {
+    this.github = github ?? new GitHubAdapter({ repository, execute }); this.timeoutMs = timeoutMs; this.pollIntervalMs = pollIntervalMs; this.requiredContexts = requiredContexts;
+  }
+
+  async #requiredContexts(repo, base) {
+    if (this.requiredContexts.length) return { contexts: this.requiredContexts, source: "config" };
+    // Protection is queried only when the instance did not pin an explicit
+    // policy.  Missing/hidden protection is deliberately a blocker, never an
+    // implicit "all observed checks" policy.
+    try {
+      const protection = await this.github.api(["--method", "GET", `repos/${repo}/branches/${base}/protection`]);
+      const payload = JSON.parse(String(protection.stdout ?? "{}"));
+      const contexts = payload.required_status_checks?.checks?.map((item) => item.context)
+        ?? payload.required_status_checks?.contexts ?? [];
+      const unique = [...new Set(contexts.filter((item) => typeof item === "string" && item.trim()))];
+      if (!unique.length) throw new RemoteAdapterError("ci_policy_missing", "Target branch protection has no required status-check contexts; configure remote.requiredCiContexts explicitly.");
+      return { contexts: unique, source: "branch_protection" };
+    } catch (error) {
+      if (error instanceof RemoteAdapterError) throw error;
+      throw new RemoteAdapterError("ci_policy_missing", "Required CI policy is unavailable; configure remote.requiredCiContexts or grant read access to target branch protection.", error);
+    }
   }
 
   async waitForChecks({ pullRequest, candidate }) {
     if (!pullRequest?.number) throw new RemoteAdapterError("ci_missing_pr", "Remote CI requires a persisted pull request number.");
+    if (!/^[0-9a-f]{40}$/i.test(candidate?.sha ?? "")) throw new RemoteAdapterError("ci_invalid_candidate", "Remote CI requires the exact 40-character candidate SHA.");
     const deadline = Date.now() + this.timeoutMs;
     let last = null;
     while (Date.now() <= deadline) {
       try {
         const repo = await this.github.repositoryName();
-        const checks = await this.github.api(["--method", "GET", `repos/${repo}/commits/${candidate.sha}/check-runs`]);
-        const payload = JSON.parse(String(checks.stdout ?? "{}"));
-        const runs = (payload.check_runs ?? []).map((run) => ({ name: run.name, status: run.status, conclusion: run.conclusion, detailsUrl: run.details_url }));
-        last = { checkRuns: runs };
-        if (runs.some((run) => run.status === "completed" && !["success", "neutral", "skipped"].includes(run.conclusion))) return { status: "failed", reason: "A remote CI check failed.", checkRuns: runs };
-        if (runs.length && runs.every((run) => run.status === "completed" && ["success", "neutral", "skipped"].includes(run.conclusion))) return { status: "passed", checkRuns: runs };
+        const policy = await this.#requiredContexts(repo, candidate.base);
+        const [checks, statuses] = await Promise.all([
+          this.github.api(["--method", "GET", `repos/${repo}/commits/${candidate.sha}/check-runs?per_page=100`]),
+          this.github.api(["--method", "GET", `repos/${repo}/commits/${candidate.sha}/status`])
+        ]);
+        const checkPayload = JSON.parse(String(checks.stdout ?? "{}"));
+        const statusPayload = JSON.parse(String(statuses.stdout ?? "{}"));
+        const runs = (checkPayload.check_runs ?? []).map((run) => ({ name: run.name, status: run.status, conclusion: run.conclusion, headSha: run.head_sha ?? null, detailsUrl: run.details_url }));
+        const statusChecks = (statusPayload.statuses ?? []).map((status) => ({ name: status.context, status: status.state, conclusion: status.state, sha: statusPayload.sha ?? status.sha ?? null, detailsUrl: status.target_url ?? null }));
+        const required = policy.contexts.map((name) => {
+          const matchingRuns = runs.filter((run) => run.name === name && (!run.headSha || run.headSha.toLowerCase() === candidate.sha.toLowerCase()));
+          const matchingStatuses = statusChecks.filter((status) => status.name === name && (!status.sha || status.sha.toLowerCase() === candidate.sha.toLowerCase()));
+          const matches = [...matchingRuns, ...matchingStatuses];
+          if (!matches.length) return { name, state: "missing" };
+          if (matches.some((item) => (item.status === "completed" && !["success", "neutral", "skipped"].includes(item.conclusion)) || ["failure", "error"].includes(item.status))) return { name, state: "failed", matches };
+          if (matches.some((item) => item.status !== "completed" && item.status !== "success" && item.status !== "neutral" && item.status !== "skipped")) return { name, state: "pending", matches };
+          return { name, state: "passed", matches };
+        });
+        last = { checkRuns: runs, statusChecks, requiredContexts: policy.contexts, required, policySource: policy.source };
+        if (required.some((item) => item.state === "failed")) return { status: "failed", reason: "A required remote CI context failed for the candidate SHA.", ...last };
+        if (required.every((item) => item.state === "passed")) return { status: "passed", ...last };
         await sleep(this.pollIntervalMs);
       } catch (error) {
         if (error instanceof RemoteAdapterError) throw error;
@@ -154,14 +189,30 @@ export class GitHubMergeAdapter {
     if (!safeName(base) || protectedBranches.has(candidate.branch?.toLowerCase())) throw new Error("Unsafe merge target");
     try {
       const repo = await this.github.repositoryName();
+      const verifyTarget = async (pr) => {
+        if (pr.head?.sha?.toLowerCase() !== candidate.sha.toLowerCase() || pr.base?.ref !== base) throw new RemoteAdapterError("merge_verify_failed", "Persisted pull request no longer points at the candidate SHA and target branch.");
+        const [main, comparison] = await Promise.all([
+          this.github.api([`repos/${repo}/git/ref/heads/${base}`]),
+          this.github.api([`repos/${repo}/compare/${candidate.sha}...${base}`])
+        ]);
+        const ref = JSON.parse(String(main.stdout ?? "{}"));
+        const compare = JSON.parse(String(comparison.stdout ?? "{}"));
+        const sha = ref.object?.sha;
+        if (!/^[0-9a-f]{40}$/i.test(sha) || !["behind", "identical"].includes(compare.status)) throw new RemoteAdapterError("merge_verify_failed", "Target branch was not verified to contain the candidate after merge.");
+        return sha;
+      };
+      const current = JSON.parse(String((await this.github.api([`repos/${repo}/pulls/${pullRequest.number}`])).stdout ?? "{}"));
+      if (current.merged_at) {
+        const mainSha = await verifyTarget(current);
+        return { status: "merged", number: pullRequest.number, url: current.html_url ?? pullRequest.url, mergeSha: current.merge_commit_sha ?? mainSha, mainSha, targetVerified: true, duplicate: true, idempotencyKey };
+      }
       const response = await this.github.api([`repos/${repo}/pulls/${pullRequest.number}/merge`, "--method", "PUT", "-f", `merge_method=${this.mergeMethod}`, "-f", `sha=${candidate.sha}`, "-f", `commit_title=Autonomous delivery #${pullRequest.number}`]);
       const merged = JSON.parse(String(response.stdout ?? "{}"));
       if (!merged.merged) throw new RemoteAdapterError("branch_protection", merged.message ? `GitHub refused merge: ${merged.message}` : "GitHub refused the merge.");
-      const main = await this.github.api([`repos/${repo}/git/ref/heads/${base}`]);
-      const ref = JSON.parse(String(main.stdout ?? "{}"));
-      const sha = ref.object?.sha;
-      if (!/^[0-9a-f]{40}$/i.test(sha)) throw new RemoteAdapterError("merge_verify_failed", "Could not verify the target branch SHA after merge.");
-      return { status: "merged", number: pullRequest.number, url: pullRequest.url, mergeSha: merged.sha ?? sha, mainSha: sha, idempotencyKey };
+      const verifiedPr = JSON.parse(String((await this.github.api([`repos/${repo}/pulls/${pullRequest.number}`])).stdout ?? "{}"));
+      if (!verifiedPr.merged_at) throw new RemoteAdapterError("merge_verify_failed", "GitHub merge endpoint responded but the pull request is not marked merged.");
+      const sha = await verifyTarget(verifiedPr);
+      return { status: "merged", number: pullRequest.number, url: pullRequest.url, mergeSha: merged.sha ?? sha, mainSha: sha, targetVerified: true, idempotencyKey };
     } catch (error) {
       if (error instanceof RemoteAdapterError) throw error;
       if (isCredentialError(error)) throw new RemoteAdapterError("credentials", "GitHub CLI credentials are unavailable or invalid.", error);

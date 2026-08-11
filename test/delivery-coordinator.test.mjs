@@ -53,10 +53,10 @@ function setup(remote = true) {
 
 function fakeRemote(calls) {
   return {
-    remoteGitAdapter: { async pushCandidate() { calls.push += 1; return { status: "pushed" }; } },
-    pullRequestAdapter: { async ensurePullRequest() { calls.pr += 1; return { status: "open", number: 1, url: "https://example.test/pr/1" }; } },
+    remoteGitAdapter: { async pushCandidate({ sha }) { calls.push += 1; return { status: "pushed", verifiedSha: sha }; } },
+    pullRequestAdapter: { async ensurePullRequest({ sha }) { calls.pr += 1; return { status: "open", number: 1, url: "https://example.test/pr/1", headSha: sha }; } },
     remoteCiAdapter: { async waitForChecks() { calls.ci += 1; return { status: "passed", checkRuns: [{ name: "test", status: "completed", conclusion: "success" }] }; } },
-    mergeAdapter: { async merge() { calls.merge += 1; return { status: "merged", mainSha: "b".repeat(40), mergeSha: "b".repeat(40) }; } }
+    mergeAdapter: { async merge() { calls.merge += 1; return { status: "merged", mainSha: "b".repeat(40), mergeSha: "b".repeat(40), targetVerified: true }; } }
   };
 }
 
@@ -73,6 +73,23 @@ test("completed autonomous delivery is restart-idempotent", async () => {
   try {
     const ready = await coordinator.begin({ source: fixture.source, ...fakeRemote(calls) }); assert.equal(ready.state, "completed_merged");
     const restarted = await coordinator.resume(fakeRemote(calls)); assert.equal(restarted.state, "completed_merged"); assert.deepEqual(calls, { push: 1, pr: 1, ci: 1, merge: 1 });
+  } finally { router.close(); rmSync(fixture.root, { recursive: true, force: true }); }
+});
+
+test("persisted candidate resumes CI blockers and interruptions without a new intake, Bootstrap, or DAG", async () => {
+  const fixture = setup(true); const client = new DeliveryClient(); fixture.config.appServerClientFactory = () => client;
+  const router = new SwarmRouter(fixture.config); const coordinator = new DeliveryCoordinator(router); const calls = { push: 0, pr: 0, ci: 0, merge: 0 };
+  try {
+    const blockedAdapters = { ...fakeRemote(calls), remoteCiAdapter: { async waitForChecks() { calls.ci += 1; return { status: "timed_out", reason: "required build pending" }; } } };
+    const blocked = await coordinator.begin({ source: fixture.source, ...blockedAdapters });
+    assert.equal(blocked.state, "blocked_ci"); assert.ok(blocked.integrationPath); assert.equal(blocked.candidate.sha.length, 40);
+    assert.equal(router.store.deliveryRun(blocked.id).publicationCheckpoint.stage, "ci");
+    const beforeResumeGoals = client.goals.length;
+    const resumed = await coordinator.resume(fakeRemote(calls));
+    assert.equal(resumed.state, "completed_merged"); assert.equal(client.goals.length, beforeResumeGoals); assert.equal(router.list().filter((task) => task.role === "bootstrap").length, 1);
+    router.store.interruptDeliveryRun(resumed.id, { reason: "test restart after merge side effect" });
+    const afterInterrupt = await coordinator.resume(fakeRemote(calls));
+    assert.equal(afterInterrupt.state, "completed_merged"); assert.equal(router.list().filter((task) => task.role === "bootstrap").length, 1); assert.equal(calls.merge, 1);
   } finally { router.close(); rmSync(fixture.root, { recursive: true, force: true }); }
 });
 

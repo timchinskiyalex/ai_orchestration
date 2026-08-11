@@ -123,6 +123,9 @@ export class StateStore {
         source TEXT,
         bootstrap_task_id TEXT REFERENCES tasks(id),
         integration_path TEXT,
+        candidate_branch TEXT,
+        candidate_sha TEXT,
+        publication_checkpoint_json TEXT,
         publish_json TEXT,
         confirm_remote_push INTEGER NOT NULL DEFAULT 0,
         owner_pid INTEGER,
@@ -179,6 +182,9 @@ export class StateStore {
     this.#addColumnIfMissing("delivery_runs", "heartbeat_at", "TEXT");
     this.#addColumnIfMissing("delivery_runs", "interrupted_at", "TEXT");
     this.#addColumnIfMissing("delivery_runs", "recovery_json", "TEXT");
+    this.#addColumnIfMissing("delivery_runs", "candidate_branch", "TEXT");
+    this.#addColumnIfMissing("delivery_runs", "candidate_sha", "TEXT");
+    this.#addColumnIfMissing("delivery_runs", "publication_checkpoint_json", "TEXT");
   }
 
   close() { this.db.close(); }
@@ -470,9 +476,9 @@ export class StateStore {
     return row ? this.#mapDeliveryRun(row) : null;
   }
 
-  updateDeliveryRun(id, { state, integrationPath, publish, confirmRemotePush } = {}) {
+  updateDeliveryRun(id, { state, integrationPath, publish, confirmRemotePush, candidate, publicationCheckpoint } = {}) {
     const current = this.deliveryRun(id); if (!current) throw new Error(`Delivery run not found: ${id}`);
-    const next = { state: state ?? current.state, integrationPath: integrationPath ?? current.integrationPath, publish: publish ?? current.publish, confirmRemotePush: confirmRemotePush ?? current.confirmRemotePush };
+    const next = { state: state ?? current.state, integrationPath: integrationPath ?? current.integrationPath, publish: publish ?? current.publish, confirmRemotePush: confirmRemotePush ?? current.confirmRemotePush, candidate: candidate ?? current.candidate, publicationCheckpoint: publicationCheckpoint ?? current.publicationCheckpoint };
     this.db.exec("BEGIN IMMEDIATE");
     try {
       const terminal = !["running", "awaiting_human", "awaiting_human_remote_handoff"].includes(next.state);
@@ -480,7 +486,7 @@ export class StateStore {
         const active = this.db.prepare("SELECT id FROM delivery_runs WHERE state IN ('running','awaiting_human','awaiting_human_remote_handoff') AND id != ? LIMIT 1").get(id);
         if (active) throw new Error(`Delivery already owned by active run: ${active.id}`);
       }
-      this.db.prepare("UPDATE delivery_runs SET state = ?, integration_path = ?, publish_json = ?, confirm_remote_push = ?, owner_pid = CASE WHEN ? THEN NULL ELSE owner_pid END, owner_session_id = CASE WHEN ? THEN NULL ELSE owner_session_id END, heartbeat_at = CASE WHEN ? THEN NULL ELSE heartbeat_at END, updated_at = ? WHERE id = ?").run(next.state, next.integrationPath, next.publish ? JSON.stringify(next.publish) : null, next.confirmRemotePush ? 1 : 0, terminal ? 1 : 0, terminal ? 1 : 0, terminal ? 1 : 0, now(), id);
+      this.db.prepare("UPDATE delivery_runs SET state = ?, integration_path = ?, candidate_branch = ?, candidate_sha = ?, publication_checkpoint_json = ?, publish_json = ?, confirm_remote_push = ?, owner_pid = CASE WHEN ? THEN NULL ELSE owner_pid END, owner_session_id = CASE WHEN ? THEN NULL ELSE owner_session_id END, heartbeat_at = CASE WHEN ? THEN NULL ELSE heartbeat_at END, updated_at = ? WHERE id = ?").run(next.state, next.integrationPath, next.candidate?.branch ?? null, next.candidate?.sha ?? null, next.publicationCheckpoint ? JSON.stringify(next.publicationCheckpoint) : null, next.publish ? JSON.stringify(next.publish) : null, next.confirmRemotePush ? 1 : 0, terminal ? 1 : 0, terminal ? 1 : 0, terminal ? 1 : 0, now(), id);
       this.#insertEvent(current.bootstrapTaskId, "delivery/state", { deliveryRunId: id, state: next.state, confirmRemotePush: next.confirmRemotePush });
       this.db.exec("COMMIT");
     } catch (error) { this.db.exec("ROLLBACK"); throw error; }
@@ -500,6 +506,37 @@ export class StateStore {
       this.db.exec("COMMIT");
     } catch (error) { this.db.exec("ROLLBACK"); throw error; }
     return this.deliveryRun(id);
+  }
+
+  resumeDeliveryRun(id, { ownerPid, ownerSessionId }) {
+    if (!Number.isInteger(ownerPid) || ownerPid < 1 || typeof ownerSessionId !== "string" || !ownerSessionId) throw new Error("Delivery resume requires owner pid and session");
+    const resumable = ["interrupted", "blocked_credentials", "blocked_ci", "blocked_branch_protection"];
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const current = this.deliveryRun(id); if (!current) throw new Error(`Delivery run not found: ${id}`);
+      if (!resumable.includes(current.state)) throw new Error(`Delivery run is not resumable: ${id} (${current.state})`);
+      const timestamp = now();
+      const changed = this.db.prepare("UPDATE delivery_runs SET state = 'running', owner_pid = ?, owner_session_id = ?, heartbeat_at = ?, interrupted_at = NULL, updated_at = ? WHERE id = ? AND owner_session_id IS NULL").run(ownerPid, ownerSessionId, timestamp, timestamp, id);
+      if (!changed.changes) throw new Error(`Delivery already owned: ${id}`);
+      this.#insertEvent(current.bootstrapTaskId, "delivery/resumed", { deliveryRunId: id, previousState: current.state, ownerPid, ownerSessionId, publicationCheckpoint: current.publicationCheckpoint });
+      this.db.exec("COMMIT");
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    return this.deliveryRun(id);
+  }
+
+  resumeInterruptedTasks(deliveryRunId) {
+    const tasks = this.db.prepare("SELECT * FROM tasks WHERE delivery_run_id = ? AND status = 'interrupted' ORDER BY created_at").all(deliveryRunId);
+    if (!tasks.length) return [];
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const timestamp = now();
+      for (const task of tasks) {
+        this.db.prepare("UPDATE tasks SET status = 'queued', error = NULL, updated_at = ? WHERE id = ?").run(timestamp, task.id);
+        this.#insertEvent(task.id, "task/resumed", { from: "interrupted", to: "queued", recovery: "same_delivery_run" });
+      }
+      this.db.exec("COMMIT");
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    return tasks.map((task) => this.getTask(task.id));
   }
 
   heartbeatDeliveryLease(id, ownerSessionId) {
@@ -613,7 +650,7 @@ export class StateStore {
   }
 
   #mapDeliveryRun(row) {
-    return { id: row.id, schemaVersion: row.schema_version, state: row.state, source: row.source, bootstrapTaskId: row.bootstrap_task_id, integrationPath: row.integration_path, publish: parse(row.publish_json, null), confirmRemotePush: Boolean(row.confirm_remote_push), ownerPid: row.owner_pid, ownerSessionId: row.owner_session_id, heartbeatAt: row.heartbeat_at, interruptedAt: row.interrupted_at, recovery: parse(row.recovery_json, null), createdAt: row.created_at, updatedAt: row.updated_at };
+    return { id: row.id, schemaVersion: row.schema_version, state: row.state, source: row.source, bootstrapTaskId: row.bootstrap_task_id, integrationPath: row.integration_path, candidate: row.candidate_branch && row.candidate_sha ? { branch: row.candidate_branch, sha: row.candidate_sha } : null, publicationCheckpoint: parse(row.publication_checkpoint_json, null), publish: parse(row.publish_json, null), confirmRemotePush: Boolean(row.confirm_remote_push), ownerPid: row.owner_pid, ownerSessionId: row.owner_session_id, heartbeatAt: row.heartbeat_at, interruptedAt: row.interrupted_at, recovery: parse(row.recovery_json, null), createdAt: row.created_at, updatedAt: row.updated_at };
   }
 
   #addColumnIfMissing(table, column, definition) {

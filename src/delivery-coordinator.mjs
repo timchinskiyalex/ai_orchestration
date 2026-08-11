@@ -21,6 +21,7 @@ export class DeliveryCoordinator {
     this.router.recoverStaleDeliveries();
     const current = this.router.store.currentDeliveryRun();
     if (current && ["running", "awaiting_human", "awaiting_human_remote_handoff"].includes(current.state)) throw new Error(`A delivery run is already active: ${current.id}. Use npm run deliver -- --resume.`);
+    if (current && ["interrupted", "blocked_credentials", "blocked_ci", "blocked_branch_protection"].includes(current.state)) throw new Error(`A persisted delivery run is resumable: ${current.id}. Use npm run deliver -- --resume instead of creating a new Bootstrap/DAG.`);
     // A terminal controller run can still have never-claimed DAG rows. They are
     // historical work, not a live delivery: retain their evidence but never let
     // them block a deliberately fresh delivery.
@@ -40,15 +41,20 @@ export class DeliveryCoordinator {
     this.router.recoverStaleDeliveries();
     const run = this.router.store.currentDeliveryRun();
     if (!run) throw new Error("No delivery run exists; start with npm run deliver -- --source <docs-dir>");
-    if (["completed_merged", "completed_candidate_ready", "failed", "blocked_budget", "blocked_quota", "blocked_credentials", "blocked_ci", "blocked_branch_protection", "conflict_blocked", "interrupted"].includes(run.state)) return run;
-    this.router.activateDeliveryRun(run.id);
-    if (run.integrationPath) return this.#publishPersisted(run, adapters);
-    return this.#advance(run, adapters);
+    if (["completed_merged", "completed_candidate_ready", "failed", "blocked_budget", "blocked_quota", "conflict_blocked"].includes(run.state)) return run;
+    const resumed = ["interrupted", "blocked_credentials", "blocked_ci", "blocked_branch_protection"].includes(run.state)
+      ? this.router.resumeDeliveryRun(run.id)
+      : (this.router.activateDeliveryRun(run.id), run);
+    if (resumed.integrationPath) return this.#publishPersisted(resumed, adapters);
+    if (run.state === "interrupted") this.router.store.resumeInterruptedTasks(resumed.id);
+    return this.#advance(resumed, adapters);
   }
 
   async #publishPersisted(run, adapters) {
     const manifest = this.router.store.integrationManifest(run.integrationPath);
     if (!manifest) return this.router.store.updateDeliveryRun(run.id, { state: "failed", publish: { reason: "Persisted delivery integration manifest is missing", recovery: { action: "Restore the generated integration manifest before resuming." } } });
+    if (run.candidate && (run.candidate.branch !== manifest.branch || run.candidate.sha.toLowerCase() !== manifest.candidateSha?.toLowerCase())) return this.router.store.updateDeliveryRun(run.id, { state: "failed", publish: { reason: "Persisted candidate identity does not match the integration manifest", recovery: { action: "Do not publish; inspect the preserved candidate and delivery checkpoint." } } });
+    this.router.store.updateDeliveryRun(run.id, { state: "running", integrationPath: run.integrationPath, candidate: { branch: manifest.branch, sha: manifest.candidateSha }, publicationCheckpoint: { stage: "publication-ready", candidate: { branch: manifest.branch, sha: manifest.candidateSha }, resumed: true, updatedAt: new Date().toISOString() } });
     const publish = await this.router.publishCandidate({ path: run.integrationPath, manifest }, adapters);
     return this.router.store.updateDeliveryRun(run.id, { state: publish.terminalState, integrationPath: run.integrationPath, publish, confirmRemotePush: this.router.isAutonomous() });
   }
@@ -88,6 +94,10 @@ export class DeliveryCoordinator {
     try { integration = await this.router.runToIntegration({ alreadyIdle: true, deliveryRunId: run.id }); }
     catch (error) { return this.router.store.updateDeliveryRun(run.id, { state: "conflict_blocked", publish: { reason: String(error.message).slice(0, 500), recovery: { action: "Inspect the retained candidate/worktree and verification results." } } }); }
     if (integration.integration.manifest.status !== "candidate_ready") return this.router.store.updateDeliveryRun(run.id, { state: "conflict_blocked", integrationPath: integration.integration.path, publish: { reason: integration.integration.manifest.blockedReason, recovery: integration.integration.manifest.recovery } });
+    // This transaction is intentionally before the first remote action.  A
+    // crash after a remote side effect can therefore only resume this exact
+    // candidate and its idempotency keys, never create a fresh DAG.
+    this.router.store.updateDeliveryRun(run.id, { state: "running", integrationPath: integration.integration.path, candidate: { branch: integration.integration.manifest.branch, sha: integration.integration.manifest.candidateSha }, publicationCheckpoint: { stage: "publication-ready", candidate: { branch: integration.integration.manifest.branch, sha: integration.integration.manifest.candidateSha }, updatedAt: new Date().toISOString() } });
     const publish = await this.router.publishCandidate(integration.integration, context);
     return this.router.store.updateDeliveryRun(run.id, { state: publish.terminalState, integrationPath: integration.integration.path, publish, confirmRemotePush: this.router.isAutonomous() });
   }
