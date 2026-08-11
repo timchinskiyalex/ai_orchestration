@@ -67,6 +67,7 @@ export class SwarmRouter extends EventEmitter {
     this.expectedClientShutdown = false;
     this.budgetInterruptedTasks = new Set();
     this.activeTurns = new Map();
+    this.closed = false;
   }
 
   init() {
@@ -74,7 +75,12 @@ export class SwarmRouter extends EventEmitter {
     return { runtimeDir: this.config.runtimeDir, database: join(this.config.runtimeDir, "swarm.sqlite") };
   }
 
-  close() { this.stop(); this.store.close(); }
+  close() {
+    if (this.closed) return;
+    this.closed = true;
+    this.stop();
+    this.store.close();
+  }
 
   stop() {
     if (this.activeClient) this.lastAppServerDiagnostics = this.activeClient.diagnostics();
@@ -499,12 +505,9 @@ export class SwarmRouter extends EventEmitter {
     this.activeTurns.set(task.id, { taskId: task.id, threadId, turnId });
     this.#lifecycle("turn started", { taskId: task.id, threadId, turnId });
     const turn = await client.waitForTurn(threadId, turnId, this.config.router.turnTimeoutMs);
-    this.activeTurns.delete(task.id);
     const resolvedTurnId = turn.id ?? turnId;
-    if (resolvedTurnId !== turnId) {
-      this.store.setThread(task.id, { threadId, turnId: resolvedTurnId });
-      this.#lifecycle("turn id alias resolved", { taskId: task.id, threadId, requestedTurnId: turnId, resolvedTurnId });
-    }
+    this.#adoptResolvedTurnId(task.id, threadId, resolvedTurnId);
+    this.activeTurns.delete(task.id);
     const current = this.store.getTask(task.id);
     if (["awaiting_approval", "blocked_budget", "interrupted"].includes(current.status)) return;
     if (turn.status === "completed") {
@@ -857,10 +860,25 @@ export class SwarmRouter extends EventEmitter {
     if (message.method !== "thread/tokenUsage/updated") return;
     const taskId = this.threadTasks.get(message.params.threadId);
     if (!taskId) return;
+    // App Server may acknowledge turn/start with a client-facing ID and later
+    // emit lifecycle events for its canonical turn ID. Budget interruption must
+    // target the canonical ID, otherwise the upstream turn keeps running.
+    this.#adoptResolvedTurnId(taskId, message.params.threadId, message.params.turnId);
     const reportedTokenUsed = this.governor.normalizeUsage(message.params);
     this.store.setTokenUsage(taskId, reportedTokenUsed);
     const tokenUsed = this.store.getTask(taskId)?.tokenUsed ?? reportedTokenUsed;
     this.#enforceUsageBudget(taskId, tokenUsed).catch((error) => this.#lifecycle("budget watchdog failed", { taskId, error: String(error.message).slice(0, 300) }));
+  }
+
+  #adoptResolvedTurnId(taskId, threadId, resolvedTurnId) {
+    if (typeof resolvedTurnId !== "string" || !resolvedTurnId) return this.store.getTask(taskId);
+    const task = this.store.getTask(taskId);
+    if (!task || task.threadId !== threadId || task.turnId === resolvedTurnId) return task;
+    const requestedTurnId = task.turnId;
+    this.store.setThread(taskId, { threadId, turnId: resolvedTurnId });
+    if (this.activeTurns.has(taskId)) this.activeTurns.set(taskId, { taskId, threadId, turnId: resolvedTurnId });
+    this.#lifecycle("turn id alias resolved", { taskId, threadId, requestedTurnId, resolvedTurnId });
+    return this.store.getTask(taskId);
   }
 
   async #enforceUsageBudget(taskId, actualTokens) {
@@ -904,6 +922,10 @@ export class SwarmRouter extends EventEmitter {
     const event = { timestamp: new Date().toISOString(), type, ...details };
     this.lifecycleTrace.push(event);
     if (this.lifecycleTrace.length > 100) this.lifecycleTrace.splice(0, this.lifecycleTrace.length - 100);
+    // The child process can emit its final exit event after the delivery CLI has
+    // closed SQLite. Keep that late event in memory, but never touch a closed
+    // store or turn a completed/blocked delivery into a launcher crash.
+    if (this.closed) return event;
     // SQLite is the source of truth; JSONL is an operationally convenient
     // append-only mirror. Neither stores prompts, agent text, or payloads.
     this.store.recordEvent(details.taskId ?? null, `lifecycle/${type}`, event);

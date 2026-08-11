@@ -13,7 +13,7 @@ const roles = Object.fromEntries(["bootstrap", "planner", "backend", "frontend",
 }]));
 
 class UsageFakeAppServer extends EventEmitter {
-  constructor({ usage = null, exit = false } = {}) { super(); this.usage = usage; this.exit = exit; this.next = 1; this.interrupts = []; this.closed = false; this.waiters = new Map(); }
+  constructor({ usage = null, exit = false, resolvedTurnId = null } = {}) { super(); this.usage = usage; this.exit = exit; this.resolvedTurnId = resolvedTurnId; this.next = 1; this.interrupts = []; this.closed = false; this.waiters = new Map(); this.turnAliases = new Map(); }
   async connect() {}
   shutdown() { this.closed = true; }
   diagnostics() { return { protocolEvents: [], stderrTail: "", process: { alive: !this.closed, exited: this.closed, code: null, signal: null } }; }
@@ -22,16 +22,18 @@ class UsageFakeAppServer extends EventEmitter {
   async setGoal() {}
   async startTurn({ threadId }) {
     const turnId = `turn-${threadId}`;
+    const resolvedTurnId = this.resolvedTurnId ?? turnId;
+    this.turnAliases.set(resolvedTurnId, turnId);
     setTimeout(() => {
       if (this.exit) { this.emit("exit", { code: 1, signal: null }); this.waiters.get(`${threadId}:${turnId}`)?.reject(new Error("fake App Server exited")); return; }
-      if (this.usage !== null) this.emit("notification", { method: "thread/tokenUsage/updated", params: { threadId, turnId, tokenUsage: { total: { totalTokens: this.usage } } } });
+      if (this.usage !== null) this.emit("notification", { method: "thread/tokenUsage/updated", params: { threadId, turnId: resolvedTurnId, tokenUsage: { total: { totalTokens: this.usage } } } });
       if (this.usage !== null && this.usage < 20) this.waiters.get(`${threadId}:${turnId}`)?.resolve({ id: turnId, status: "completed" });
     }, 0);
     return { turn: { id: turnId } };
   }
   async interruptTurn({ threadId, turnId }) {
     this.interrupts.push({ threadId, turnId });
-    this.waiters.get(`${threadId}:${turnId}`)?.resolve({ id: turnId, status: "interrupted" });
+    this.waiters.get(`${threadId}:${this.turnAliases.get(turnId) ?? turnId}`)?.resolve({ id: turnId, status: "interrupted" });
     return {};
   }
   waitForTurn(threadId, turnId) {
@@ -40,10 +42,10 @@ class UsageFakeAppServer extends EventEmitter {
   async readThread({ threadId }) { return { thread: { turns: [{ id: `turn-${threadId}`, items: [{ type: "agentMessage", text: "```json\n{\"summary\":\"ok\",\"assumptions\":[],\"risks\":[],\"humanGates\":[]}\n```" }] }] } }; }
 }
 
-function fixture({ usage = null, hardRunTokenLimit = 500, weeklyTokenLimit = 1000, maxConcurrentTasks = 1, exit = false } = {}) {
+function fixture({ usage = null, hardRunTokenLimit = 500, weeklyTokenLimit = 1000, maxConcurrentTasks = 1, exit = false, resolvedTurnId = null } = {}) {
   const root = mkdtempSync(join(tmpdir(), "orchestration-budget-"));
   git(root, ["init", "-b", "main"]); writeFileSync(join(root, "README.md"), "# test\n"); git(root, ["add", "."]); git(root, ["-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "base"]);
-  const client = new UsageFakeAppServer({ usage, exit });
+  const client = new UsageFakeAppServer({ usage, exit, resolvedTurnId });
   const router = new SwarmRouter({ repository: root, runtimeDir: join(root, "runtime"), baseRef: "main", model: "fake", project: { name: "test", documentationDir: "docs/in", generatedDir: "docs/out", productRoots: [] }, router: { maxConcurrentTasks, maxChildrenPerTask: 10, maxDelegationDepth: 4, maxPlanTasks: 5, defaultParentBudget: 1000, turnTimeoutMs: 1000, approvalMode: "deny" }, autonomy: { mode: "autonomous", autoApproveWorkflowGates: true, autoRemediate: true, autoPush: true, autoCreatePullRequest: true, autoMerge: true, maxRemediationRounds: 3 }, budget: { weeklyTokenLimit, weeklyWindowDays: 7, hardRunTokenLimit, interruptSafetyMarginTokens: 10 }, quota: { throttleAtUsedPercent: 90, throttleWhenUnavailable: false }, delivery: { maxRemediationRounds: 3, leaseHeartbeatMs: 250, staleLeaseMs: 250, shutdownGraceMs: 250 }, roles, appServerClientFactory: () => client });
   return { root, router, client, dispose: () => { router.close(); rmSync(root, { recursive: true, force: true }); } };
 }
@@ -77,6 +79,18 @@ test("usage below threshold does not interrupt, while threshold usage interrupts
     assert.equal(threshold.router.store.getTask(task.id).status, "blocked_budget"); assert.equal(persisted.actualTokens, 35); assert.equal(persisted.interruptThresholdTokens, 20); assert.equal(persisted.configuredBudgetCap, 100); assert.equal(persisted.thresholdOvershootTokens, 15); assert.equal(persisted.capOvershootTokens, 0); assert.equal(threshold.router.store.deliveryRun(run.id).state, "blocked_budget");
     assert.ok(threshold.router.lifecycleEvents().some((event) => event.type === "turn started")); assert.ok(threshold.router.lifecycleEvents().some((event) => event.type === "budget interrupt requested"));
   } finally { threshold.dispose(); }
+});
+
+test("budget watchdog adopts the canonical App Server turn ID before interrupting", async () => {
+  const subject = fixture({ usage: 35, resolvedTurnId: "canonical-server-turn" });
+  try {
+    const task = subject.router.enqueue({ role: "bootstrap", title: "canonical turn", prompt: "bounded" }); const run = createRun(subject.router, task);
+    await subject.router.runUntilIdle({ deliveryRunId: run.id });
+    assert.deepEqual(subject.client.interrupts, [{ threadId: "thread-1", turnId: "canonical-server-turn" }]);
+    assert.equal(subject.router.store.getTask(task.id).turnId, "canonical-server-turn");
+    assert.equal(subject.router.store.budgetInterruption(task.id).turnId, "canonical-server-turn");
+    assert.ok(subject.router.lifecycleEvents().some((event) => event.type === "turn id alias resolved" && event.resolvedTurnId === "canonical-server-turn"));
+  } finally { subject.dispose(); }
 });
 
 test("budget interruption stops the scheduler before an independent next task starts", async () => {
@@ -125,5 +139,13 @@ test("stale owner lease recovery marks the historical run interrupted without er
     const recovered = subject.router.recoverStaleDeliveries();
     assert.equal(recovered.length, 1); assert.equal(subject.router.store.deliveryRun(run.id).state, "interrupted");
     const historical = subject.router.store.getTask(task.id); assert.equal(historical.status, "interrupted"); assert.equal(historical.tokenUsed, 120550); assert.equal(historical.threadId, "historic-thread"); assert.equal(historical.turnId, "historic-turn");
+  } finally { subject.dispose(); }
+});
+
+test("late App Server process-exit telemetry after router close cannot reopen SQLite", () => {
+  const subject = fixture();
+  try {
+    subject.router.close();
+    assert.doesNotThrow(() => subject.client.emit("protocol", { direction: "processExit", errorMessage: "code=0; signal=none" }));
   } finally { subject.dispose(); }
 });
