@@ -497,7 +497,11 @@ export class SwarmRouter extends EventEmitter {
     const threadId = threadResult.thread.id;
     this.threadTasks.set(threadId, task.id);
     this.#lifecycle("thread started", { taskId: task.id, threadId });
-    await client.setGoal({ threadId, objective: `${task.title}\n\n${task.prompt}`, status: "active", tokenBudget: task.tokenBudget });
+    const goal = { threadId, objective: `${task.title}\n\n${task.prompt}`, status: "active" };
+    // In tracking-only mode, tokenBudget remains controller telemetry only. Sending
+    // it to App Server turns a forecast into an agent-visible execution cap.
+    if (this.#enforcesLocalBudget()) goal.tokenBudget = task.tokenBudget;
+    await client.setGoal(goal);
     const turnOptions = { threadId, input: [{ type: "text", text: this.#taskPrompt(task, worktree, overlayContext?.snapshot) }] };
     // The generated App Server schema explicitly allows `effort`; it does not
     // expose any server-side max-token field for turn/start.
@@ -545,7 +549,11 @@ export class SwarmRouter extends EventEmitter {
       resultPath = this.#saveAgentResult(task, resultText);
       this.store.setResultPath(task.id, resultPath);
       if (roleConfig.sandbox === "workspace-write") {
-        if (this.#isScaffoldTask(task)) overlayContext = await this.#refreshProjectOverlayFromWorktree(worktree);
+        if (this.#isScaffoldTask(task)) {
+          overlayContext = await this.#refreshProjectOverlayFromWorktree(worktree);
+          const missingRoots = (overlayContext.overlay.components ?? []).filter((component) => component.state !== "scaffolded").map((component) => component.root);
+          if (missingRoots.length) throw new Error(`Scaffold incomplete: required product roots are still unscaffolded: ${missingRoots.join(", ")}`);
+        }
         const finalized = await this.finalizer.finalize({ task, worktree, branch, overlay: overlayContext.overlay, overlayPath: overlayContext.path });
         this.store.recordWorkerArtifact(task.id, finalized.path, finalized.artifact);
         if (this.#isScaffoldTask(task)) this.#connectScaffoldDependents(task, finalized.artifact);

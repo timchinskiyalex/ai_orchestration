@@ -10,11 +10,11 @@ import { SwarmRouter } from "../src/router.mjs";
 
 const git = (cwd, args) => execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8" }).trim();
 class DeliveryClient extends EventEmitter {
-  constructor() { super(); this.id = 0; this.threads = new Map(); }
+  constructor() { super(); this.id = 0; this.threads = new Map(); this.goals = []; }
   async connect() {} shutdown() {} diagnostics() { return { protocolEvents: [], stderrTail: "", process: {} }; }
   async request(method) { return method === "account/read" ? { account: {} } : method === "account/usage/read" ? { dailyUsageBuckets: [] } : { rateLimits: null }; }
   async startThread({ cwd }) { const id = `thread-${++this.id}`; this.threads.set(id, { cwd, goal: "" }); return { thread: { id } }; }
-  async setGoal({ threadId, objective }) { this.threads.get(threadId).goal = objective; }
+  async setGoal(goal) { this.goals.push(goal); this.threads.get(goal.threadId).goal = goal.objective; }
   async startTurn({ threadId }) { return { turn: { id: `turn-${threadId}` } }; }
   async waitForTurn(threadId, turnId) { const thread = this.threads.get(threadId); if (/Writer/.test(thread.goal)) writeFileSync(join(thread.cwd, "src", "value.mjs"), "export const value = 2;\n"); return { id: turnId, status: "completed" }; }
   async readThread({ threadId }) { const thread = this.threads.get(threadId); const text = /^Bootstrap/.test(thread.goal) ? "```json\n{\"summary\":\"ok\",\"assumptions\":[],\"risks\":[],\"humanGates\":[]}\n```" : /^Plan /.test(thread.goal) ? "```json\n{\"tasks\":[{\"id\":\"writer\",\"title\":\"Writer\",\"prompt\":\"Writer\",\"primaryDomain\":\"backend\",\"supportingDomains\":[],\"riskFlags\":[],\"humanApprovalRequired\":false,\"estimatedTokens\":20,\"dependsOn\":[],\"allowedPaths\":[\"src/value.mjs\"],\"acceptanceChecks\":[\"npm test\"]}]}\n```" : /^Security review:/.test(thread.goal) ? "```json\n{\"verdict\":\"pass\",\"summary\":\"secure\",\"findings\":[],\"executedChecks\":[],\"notRunChecks\":[]}\n```" : /^QA:/.test(thread.goal) ? "```json\n{\"verdict\":\"pass\",\"summary\":\"quality verified\",\"findings\":[],\"executedChecks\":[],\"notRunChecks\":[]}\n```" : "writer complete"; return { thread: { turns: [{ id: `turn-${threadId}`, items: [{ type: "agentMessage", text }] }] } }; }
@@ -59,5 +59,16 @@ test("a fresh delivery cancels stranded historical tasks but preserves their rec
     assert.equal(router.store.getTask(stranded.id).status, "cancelled");
     assert.match(router.store.getTask(stranded.id).error, /superseded_by_fresh_delivery/);
     assert.equal(final.state, "completed_merged");
+  } finally { router.close(); rmSync(fixture.root, { recursive: true, force: true }); }
+});
+
+test("tracking-only delivery does not send a token cap to App Server goals", async () => {
+  const fixture = setup(false); fixture.config.budget.enforceLocalLimits = false;
+  const client = new DeliveryClient(); fixture.config.appServerClientFactory = () => client;
+  const router = new SwarmRouter(fixture.config); const coordinator = new DeliveryCoordinator(router);
+  try {
+    await coordinator.begin({ source: fixture.source });
+    assert.ok(client.goals.length > 0);
+    assert.equal(client.goals.some((goal) => "tokenBudget" in goal), false);
   } finally { router.close(); rmSync(fixture.root, { recursive: true, force: true }); }
 });

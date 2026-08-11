@@ -4,3 +4,8 @@ config/swarm.config.json
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
+**/bin/
+**/obj/
+**/node_modules/
+**/.next/
+**/coverage/
