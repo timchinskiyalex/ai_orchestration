@@ -738,10 +738,13 @@ export class SwarmRouter extends EventEmitter {
       const component = configured.get(root);
       if (!component) throw new Error(`No allowlisted scaffold adapter is configured for '${root}'`);
       if (component.adapter === "next-node") {
-        const npx = process.platform === "win32" ? "npx.cmd" : "npx";
         const packagePath = join(worktree, root, "package.json");
-        if (!existsSync(packagePath)) await exec(npx, ["create-next-app@latest", root, "--ts", "--eslint", "--app", "--src-dir", "--use-npm", "--yes"], { cwd: worktree, timeout: 300_000, windowsHide: true });
-        else await exec(process.platform === "win32" ? "npm.cmd" : "npm", ["install", "--package-lock-only", "--ignore-scripts"], { cwd: join(worktree, root), timeout: 180_000, windowsHide: true });
+        if (!/^[A-Za-z0-9_./-]+$/.test(root)) throw new Error(`Unsafe configured Node scaffold path '${root}'`);
+        const runNodePackageCommand = async (cwd, command, timeout) => process.platform === "win32"
+          ? exec(process.env.ComSpec ?? "cmd.exe", ["/d", "/s", "/c", command], { cwd, timeout, windowsHide: true })
+          : exec(command.split(" ")[0], command.split(" ").slice(1), { cwd, timeout, windowsHide: true });
+        if (!existsSync(packagePath)) await runNodePackageCommand(worktree, `npx create-next-app@latest ${root} --ts --eslint --app --src-dir --use-npm --yes`, 300_000);
+        else await runNodePackageCommand(join(worktree, root), "npm install --package-lock-only --ignore-scripts", 180_000);
         const packageJson = JSON.parse(readFileSync(packagePath, "utf8"));
         packageJson.scripts ??= {};
         packageJson.scripts.test ??= "node --test";
