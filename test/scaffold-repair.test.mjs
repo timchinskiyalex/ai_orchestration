@@ -59,10 +59,10 @@ test("deterministic scaffold creates a WorkerArtifact before two dependent write
     git(root, ["init", "-b", "main"]); mkdirSync(source); writeFileSync(join(source, "spec.md"), "# Product\nCreate frontend and backend."); writeFileSync(join(root, "package.json"), JSON.stringify({ name: "controller-only" })); git(root, ["add", "."]); git(root, ["-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "base"]);
     router = new SwarmRouter(configuration(root, client));
     const run = await new DeliveryCoordinator(router).begin({ source,
-      remoteGitAdapter: { async pushCandidate() { return { status: "pushed" }; } },
-      pullRequestAdapter: { async ensurePullRequest() { return { status: "open", number: 1, url: "https://example.test/pr/1" }; } },
+      remoteGitAdapter: { async pushCandidate({ sha }) { return { status: "pushed", verifiedSha: sha }; } },
+      pullRequestAdapter: { async ensurePullRequest({ sha }) { return { status: "open", number: 1, url: "https://example.test/pr/1", headSha: sha }; } },
       remoteCiAdapter: { async waitForChecks() { return { status: "passed", checkRuns: [] }; } },
-      mergeAdapter: { async merge() { return { status: "merged", mainSha: "a".repeat(40), mergeSha: "a".repeat(40) }; } }
+      mergeAdapter: { async merge() { return { status: "merged", mainSha: "a".repeat(40), mergeSha: "a".repeat(40), targetVerified: true }; } }
     });
     const scaffold = router.list().find((task) => task.title === "Scaffold product roots");
     assert.equal(run.state, "completed_merged");

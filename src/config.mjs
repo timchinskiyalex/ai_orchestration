@@ -56,6 +56,10 @@ export function loadConfig(configPath) {
   config.remote.allowedRemotes ??= ["origin"];
   config.remote.candidateBranchPrefix ??= "swarm/candidate/";
   config.remote.requireCi ??= false;
+  // An explicit allowlist is the preferred CI policy.  An empty list means
+  // "read the target branch protection"; it never means that arbitrary green
+  // checks are sufficient.
+  config.remote.requiredCiContexts ??= [];
   config.remote.ciTimeoutMs ??= 900000;
   config.remote.ciPollIntervalMs ??= 10000;
   config.remote.mergeMethod ??= "merge";
@@ -101,6 +105,8 @@ export function loadConfig(configPath) {
   for (const key of ["leaseHeartbeatMs", "staleLeaseMs", "shutdownGraceMs"]) if (!Number.isInteger(config.delivery[key]) || config.delivery[key] < 250) throw new Error(`delivery.${key} must be an integer of at least 250`);
   if (config.autonomy.mode === "autonomous" && config.delivery.maxRemediationRounds !== config.autonomy.maxRemediationRounds) throw new Error("delivery.maxRemediationRounds must match autonomy.maxRemediationRounds in autonomous mode");
   if (typeof config.remote.enabled !== "boolean" || typeof config.remote.requireCi !== "boolean") throw new Error("remote.enabled and remote.requireCi must be boolean");
+  if (!Array.isArray(config.remote.requiredCiContexts) || config.remote.requiredCiContexts.some((item) => typeof item !== "string" || !item.trim() || item.length > 200) || new Set(config.remote.requiredCiContexts).size !== config.remote.requiredCiContexts.length) throw new Error("remote.requiredCiContexts must be an array of unique non-empty check context names");
+  config.remote.requiredCiContexts = config.remote.requiredCiContexts.map((item) => item.trim());
   if (typeof config.remote.remoteName !== "string" || !Array.isArray(config.remote.allowedRemotes) || !config.remote.allowedRemotes.every((item) => typeof item === "string") || !config.remote.allowedRemotes.includes(config.remote.remoteName)) throw new Error("remote.remoteName must be included in remote.allowedRemotes");
   if (typeof config.remote.candidateBranchPrefix !== "string" || !config.remote.candidateBranchPrefix.startsWith("swarm/candidate/") || config.remote.candidateBranchPrefix.includes("..")) throw new Error("remote.candidateBranchPrefix must remain under swarm/candidate/");
   if (!Number.isInteger(config.remote.ciTimeoutMs) || config.remote.ciTimeoutMs < 1_000 || config.remote.ciTimeoutMs > 3_600_000) throw new Error("remote.ciTimeoutMs must be an integer from 1000 to 3600000");

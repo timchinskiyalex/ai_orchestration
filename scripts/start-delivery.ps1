@@ -45,14 +45,16 @@ if ($LASTEXITCODE -ne 0) { throw "Could not recover stale delivery state" }
 if ($recovery) { Write-Host ($recovery -join "`n") }
 
 $status = Get-DeliveryStatus
-$terminal = @('completed_merged', 'failed', 'interrupted', 'blocked_budget', 'blocked_quota', 'blocked_credentials', 'blocked_ci', 'blocked_branch_protection', 'conflict_blocked')
-$resume = $status.deliveryRun -and -not ($terminal -contains $status.deliveryRun.state)
+$terminal = @('completed_merged', 'completed_candidate_ready', 'failed', 'interrupted', 'blocked_budget', 'blocked_quota', 'blocked_credentials', 'blocked_ci', 'blocked_branch_protection', 'conflict_blocked')
+$resumable = @('interrupted', 'blocked_credentials', 'blocked_ci', 'blocked_branch_protection', 'running', 'awaiting_human', 'awaiting_human_remote_handoff')
+$resume = $status.deliveryRun -and ($resumable -contains $status.deliveryRun.state)
 $deliveryArgs = @('src/index.mjs', 'deliver')
 if ($resume) { $deliveryArgs += '--resume' } else { $deliveryArgs += @('--source', $source) }
 
 Write-Host "Live monitor opened in a separate PowerShell window. Main window will print stage and budget progress. Starting autonomous delivery."
 & node @deliveryArgs
-if ($LASTEXITCODE -ne 0) { throw "Delivery command failed with exit code $LASTEXITCODE" }
+$deliveryExitCode = $LASTEXITCODE
+if ($deliveryExitCode -ne 0) { Write-Host "Delivery command ended non-zero; reading persisted final summary before returning." }
 
 $final = Get-DeliveryStatus
 if (-not $final.deliveryRun) { throw "Delivery state was not found after execution" }

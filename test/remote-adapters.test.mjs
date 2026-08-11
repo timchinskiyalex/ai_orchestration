@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { PullRequestAdapter, RemoteCiAdapter, RemoteGitAdapter, assertSafeRemoteTarget } from "../src/remote-adapters.mjs";
+import { GitHubCiAdapter, PullRequestAdapter, RemoteCiAdapter, RemoteGitAdapter, assertSafeRemoteTarget } from "../src/remote-adapters.mjs";
 
 test("RemoteGitAdapter verifies exact SHA without force-push and refuses unsafe targets", async () => {
   const calls = []; let pushed = false; const sha = "a".repeat(40);
@@ -15,4 +15,16 @@ test("RemoteGitAdapter verifies exact SHA without force-push and refuses unsafe 
 test("missing remote CI and PR adapters report human handoff instead of success", async () => {
   assert.equal((await new RemoteCiAdapter().verify({})).status, "unavailable");
   assert.equal((await new PullRequestAdapter().handoff({})).status, "unavailable");
+});
+
+function githubForChecks({ runs = [], statuses = [] }) { return { async repositoryName() { return "owner/repo"; }, async api(args) { const path = args.at(-1); if (path.includes("check-runs")) return { stdout: JSON.stringify({ check_runs: runs }) }; if (path.endsWith("/status")) return { stdout: JSON.stringify({ sha: "a".repeat(40), statuses }) }; throw new Error(`Unexpected GitHub API request: ${path}`); } }; }
+
+test("required CI contexts are evaluated only for the exact candidate SHA", async () => {
+  const candidate = { sha: "a".repeat(40), base: "main" }; const check = (name, status, conclusion = null, headSha = candidate.sha) => ({ name, status, conclusion, head_sha: headSha });
+  const verify = async (fixture) => new GitHubCiAdapter({ github: githubForChecks(fixture), requiredContexts: ["build"], timeoutMs: 1, pollIntervalMs: 1 }).waitForChecks({ pullRequest: { number: 7 }, candidate });
+  const unrelated = await verify({ runs: [check("unrelated", "completed", "success")] }); assert.equal(unrelated.status, "timed_out"); assert.equal(unrelated.required[0].state, "missing");
+  const pending = await verify({ runs: [check("build", "in_progress", null)] }); assert.equal(pending.status, "timed_out"); assert.equal(pending.required[0].state, "pending");
+  const failed = await verify({ runs: [check("build", "completed", "failure")] }); assert.equal(failed.status, "failed");
+  const stale = await verify({ runs: [check("build", "completed", "success", "b".repeat(40))] }); assert.equal(stale.status, "timed_out"); assert.equal(stale.required[0].state, "missing");
+  const passed = await verify({ runs: [check("build", "completed", "success")] }); assert.equal(passed.status, "passed"); assert.deepEqual(passed.requiredContexts, ["build"]);
 });

@@ -32,6 +32,14 @@ test("quota-free autonomous flow materializes DAG, Security/QA, finalizes writer
     const tasks = router.list(); const backend = tasks.find((task) => task.role === "backend"); const security = tasks.find((task) => task.role === "security"); const qa = tasks.find((task) => task.role === "qa");
     assert.ok(backend && security && qa, JSON.stringify(tasks.map((task) => ({ role: task.role, status: task.status, error: task.error })))); assert.equal(backend.status, "done"); assert.deepEqual(security.dependencies, [backend.id]); assert.deepEqual(qa.dependencies, [security.id]);
     assert.equal(router.store.getTask(backend.id).status, "done"); assert.equal(router.store.getTask(security.id).status, "done"); assert.equal(router.store.getTask(qa.id).status, "done"); assert.equal(router.store.securityReport(security.id).report.verdict, "pass"); assert.equal(router.store.qualityReport(qa.id).report.verdict, "pass"); const artifact = router.store.workerArtifactRecord(backend.id); assert.ok(artifact?.path);
+    const markStatus = (task, status) => { router.store.transition(task.id, "preparing"); router.store.transition(task.id, "running"); router.store.transition(task.id, status); };
+    const unreviewed = router.enqueue({ role: "backend", title: "Unreviewed artifact", prompt: "Already finalized", allowedPaths: ["src/value.mjs"] });
+    markStatus(unreviewed, "done"); router.store.recordWorkerArtifact(unreviewed.id, artifact.path, { ...artifact.artifact, taskId: unreviewed.id });
+    await assert.rejects(router.integrateFinalized([unreviewed.id]), /passed Security and QA review chain/);
+    const failed = router.enqueue({ role: "backend", title: "Failed artifact", prompt: "Already finalized", allowedPaths: ["src/value.mjs"] });
+    markStatus(failed, "failed"); router.store.recordWorkerArtifact(failed.id, artifact.path, { ...artifact.artifact, taskId: failed.id });
+    await assert.rejects(router.integrateFinalized([failed.id]), /must be done/);
+    await assert.rejects(router.integrateFinalized([backend.id, backend.id]), /must be unique/);
     const integration = await router.integrateFinalized([backend.id]); assert.equal(integration.manifest.status, "candidate_ready");
   } finally { router?.close(); rmSync(root, { recursive: true, force: true }); }
 });

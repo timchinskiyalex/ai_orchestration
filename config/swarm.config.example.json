@@ -53,6 +53,7 @@
     "allowedRemotes": ["origin"],
     "candidateBranchPrefix": "swarm/candidate/",
     "requireCi": true,
+    "requiredCiContexts": [],
     "ciTimeoutMs": 900000,
     "ciPollIntervalMs": 10000,
     "mergeMethod": "merge"

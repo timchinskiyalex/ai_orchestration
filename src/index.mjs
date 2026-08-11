@@ -5,6 +5,7 @@ import { loadConfig } from "./config.mjs";
 import { ingestDocumentation } from "./project-intake.mjs";
 import { scaffoldInstance } from "./instance-scaffold.mjs";
 import { readLatestE2eReport } from "./e2e-report.mjs";
+import { deliveryExitCode, deliveryFinalSummary } from "./delivery-presentation.mjs";
 
 const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const configPath = process.env.SWARM_CONFIG ?? join(root, "config", "swarm.config.json");
@@ -19,6 +20,11 @@ function option(name, required = true) {
   return args[index + 1];
 }
 const hasFlag = (name) => args.includes(name);
+function integrationTaskIds(value) {
+  const ids = value.split(",").map((item) => item.trim());
+  if (ids.some((id) => !id)) throw new Error("--tasks must be a comma-separated list of task ids");
+  return ids;
+}
 
 function usage() {
   console.log(`Usage:
@@ -116,6 +122,8 @@ try {
         ? await coordinator.resume()
         : await coordinator.begin({ source: option("--source") });
       console.log(JSON.stringify(delivery, null, 2));
+      console.log(`FINAL DELIVERY SUMMARY ${JSON.stringify(deliveryFinalSummary(router, delivery))}`);
+      process.exitCode = deliveryExitCode(delivery);
     }
     else if (command === "ingest-docs") {
       const result = ingestDocumentation({ source: option("--source"), repository: router.config.repository, destinationRelative: router.config.project.documentationDir });
@@ -145,7 +153,7 @@ try {
       const task = router.enqueue({ role: option("--role"), title: option("--title"), prompt: option("--prompt"), parentTaskId: option("--parent", false) });
       console.log(`Queued ${task.id} (${task.role}): ${task.title}`);
     } else if (command === "integrate") {
-      const result = await router.integrateFinalized(option("--tasks").split(",").map((value) => value.trim()).filter(Boolean));
+      const result = await router.integrateFinalized(integrationTaskIds(option("--tasks")));
       console.log(`Integration manifest: ${result.path}`);
       console.table([{ status: result.manifest.status, candidateBranch: result.manifest.branch, candidateSha: result.manifest.headSha, localVerification: result.manifest.localVerification?.status ?? "unknown", remoteCi: result.manifest.remoteCi?.status ?? "unavailable", pr: result.manifest.pullRequest?.status ?? "unavailable", nextAction: result.manifest.humanMergeGate?.action }]);
     } else if (command === "run-to-integration") {

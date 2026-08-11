@@ -160,6 +160,13 @@ export class SwarmRouter extends EventEmitter {
     return run;
   }
 
+  resumeDeliveryRun(id) {
+    const sessionId = randomUUID();
+    const run = this.store.resumeDeliveryRun(id, { ownerPid: process.pid, ownerSessionId: sessionId });
+    this.activateDeliveryRun(run.id, sessionId);
+    return run;
+  }
+
   lifecycleEvents() { return [...this.lifecycleTrace]; }
 
   appServerDiagnostics() {
@@ -274,9 +281,17 @@ export class SwarmRouter extends EventEmitter {
   async integrateFinalized(taskIds) {
     const ids = Array.isArray(taskIds) ? taskIds : [];
     if (!ids.length) throw new Error("Provide at least one finalized task id");
+    if (new Set(ids).size !== ids.length) throw new Error("Integration task ids must be unique");
     const artifacts = ids.map((id) => {
+      const task = this.store.getTask(id);
+      if (!task) throw new Error(`Task ${id} has no finalized WorkerArtifact (task was not found)`);
+      if (task.status !== "done") throw new Error(`Task ${id} must be done before integration (current status: ${task.status})`);
       const artifact = this.store.workerArtifact(id);
       if (!artifact) throw new Error(`Task ${id} has no finalized WorkerArtifact`);
+      if (artifact.taskId !== task.id) throw new Error(`Task ${id} WorkerArtifact taskId does not match the task`);
+      if (this.config.roles[task.role]?.sandbox === "workspace-write" && !this.#writerReviewPassed(task.id)) {
+        throw new Error(`Task ${id} requires a passed Security and QA review chain before integration`);
+      }
       return artifact;
     });
     const { overlay } = loadProjectOverlay(this.config.repository, this.config.project.generatedDir);
@@ -294,18 +309,28 @@ export class SwarmRouter extends EventEmitter {
     const auto = autonomous && autonomy.autoPush && autonomy.autoCreatePullRequest && autonomy.autoMerge;
     if (!remote.enabled || (!auto && !confirmRemotePush)) return { terminalState: autonomous ? "blocked_credentials" : "awaiting_human", status: autonomous ? "blocked_remote" : "awaiting_human_remote_handoff", reason: remote.enabled ? "Remote publication is disabled by autonomy policy." : "Remote publication is disabled in config.", candidate: { branch: manifest.branch, sha: manifest.candidateSha } };
     const candidate = { branch: manifest.branch, sha: manifest.candidateSha, base: this.config.baseRef };
+    if (!candidate.branch || !/^[0-9a-f]{40}$/i.test(candidate.sha ?? "")) return { terminalState: "conflict_blocked", status: "conflict_blocked", reason: "Integration manifest does not contain an exact candidate branch and SHA." };
+    const checkpoint = (stage, extra = {}) => {
+      const run = this.activeDeliveryRunId ? this.store.deliveryRun(this.activeDeliveryRunId) : null;
+      if (!run) return;
+      if (run.candidate && (run.candidate.branch !== candidate.branch || run.candidate.sha.toLowerCase() !== candidate.sha.toLowerCase())) throw new Error("Persisted delivery candidate identity does not match the integration manifest.");
+      this.store.updateDeliveryRun(run.id, { state: "running", integrationPath: integration.path ?? run.integrationPath, candidate, publicationCheckpoint: { stage, candidate, updatedAt: new Date().toISOString(), ...extra } });
+    };
     const failure = (error, stage, extra = {}) => {
       const code = error instanceof RemoteAdapterError ? error.code : "remote_failed";
       const terminalState = code === "credentials" ? "blocked_credentials" : code === "branch_protection" ? "blocked_branch_protection" : stage === "ci" ? "blocked_ci" : "failed";
       return { terminalState, status: terminalState, stage, reason: String(error.message ?? error).slice(0, 500), candidate, recovery: { action: "Inspect the persisted remote action and resolve the stated remote condition; rerun the launcher to resume idempotently." }, ...extra };
     };
-    const runAction = async ({ key, kind, action }) => {
+    const runAction = async ({ key, kind, stage, action }) => {
       let stored = this.store.externalAction(key);
       if (stored?.status === "passed") return stored.payload;
       if (!stored) this.store.recordExternalAction({ idempotencyKey: key, kind, status: "started", payload: { candidate } });
+      else this.store.updateExternalAction(key, { status: "started", payload: { ...stored.payload, candidate, retrying: true } });
+      checkpoint(stage, { externalAction: key, status: "started" });
       try {
         const payload = await action();
         this.store.updateExternalAction(key, { status: payload?.status === "failed" || payload?.status === "timed_out" ? "failed" : "passed", payload });
+        checkpoint(stage, { externalAction: key, status: "passed" });
         return payload;
       } catch (error) {
         this.store.updateExternalAction(key, { status: "failed", payload: { reason: String(error.message ?? error).slice(0, 500), code: error.code ?? null } });
@@ -314,26 +339,28 @@ export class SwarmRouter extends EventEmitter {
     };
     try {
       const pushKey = `push:${remote.remoteName}:${candidate.branch}:${candidate.sha}`;
-      const remotePush = await runAction({ key: pushKey, kind: "remote-push", action: () => (remoteGitAdapter ?? new RemoteGitAdapter({ repository: this.config.repository, remoteName: remote.remoteName, allowedRemotes: remote.allowedRemotes, branchPrefix: remote.candidateBranchPrefix })).pushCandidate({ branch: candidate.branch, sha: candidate.sha, confirmRemotePush: auto || confirmRemotePush, idempotencyKey: pushKey }) });
+      checkpoint("publication-ready");
+      const remotePush = await runAction({ key: pushKey, kind: "remote-push", stage: "push", action: () => (remoteGitAdapter ?? new RemoteGitAdapter({ repository: this.config.repository, remoteName: remote.remoteName, allowedRemotes: remote.allowedRemotes, branchPrefix: remote.candidateBranchPrefix })).pushCandidate({ branch: candidate.branch, sha: candidate.sha, confirmRemotePush: auto || confirmRemotePush, idempotencyKey: pushKey }) });
+      if ((remotePush?.verifiedSha ?? remotePush?.sha)?.toLowerCase() !== candidate.sha.toLowerCase()) throw new RemoteAdapterError("remote_sha_mismatch", "Candidate push did not verify the exact candidate SHA.");
       if (!autonomy.autoCreatePullRequest && !confirmRemotePush) return { terminalState: "awaiting_human", status: "awaiting_human_remote_handoff", candidate, remotePush, reason: "Candidate is pushed; manual PR mode is active." };
       const prKey = `pr:${candidate.branch}:${candidate.base}:${candidate.sha}`;
-      const pullRequest = await runAction({ key: prKey, kind: "pull-request", action: async () => {
+      const pullRequest = await runAction({ key: prKey, kind: "pull-request", stage: "pull-request", action: async () => {
         const adapter = pullRequestAdapter ?? new GitHubPullRequestAdapter({ repository: this.config.repository });
         if (typeof adapter.ensurePullRequest === "function") return adapter.ensurePullRequest({ branch: candidate.branch, base: candidate.base, sha: candidate.sha, idempotencyKey: prKey });
         if (typeof adapter.handoff === "function") return adapter.handoff(candidate);
         throw new RemoteAdapterError("pr_create_failed", "Configured pull request adapter cannot create a pull request.");
       } });
-      if (!pullRequest?.number) throw new RemoteAdapterError("pr_create_failed", "Pull request adapter did not return a PR number.");
+      if (!pullRequest?.number || pullRequest.headSha?.toLowerCase() !== candidate.sha.toLowerCase()) throw new RemoteAdapterError("pr_create_failed", "Pull request adapter did not verify that the PR head is the candidate SHA.");
       const ciKey = `ci:${pullRequest.number}:${candidate.sha}`;
-      const remoteCi = await runAction({ key: ciKey, kind: "remote-ci", action: async () => {
-        const adapter = remoteCiAdapter ?? new GitHubCiAdapter({ repository: this.config.repository, timeoutMs: remote.ciTimeoutMs, pollIntervalMs: remote.ciPollIntervalMs });
+      const remoteCi = await runAction({ key: ciKey, kind: "remote-ci", stage: "ci", action: async () => {
+        const adapter = remoteCiAdapter ?? new GitHubCiAdapter({ repository: this.config.repository, timeoutMs: remote.ciTimeoutMs, pollIntervalMs: remote.ciPollIntervalMs, requiredContexts: remote.requiredCiContexts });
         return typeof adapter.waitForChecks === "function" ? adapter.waitForChecks({ pullRequest, candidate }) : adapter.verify(candidate);
       } });
       if (remote.requireCi && remoteCi.status !== "passed") return { terminalState: "blocked_ci", status: "blocked_ci", candidate, remotePush, pullRequest, remoteCi, reason: remoteCi.reason ?? "Required remote CI is not green.", recovery: { action: "Read the persisted CI failure summary. A CI-only failure has no safely scoped source remediation artifact, so the candidate is retained without a forced merge." } };
       if (!autonomy.autoMerge && !confirmRemotePush) return { terminalState: "completed_candidate_ready", status: "completed_candidate_ready", candidate, remotePush, pullRequest, remoteCi };
       const mergeKey = `merge:${pullRequest.number}:${candidate.sha}`;
-      const merge = await runAction({ key: mergeKey, kind: "pull-request-merge", action: () => (mergeAdapter ?? new GitHubMergeAdapter({ repository: this.config.repository, mergeMethod: remote.mergeMethod })).merge({ pullRequest, candidate, base: candidate.base, idempotencyKey: mergeKey }) });
-      if (merge.status !== "merged" || !merge.mainSha) throw new RemoteAdapterError("merge_verify_failed", "Merge adapter did not verify main after merge.");
+      const merge = await runAction({ key: mergeKey, kind: "pull-request-merge", stage: "merge", action: () => (mergeAdapter ?? new GitHubMergeAdapter({ repository: this.config.repository, mergeMethod: remote.mergeMethod })).merge({ pullRequest, candidate, base: candidate.base, idempotencyKey: mergeKey }) });
+      if (merge.status !== "merged" || !merge.mainSha || merge.targetVerified !== true) throw new RemoteAdapterError("merge_verify_failed", "Merge adapter did not verify the target branch after merge.");
       return { terminalState: "completed_merged", status: "completed_merged", candidate, remotePush, pullRequest, remoteCi, merge };
     } catch (error) {
       return failure(error, error?.code?.startsWith("ci") ? "ci" : error?.code?.startsWith("pr") ? "pull-request" : error?.code?.startsWith("merge") || error?.code === "branch_protection" ? "merge" : "push");
@@ -510,6 +537,7 @@ export class SwarmRouter extends EventEmitter {
 
     let worktree = task.worktree;
     let branch = task.branch;
+    if (roleConfig.sandbox === "workspace-write") this._assertWriterArtifactLineage(task);
     if (task.artifactBaseSha && roleConfig.sandbox === "workspace-write") {
       ({ worktree, branch } = await this.worktrees.create(task.id, { baseSha: task.artifactBaseSha }));
     } else if (task.sourceWriterTaskId) {
@@ -607,6 +635,7 @@ export class SwarmRouter extends EventEmitter {
         ({ overlayContext, resultText, finalized: finalizedArtifact } = await this.#finalizeWriterWithRepair(client, task, threadId, worktree, branch, overlayContext, resultText));
         const finalized = finalizedArtifact;
         this.store.recordWorkerArtifact(task.id, finalized.path, finalized.artifact);
+        this.#connectArtifactDependents(task, finalized.artifact);
       }
       this.store.transition(task.id, finalStatusForRole(task.role, { autonomous: this.isAutonomous() }));
       if (task.role === "bootstrap" && this.isAutonomous()) this.#enqueuePlanner(task);
@@ -660,7 +689,7 @@ export class SwarmRouter extends EventEmitter {
     this.store.setResultPath(task.id, resultPath);
     const finalized = await this.finalizer.finalize({ task, worktree, branch, overlay: refreshed.overlay, overlayPath: refreshed.path });
     this.store.recordWorkerArtifact(task.id, finalized.path, finalized.artifact);
-    this.#connectScaffoldDependents(task, finalized.artifact);
+    this.#connectArtifactDependents(task, finalized.artifact);
     this.store.transition(task.id, finalStatusForRole(task.role, { autonomous: this.isAutonomous() }));
     this.#lifecycle("deterministic scaffold completed", { taskId: task.id, artifactPath: finalized.path, components: provision.provisioned.map((item) => item.root) });
   }
@@ -817,7 +846,9 @@ export class SwarmRouter extends EventEmitter {
     return [...descendants].some((candidate) => {
       const security = tasks.find((task) => task.role === "security" && task.sourceWriterTaskId === candidate);
       const quality = tasks.find((task) => task.role === "qa" && task.sourceWriterTaskId === candidate);
-      return this.store.securityReport(security?.id)?.report.verdict === "pass" && this.store.qualityReport(quality?.id)?.report.verdict === "pass";
+      return security?.status === "done" && quality?.status === "done"
+        && this.store.securityReport(security.id)?.report.verdict === "pass"
+        && this.store.qualityReport(quality.id)?.report.verdict === "pass";
     });
   }
 
@@ -982,6 +1013,7 @@ export class SwarmRouter extends EventEmitter {
     };
     const primaryIds = new Map(dispatch.map(({ item }) => [item.id, randomUUID()]));
     const scaffoldTaskId = primaryIds.get("scaffold-product") ?? null;
+    const primaryRoleByTaskId = new Map(dispatch.map(({ item }) => [primaryIds.get(item.id), item.primaryDomain]));
     const specs = [];
     // Build and validate the whole dispatch graph before making one atomic
     // StateStore write. This prevents a rejected route from leaving a partial DAG.
@@ -990,10 +1022,16 @@ export class SwarmRouter extends EventEmitter {
       const primaryId = primaryIds.get(item.id);
       const dependencies = [plannerTask.id, ...dependencyPlanIds.map((dependency) => primaryIds.get(dependency))];
       if (scaffoldTaskId && item.id !== "scaffold-product" && primary.sandbox === "workspace-write" && !dependencies.includes(scaffoldTaskId)) dependencies.push(scaffoldTaskId);
+      const writerPredecessors = dependencies
+        .filter((dependency) => dependency !== plannerTask.id)
+        .filter((dependency) => this.config.roles[primaryRoleByTaskId.get(dependency)]?.sandbox === "workspace-write");
+      if (writerPredecessors.length > 1) {
+        throw new Error(`Planner validation: writer '${item.id}' has multiple writer artifact predecessors; split or serialize the plan until controller-owned fan-in artifacts are supported`);
+      }
       const prompt = item.id === "scaffold-product"
         ? "[[product-scaffold]]\nController-owned scaffold contract: create every declared product root now. frontend/ must be a runnable Next.js application with package.json, npm lockfile, build and test scripts. backend/ must be an ASP.NET Core Web API solution with an xUnit test project. Do not create placeholders, plans, or a partial root. Run the declared checks after files are written."
         : item.prompt;
-      specs.push({ id: primaryId, role: item.primaryDomain, parentTaskId: plannerTask.id, title: item.title, prompt, allowedPaths: item.allowedPaths, acceptanceChecks: item.acceptanceChecks, dependencies, estimatedTokens: item.estimatedTokens, tokenBudget: primary.tokenBudget, maxAttempts: 1, humanApprovalRequired: elevatedGate, riskFlags: item.riskFlags, supportingDomains: item.supportingDomains, deliveryRunId: plannerTask.deliveryRunId ?? this.activeDeliveryRunId });
+      specs.push({ id: primaryId, role: item.primaryDomain, parentTaskId: plannerTask.id, title: item.title, prompt, allowedPaths: item.allowedPaths, acceptanceChecks: item.acceptanceChecks, dependencies, estimatedTokens: item.estimatedTokens, tokenBudget: primary.tokenBudget, maxAttempts: 1, humanApprovalRequired: elevatedGate, riskFlags: item.riskFlags, supportingDomains: item.supportingDomains, artifactDependencies: writerPredecessors, deliveryRunId: plannerTask.deliveryRunId ?? this.activeDeliveryRunId });
       let predecessorId = primaryId;
       const mandatoryReview = primary.sandbox === "workspace-write";
       if ((mandatoryReview || securityRequired) && item.primaryDomain !== "security") {
@@ -1025,10 +1063,23 @@ export class SwarmRouter extends EventEmitter {
     await Promise.allSettled(active.map((turn) => this.#interruptAndAwaitTurn(client, turn, "delivery_fail_fast", { timeoutMs: this.config.delivery?.shutdownGraceMs ?? 3_000 })));
   }
 
-  #connectScaffoldDependents(scaffoldTask, artifact) {
+  #connectArtifactDependents(predecessor, artifact) {
     for (const task of this.store.listTasks()) {
-      if (task.id === scaffoldTask.id || !task.dependencies.includes(scaffoldTask.id) || this.config.roles[task.role]?.sandbox !== "workspace-write") continue;
-      this.store.setArtifactLineage(task.id, { artifactBaseSha: artifact.headSha, artifactDependencies: [scaffoldTask.id] });
+      if (task.id === predecessor.id || !task.dependencies.includes(predecessor.id) || this.config.roles[task.role]?.sandbox !== "workspace-write") continue;
+      const writerPredecessors = task.dependencies.filter((dependency) => this.config.roles[this.store.getTask(dependency)?.role]?.sandbox === "workspace-write");
+      if (writerPredecessors.length > 1) throw new Error(`Writer task ${task.id} has multiple writer artifact predecessors; controller-owned fan-in artifacts are not supported`);
+      if (writerPredecessors.length === 1) this.store.setArtifactLineage(task.id, { artifactBaseSha: artifact.headSha, artifactDependencies: writerPredecessors });
+    }
+  }
+  _assertWriterArtifactLineage(task) {
+    const writerPredecessors = task.dependencies.filter((dependency) => this.config.roles[this.store.getTask(dependency)?.role]?.sandbox === "workspace-write");
+    if (writerPredecessors.length > 1) throw new Error(`Writer task ${task.id} has multiple writer artifact predecessors; controller-owned fan-in artifacts are not supported`);
+    if (!writerPredecessors.length) return;
+    const predecessorId = writerPredecessors[0];
+    const predecessor = this.store.workerArtifact(predecessorId);
+    if (!predecessor) throw new Error(`Writer task ${task.id} cannot start before predecessor ${predecessorId} has a WorkerArtifact`);
+    if (task.artifactBaseSha !== predecessor.headSha || !task.artifactDependencies.includes(predecessorId)) {
+      throw new Error(`Writer task ${task.id} is missing artifact lineage from predecessor ${predecessorId}`);
     }
   }
   #inheritedWorktree(task) {
