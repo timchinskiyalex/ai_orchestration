@@ -997,7 +997,10 @@ export class SwarmRouter extends EventEmitter {
       const primaryId = primaryIds.get(item.id);
       const dependencies = [plannerTask.id, ...dependencyPlanIds.map((dependency) => primaryIds.get(dependency))];
       if (scaffoldTaskId && item.id !== "scaffold-product" && primary.sandbox === "workspace-write" && !dependencies.includes(scaffoldTaskId)) dependencies.push(scaffoldTaskId);
-      specs.push({ id: primaryId, role: item.primaryDomain, parentTaskId: plannerTask.id, title: item.title, prompt: item.id === "scaffold-product" ? `[[product-scaffold]]\n${item.prompt}` : item.prompt, allowedPaths: item.allowedPaths, acceptanceChecks: item.acceptanceChecks, dependencies, estimatedTokens: item.estimatedTokens, tokenBudget: primary.tokenBudget, maxAttempts: 1, humanApprovalRequired: elevatedGate, riskFlags: item.riskFlags, supportingDomains: item.supportingDomains, deliveryRunId: plannerTask.deliveryRunId ?? this.activeDeliveryRunId });
+      const prompt = item.id === "scaffold-product"
+        ? "[[product-scaffold]]\nController-owned scaffold contract: create every declared product root now. frontend/ must be a runnable Next.js application with package.json, npm lockfile, build and test scripts. backend/ must be an ASP.NET Core Web API solution with an xUnit test project. Do not create placeholders, plans, or a partial root. Run the declared checks after files are written."
+        : item.prompt;
+      specs.push({ id: primaryId, role: item.primaryDomain, parentTaskId: plannerTask.id, title: item.title, prompt, allowedPaths: item.allowedPaths, acceptanceChecks: item.acceptanceChecks, dependencies, estimatedTokens: item.estimatedTokens, tokenBudget: primary.tokenBudget, maxAttempts: 1, humanApprovalRequired: elevatedGate, riskFlags: item.riskFlags, supportingDomains: item.supportingDomains, deliveryRunId: plannerTask.deliveryRunId ?? this.activeDeliveryRunId });
       let predecessorId = primaryId;
       const mandatoryReview = primary.sandbox === "workspace-write";
       if ((mandatoryReview || securityRequired) && item.primaryDomain !== "security") {

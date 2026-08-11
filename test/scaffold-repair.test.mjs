@@ -103,6 +103,8 @@ test("incomplete scaffold is repaired in its existing worker thread and finalize
     await new DeliveryCoordinator(router).begin({ source });
     const scaffold = router.list().find((task) => task.title === "Scaffold product roots");
     assert.equal(scaffold.status, "done");
+    assert.match(scaffold.prompt, /Controller-owned scaffold contract/);
+    assert.doesNotMatch(scaffold.prompt, /Create every root/);
     assert.equal(client.scaffoldTurns, 2);
     assert.ok(router.store.workerArtifact(scaffold.id));
     assert.equal(router.lifecycleEvents().some((event) => event.type === "scaffold completion retry"), true);
