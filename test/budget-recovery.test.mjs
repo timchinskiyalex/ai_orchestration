@@ -13,13 +13,13 @@ const roles = Object.fromEntries(["bootstrap", "planner", "backend", "frontend",
 }]));
 
 class UsageFakeAppServer extends EventEmitter {
-  constructor({ usage = null, exit = false, resolvedTurnId = null, completeAfterUsage = false } = {}) { super(); this.usage = usage; this.exit = exit; this.resolvedTurnId = resolvedTurnId; this.completeAfterUsage = completeAfterUsage; this.next = 1; this.interrupts = []; this.closed = false; this.waiters = new Map(); this.turnAliases = new Map(); }
+  constructor({ usage = null, exit = false, resolvedTurnId = null, completeAfterUsage = false, failSetGoal = false } = {}) { super(); this.usage = usage; this.exit = exit; this.resolvedTurnId = resolvedTurnId; this.completeAfterUsage = completeAfterUsage; this.failSetGoal = failSetGoal; this.next = 1; this.interrupts = []; this.closed = false; this.waiters = new Map(); this.turnAliases = new Map(); }
   async connect() {}
   shutdown() { this.closed = true; }
   diagnostics() { return { protocolEvents: [], stderrTail: "", process: { alive: !this.closed, exited: this.closed, code: null, signal: null } }; }
   async request(method) { if (method === "account/read") return { account: {} }; if (method === "account/usage/read") return { dailyUsageBuckets: [] }; if (method === "account/rateLimits/read") return { rateLimits: null }; return {}; }
   async startThread() { return { thread: { id: `thread-${this.next++}` } }; }
-  async setGoal() {}
+  async setGoal() { if (this.failSetGoal) throw new Error("simulated worker setup failure"); }
   async startTurn({ threadId }) {
     const turnId = `turn-${threadId}`;
     const resolvedTurnId = this.resolvedTurnId ?? turnId;
@@ -42,10 +42,10 @@ class UsageFakeAppServer extends EventEmitter {
   async readThread({ threadId }) { return { thread: { turns: [{ id: `turn-${threadId}`, items: [{ type: "agentMessage", text: "```json\n{\"summary\":\"ok\",\"assumptions\":[],\"risks\":[],\"humanGates\":[]}\n```" }] }] } }; }
 }
 
-function fixture({ usage = null, hardRunTokenLimit = 500, weeklyTokenLimit = 1000, maxConcurrentTasks = 1, exit = false, resolvedTurnId = null, enforceLocalLimits = true, completeAfterUsage = false } = {}) {
+function fixture({ usage = null, hardRunTokenLimit = 500, weeklyTokenLimit = 1000, maxConcurrentTasks = 1, exit = false, resolvedTurnId = null, enforceLocalLimits = true, completeAfterUsage = false, failSetGoal = false } = {}) {
   const root = mkdtempSync(join(tmpdir(), "orchestration-budget-"));
   git(root, ["init", "-b", "main"]); writeFileSync(join(root, "README.md"), "# test\n"); git(root, ["add", "."]); git(root, ["-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "base"]);
-  const client = new UsageFakeAppServer({ usage, exit, resolvedTurnId, completeAfterUsage });
+  const client = new UsageFakeAppServer({ usage, exit, resolvedTurnId, completeAfterUsage, failSetGoal });
   const router = new SwarmRouter({ repository: root, runtimeDir: join(root, "runtime"), baseRef: "main", model: "fake", project: { name: "test", documentationDir: "docs/in", generatedDir: "docs/out", productRoots: [] }, router: { maxConcurrentTasks, maxChildrenPerTask: 10, maxDelegationDepth: 4, maxPlanTasks: 5, defaultParentBudget: 1000, turnTimeoutMs: 1000, approvalMode: "deny" }, autonomy: { mode: "autonomous", autoApproveWorkflowGates: true, autoRemediate: true, autoPush: true, autoCreatePullRequest: true, autoMerge: true, maxRemediationRounds: 3 }, budget: { weeklyTokenLimit, weeklyWindowDays: 7, hardRunTokenLimit, interruptSafetyMarginTokens: 10, enforceLocalLimits }, quota: { throttleAtUsedPercent: 90, throttleWhenUnavailable: false }, delivery: { maxRemediationRounds: 3, leaseHeartbeatMs: 250, staleLeaseMs: 250, shutdownGraceMs: 250 }, roles, appServerClientFactory: () => client });
   return { root, router, client, dispose: () => { router.close(); rmSync(root, { recursive: true, force: true }); } };
 }
@@ -101,6 +101,17 @@ test("tracking-only mode records actual usage without interrupting or blocking t
     assert.equal(result.blockedBudget, false); assert.equal(subject.client.interrupts.length, 0);
     assert.equal(subject.router.store.getTask(task.id).status, "done"); assert.equal(subject.router.store.getTask(task.id).tokenUsed, 35);
     assert.equal(subject.router.statusSnapshot().localBudgetEnforcement, "tracking_only");
+  } finally { subject.dispose(); }
+});
+
+test("a worker failure fail-fast stops the scheduler before an independent task starts", async () => {
+  const subject = fixture({ failSetGoal: true, maxConcurrentTasks: 1 });
+  try {
+    const first = subject.router.enqueue({ role: "bootstrap", title: "fails", prompt: "bounded" }); const run = createRun(subject.router, first);
+    const second = subject.router.enqueue({ role: "planner", title: "must not start", prompt: "bounded", deliveryRunId: run.id });
+    const result = await subject.router.runUntilIdle({ deliveryRunId: run.id });
+    assert.equal(result.failed, true); assert.equal(subject.router.store.getTask(first.id).status, "failed"); assert.equal(subject.router.store.getTask(second.id).status, "queued");
+    assert.ok(subject.router.lifecycleEvents().some((event) => event.type === "delivery fail-fast"));
   } finally { subject.dispose(); }
 });
 

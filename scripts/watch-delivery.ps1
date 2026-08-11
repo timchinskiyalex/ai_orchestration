@@ -11,7 +11,7 @@ $env:NODE_NO_WARNINGS = '1'
 while ($true) {
   Clear-Host
   $raw = & node src/index.mjs status --json 2>$null
-  if ($LASTEXITCODE -ne 0) { throw "Could not read autonomous delivery status" }
-  $raw
+  if ($LASTEXITCODE -ne 0) { Write-Warning "Status read failed; monitor will retry. Delivery is not stopped by this monitor." }
+  else { $raw }
   Start-Sleep -Milliseconds $IntervalMs
 }

@@ -401,10 +401,10 @@ export class SwarmRouter extends EventEmitter {
       this.#lifecycle("app-server connected");
       const snapshot = await this.account.refresh(client);
       this.#lifecycle(snapshot.diagnostics?.length ? "account read failed" : "account read completed", { diagnostics: snapshot.diagnostics?.length ?? 0 });
-      const scheduler = { active: 0, blockedQuota: false, blockedBudget: false };
+      const scheduler = { active: 0, blockedQuota: false, blockedBudget: false, failed: false };
       const workers = Array.from({ length: this.config.router.maxConcurrentTasks }, () => this.#worker(client, scheduler));
       await Promise.all(workers);
-      return { blockedQuota: scheduler.blockedQuota, blockedBudget: scheduler.blockedBudget || this.budgetInterruptedTasks.size > 0, interrupted: this.stopRequested, quota: this.quotaThrottleStatus() };
+      return { blockedQuota: scheduler.blockedQuota, blockedBudget: scheduler.blockedBudget || this.budgetInterruptedTasks.size > 0, failed: scheduler.failed, interrupted: this.stopRequested, quota: this.quotaThrottleStatus() };
     } finally {
       if (heartbeat) clearInterval(heartbeat);
       process.removeListener("SIGINT", onSigint);
@@ -420,7 +420,7 @@ export class SwarmRouter extends EventEmitter {
 
   async #worker(client, scheduler) {
     while (true) {
-      if (this.stopRequested || this.budgetInterruptedTasks.size) { scheduler.blockedBudget ||= this.budgetInterruptedTasks.size > 0; return; }
+      if (this.stopRequested || scheduler.failed || this.budgetInterruptedTasks.size) { scheduler.blockedBudget ||= this.budgetInterruptedTasks.size > 0; return; }
       if (this.quotaThrottleStatus().throttled) { scheduler.blockedQuota = true; return; }
       const task = this.store.claimNext();
       if (!task) {
@@ -440,6 +440,7 @@ export class SwarmRouter extends EventEmitter {
           }
           const detail = recovery ? `${error.message} Recovery worktree: ${recovery.worktree} (${recovery.clean ? "clean" : "dirty"}). ${recovery.action}` : error.message;
           this.store.transition(task.id, "failed", { error: detail });
+          await this.#failFastAfterTaskFailure(client, scheduler, task.id, detail);
         }
       } finally { scheduler.active -= 1; }
     }
@@ -557,8 +558,10 @@ export class SwarmRouter extends EventEmitter {
   }
 
   #taskPrompt(task, worktree, overlaySnapshot) {
+    const scaffoldRequirement = this.#isScaffoldTask(task) ? "MANDATORY PRODUCT SCAFFOLD: execute the scaffold now in this worktree; do not return an analysis or plan. Create every declared product root: a runnable Next.js frontend with package.json, lockfile, build/test scripts; and an ASP.NET Core Web API solution plus xUnit test project. Verify files exist with git status/diff before finishing. Returning with no changed files is a task failure." : null;
     return [
       formatTaskPrompt({ task, worktree, project: this.config.project, overlaySnapshot, documentationAvailable: existsSync(join(this.config.repository, this.config.project.documentationDir, "inventory.json")) }),
+      scaffoldRequirement,
       this.#structuredOutputContract(task.role),
       "Bounded execution: do only the required scoped work, do not create child agents, avoid long explanations, and return the required structured result. Do not merge, push, modify Router configuration, or bypass approval/sandbox policy."
     ].join("\n");
@@ -808,13 +811,16 @@ export class SwarmRouter extends EventEmitter {
       return roleConfig;
     };
     const primaryIds = new Map(dispatch.map(({ item }) => [item.id, randomUUID()]));
+    const scaffoldTaskId = primaryIds.get("scaffold-product") ?? null;
     const specs = [];
     // Build and validate the whole dispatch graph before making one atomic
     // StateStore write. This prevents a rejected route from leaving a partial DAG.
     for (const { item, elevatedGate, securityRequired, dependencyPlanIds } of dispatch) {
       const primary = assertRoute(item.primaryDomain, item.estimatedTokens);
       const primaryId = primaryIds.get(item.id);
-      specs.push({ id: primaryId, role: item.primaryDomain, parentTaskId: plannerTask.id, title: item.title, prompt: item.id === "scaffold-product" ? `[[product-scaffold]]\n${item.prompt}` : item.prompt, allowedPaths: item.allowedPaths, acceptanceChecks: item.acceptanceChecks, dependencies: [plannerTask.id, ...dependencyPlanIds.map((dependency) => primaryIds.get(dependency))], estimatedTokens: item.estimatedTokens, tokenBudget: primary.tokenBudget, maxAttempts: 1, humanApprovalRequired: elevatedGate, riskFlags: item.riskFlags, supportingDomains: item.supportingDomains, deliveryRunId: plannerTask.deliveryRunId ?? this.activeDeliveryRunId });
+      const dependencies = [plannerTask.id, ...dependencyPlanIds.map((dependency) => primaryIds.get(dependency))];
+      if (scaffoldTaskId && item.id !== "scaffold-product" && primary.sandbox === "workspace-write" && !dependencies.includes(scaffoldTaskId)) dependencies.push(scaffoldTaskId);
+      specs.push({ id: primaryId, role: item.primaryDomain, parentTaskId: plannerTask.id, title: item.title, prompt: item.id === "scaffold-product" ? `[[product-scaffold]]\n${item.prompt}` : item.prompt, allowedPaths: item.allowedPaths, acceptanceChecks: item.acceptanceChecks, dependencies, estimatedTokens: item.estimatedTokens, tokenBudget: primary.tokenBudget, maxAttempts: 1, humanApprovalRequired: elevatedGate, riskFlags: item.riskFlags, supportingDomains: item.supportingDomains, deliveryRunId: plannerTask.deliveryRunId ?? this.activeDeliveryRunId });
       let predecessorId = primaryId;
       const mandatoryReview = primary.sandbox === "workspace-write";
       if ((mandatoryReview || securityRequired) && item.primaryDomain !== "security") {
@@ -837,6 +843,14 @@ export class SwarmRouter extends EventEmitter {
   }
 
   #isScaffoldTask(task) { return task.prompt.startsWith("[[product-scaffold]]"); }
+
+  async #failFastAfterTaskFailure(client, scheduler, failedTaskId, error) {
+    if (scheduler.failed) return;
+    scheduler.failed = true;
+    const active = [...this.activeTurns.values()].filter((item) => item.taskId !== failedTaskId);
+    this.#lifecycle("delivery fail-fast", { taskId: failedTaskId, error: String(error).slice(0, 300), interruptedTasks: active.map((item) => item.taskId) });
+    await Promise.allSettled(active.map(({ threadId, turnId }) => client.interruptTurn({ threadId, turnId })));
+  }
 
   #connectScaffoldDependents(scaffoldTask, artifact) {
     for (const task of this.store.listTasks()) {
