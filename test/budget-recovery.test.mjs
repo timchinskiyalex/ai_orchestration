@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 import { SwarmRouter } from "../src/router.mjs";
+import { DeliveryCoordinator } from "../src/delivery-coordinator.mjs";
 
 const git = (cwd, args) => execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8" });
 const roles = Object.fromEntries(["bootstrap", "planner", "backend", "frontend", "database", "qa", "security", "devops"].map((role) => [role, {
@@ -13,9 +14,9 @@ const roles = Object.fromEntries(["bootstrap", "planner", "backend", "frontend",
 }]));
 
 class UsageFakeAppServer extends EventEmitter {
-  constructor({ usage = null, exit = false, resolvedTurnId = null, completeAfterUsage = false, failSetGoal = false } = {}) { super(); this.usage = usage; this.exit = exit; this.resolvedTurnId = resolvedTurnId; this.completeAfterUsage = completeAfterUsage; this.failSetGoal = failSetGoal; this.next = 1; this.interrupts = []; this.closed = false; this.waiters = new Map(); this.turnAliases = new Map(); }
+  constructor({ usage = null, exit = false, resolvedTurnId = null, completeAfterUsage = false, failSetGoal = false } = {}) { super(); this.usage = usage; this.exit = exit; this.resolvedTurnId = resolvedTurnId; this.completeAfterUsage = completeAfterUsage; this.failSetGoal = failSetGoal; this.next = 1; this.interrupts = []; this.closed = false; this.treeCleanupRequested = 0; this.waiters = new Map(); this.turnAliases = new Map(); }
   async connect() {}
-  shutdown() { this.closed = true; }
+  shutdown() { this.closed = true; this.treeCleanupRequested += 1; return Promise.resolve({ attempted: true, command: "taskkill" }); }
   diagnostics() { return { protocolEvents: [], stderrTail: "", process: { alive: !this.closed, exited: this.closed, code: null, signal: null } }; }
   async request(method) { if (method === "account/read") return { account: {} }; if (method === "account/usage/read") return { dailyUsageBuckets: [] }; if (method === "account/rateLimits/read") return { rateLimits: null }; return {}; }
   async startThread() { return { thread: { id: `thread-${this.next++}` } }; }
@@ -36,8 +37,11 @@ class UsageFakeAppServer extends EventEmitter {
     this.waiters.get(`${threadId}:${this.turnAliases.get(turnId) ?? turnId}`)?.resolve({ id: turnId, status: "interrupted" });
     return {};
   }
-  waitForTurn(threadId, turnId) {
-    return new Promise((resolve, reject) => this.waiters.set(`${threadId}:${turnId}`, { resolve, reject }));
+  waitForTurn(threadId, turnId, timeoutMs = 60_000) {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => { this.waiters.delete(`${threadId}:${turnId}`); reject(new Error("fake turn timeout")); }, timeoutMs);
+      this.waiters.set(`${threadId}:${turnId}`, { resolve: (value) => { clearTimeout(timer); resolve(value); }, reject: (error) => { clearTimeout(timer); reject(error); } });
+    });
   }
   async readThread({ threadId }) { return { thread: { turns: [{ id: `turn-${threadId}`, items: [{ type: "agentMessage", text: "```json\n{\"summary\":\"ok\",\"assumptions\":[],\"risks\":[],\"humanGates\":[]}\n```" }] }] } }; }
 }
@@ -51,8 +55,8 @@ function fixture({ usage = null, hardRunTokenLimit = 500, weeklyTokenLimit = 100
 }
 
 function createRun(router, task) {
-  const run = router.store.createDeliveryRun({ id: `run-${task.id}`, bootstrapTaskId: task.id });
-  router.store.linkTaskToDelivery(task.id, run.id); router.activateDeliveryRun(run.id);
+  const run = router.createDeliveryRun({ id: `run-${task.id}`, bootstrapTaskId: task.id });
+  router.store.linkTaskToDelivery(task.id, run.id);
   return run;
 }
 
@@ -160,11 +164,38 @@ test("stale owner lease recovery marks the historical run interrupted without er
   const subject = fixture();
   try {
     const task = subject.router.enqueue({ role: "bootstrap", title: "stale", prompt: "bounded" }); const run = createRun(subject.router, task);
+    subject.router.store.db.prepare("UPDATE delivery_runs SET owner_pid = ?, owner_session_id = ?, heartbeat_at = ? WHERE id = ?").run(999999, "dead-session", "2000-01-01T00:00:00.000Z", run.id);
     subject.router.store.transition(task.id, "preparing"); subject.router.store.transition(task.id, "running", { threadId: "historic-thread", turnId: "historic-turn" }); subject.router.store.setTokenUsage(task.id, 120550);
     const recovered = subject.router.recoverStaleDeliveries();
     assert.equal(recovered.length, 1); assert.equal(subject.router.store.deliveryRun(run.id).state, "interrupted");
     const historical = subject.router.store.getTask(task.id); assert.equal(historical.status, "interrupted"); assert.equal(historical.tokenUsed, 120550); assert.equal(historical.threadId, "historic-thread"); assert.equal(historical.turnId, "historic-turn");
   } finally { subject.dispose(); }
+});
+
+test("turn timeout forces cleanup, terminalizes the delivery, and does not start the next task", async () => {
+  const subject = fixture({ usage: null, maxConcurrentTasks: 1 });
+  subject.router.config.router.turnTimeoutMs = 20;
+  try {
+    const first = subject.router.enqueue({ role: "bootstrap", title: "times out", prompt: "bounded" }); const run = createRun(subject.router, first);
+    const second = subject.router.enqueue({ role: "planner", title: "must not start", prompt: "bounded", deliveryRunId: run.id });
+    const result = await subject.router.runUntilIdle({ deliveryRunId: run.id });
+    assert.equal(result.failed, true);
+    assert.equal(subject.router.store.getTask(first.id).status, "failed");
+    assert.equal(subject.router.store.getTask(second.id).status, "queued");
+    assert.equal(subject.client.treeCleanupRequested, 1);
+  } finally { subject.dispose(); }
+});
+
+test("a second coordinator cannot steal a fresh delivery lease before App Server startup", async () => {
+  const first = fixture();
+  let starts = 0;
+  const second = new SwarmRouter({ ...first.router.config, appServerClientFactory: () => { starts += 1; return new UsageFakeAppServer(); } });
+  try {
+    const task = first.router.enqueue({ role: "bootstrap", title: "owned", prompt: "bounded" }); const run = createRun(first.router, task);
+    await assert.rejects(new DeliveryCoordinator(second).resume(), /Delivery already owned/);
+    assert.equal(starts, 0);
+    assert.equal(first.router.store.deliveryRun(run.id).ownerSessionId, first.router.activeDeliverySessionId);
+  } finally { second.close(); first.dispose(); }
 });
 
 test("late App Server process-exit telemetry after router close cannot reopen SQLite", () => {

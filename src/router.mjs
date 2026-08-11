@@ -108,7 +108,7 @@ export class SwarmRouter extends EventEmitter {
 
   stop() {
     if (this.activeClient) this.lastAppServerDiagnostics = this.activeClient.diagnostics();
-    this.activeClient?.shutdown();
+    this.activeClient?.shutdown()?.catch?.(() => {});
   }
 
   async requestShutdown(reason = "interrupted_controller_exit") {
@@ -121,7 +121,7 @@ export class SwarmRouter extends EventEmitter {
       await Promise.allSettled(active.map((turn) => this.#interruptAndAwaitTurn(client, turn, reason, { timeoutMs: this.config.delivery?.shutdownGraceMs ?? 3_000 })));
     }
     this.#markInterrupted(reason, { activeTurns: active.map(({ taskId, threadId, turnId }) => ({ taskId, threadId, turnId })) });
-    client?.shutdown();
+    await client?.shutdown();
   }
 
   #markInterrupted(reason, recovery = {}) {
@@ -146,7 +146,19 @@ export class SwarmRouter extends EventEmitter {
     return recovered;
   }
 
-  activateDeliveryRun(runId) { this.activeDeliveryRunId = runId; }
+  activateDeliveryRun(runId, sessionId = undefined) {
+    const sameRun = this.activeDeliveryRunId === runId;
+    this.activeDeliveryRunId = runId;
+    if (sessionId !== undefined) this.activeDeliverySessionId = sessionId;
+    else if (!sameRun) this.activeDeliverySessionId = null;
+  }
+
+  createDeliveryRun(details) {
+    const sessionId = randomUUID();
+    const run = this.store.createDeliveryRun({ ...details, ownerPid: process.pid, ownerSessionId: sessionId });
+    this.activateDeliveryRun(run.id, sessionId);
+    return run;
+  }
 
   lifecycleEvents() { return [...this.lifecycleTrace]; }
 
@@ -393,18 +405,21 @@ export class SwarmRouter extends EventEmitter {
   }
 
   async runUntilIdle({ deliveryRunId = this.activeDeliveryRunId } = {}) {
+    // Ownership is the first operation: a second controller must fail before
+    // repository preflight, App Server launch, thread creation, or turn start.
+    const sessionId = deliveryRunId && this.activeDeliveryRunId === deliveryRunId && this.activeDeliverySessionId ? this.activeDeliverySessionId : (deliveryRunId ? randomUUID() : null);
+    if (deliveryRunId) this.store.claimDeliveryLease(deliveryRunId, { ownerPid: process.pid, ownerSessionId: sessionId });
+    this.activeDeliveryRunId = deliveryRunId ?? null;
+    this.activeDeliverySessionId = sessionId;
     await this.worktrees.verifyRepository();
     this.#validateWorkerOverlays();
     const client = this.config.appServerClientFactory?.({ cwd: this.config.repository }) ?? new AppServerClient({ cwd: this.config.repository });
     this.activeClient = client;
-    this.activeDeliveryRunId = deliveryRunId ?? null;
     this.stopRequested = false;
     this.expectedClientShutdown = false;
     this.budgetInterruptedTasks.clear();
     this.pendingBudgetWatchdogs.clear();
     this.activeTurns.clear();
-    this.activeDeliverySessionId = deliveryRunId ? randomUUID() : null;
-    if (deliveryRunId) this.store.claimDeliveryLease(deliveryRunId, { ownerPid: process.pid, ownerSessionId: this.activeDeliverySessionId });
     client.on("notification", (message) => this.#onNotification(message));
     client.on("serverRequest", (message) => this.#onServerRequest(client, message));
     client.on("protocol", (event) => this.#onProtocolEvent(event));
@@ -435,7 +450,7 @@ export class SwarmRouter extends EventEmitter {
       process.removeListener("SIGINT", onSigint);
       this.lastAppServerDiagnostics = client.diagnostics();
       this.expectedClientShutdown = true;
-      client.shutdown();
+      await client.shutdown();
       this.lastAppServerDiagnostics = client.diagnostics();
       if (this.activeClient === client) this.activeClient = null;
       this.activeTurns.clear();
@@ -603,7 +618,7 @@ export class SwarmRouter extends EventEmitter {
   async #interruptAndAwaitTurn(client, { taskId, threadId, turnId }, reason, { timeoutMs = 3_000 } = {}) {
     if (!client || typeof threadId !== "string" || !threadId || typeof turnId !== "string" || !turnId) {
       this.#lifecycle("turn interrupt forced client shutdown", { taskId, threadId: threadId ?? null, turnId: turnId ?? null, reason: `${reason}: missing turn identity` });
-      client?.shutdown?.();
+      await client?.shutdown?.();
       return { terminal: null, forced: true };
     }
     this.#lifecycle("turn interrupt requested", { taskId, threadId, turnId, reason, tokenUsed: this.store.getTask(taskId)?.tokenUsed ?? null });
@@ -624,7 +639,7 @@ export class SwarmRouter extends EventEmitter {
     this.#lifecycle("turn interrupt forced client shutdown", { taskId, threadId, turnId, reason, tokenUsed: this.store.getTask(taskId)?.tokenUsed ?? null });
     const task = this.store.getTask(taskId);
     if (task?.status === "running") this.store.transition(taskId, "interrupted", { error: `${reason}: terminal confirmation timed out` });
-    client.shutdown();
+    await client.shutdown();
     return { terminal: null, forced: true };
   }
 

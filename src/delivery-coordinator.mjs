@@ -31,9 +31,8 @@ export class DeliveryCoordinator {
     const intake = ingestDocumentation({ source, repository: this.router.config.repository, destinationRelative: this.router.config.project.documentationDir });
     const overlay = await this.router.ensureProjectOverlay();
     const bootstrap = this.router.startProject();
-    const run = this.router.store.createDeliveryRun({ id: randomUUID(), source, bootstrapTaskId: bootstrap.id, confirmRemotePush: this.router.isAutonomous() });
+    const run = this.router.createDeliveryRun({ id: randomUUID(), source, bootstrapTaskId: bootstrap.id, confirmRemotePush: this.router.isAutonomous() });
     this.router.store.linkTaskToDelivery(bootstrap.id, run.id);
-    this.router.activateDeliveryRun(run.id);
     return this.#advance(run, { intake, overlayPath: overlay.path, ...adapters });
   }
 
@@ -63,6 +62,7 @@ export class DeliveryCoordinator {
     let execution;
     try { execution = await this.router.runUntilIdle(); }
     catch (error) {
+      if (/^Delivery already owned/.test(String(error.message))) throw error;
       const current = this.router.store.deliveryRun(run.id);
       if (current?.state === "interrupted") return current;
       return this.router.store.updateDeliveryRun(run.id, { state: "failed", publish: { reason: String(error.message).slice(0, 500), recovery: { action: "Inspect the preserved task worktree and structured task error." } } });
