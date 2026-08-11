@@ -32,7 +32,7 @@ test("finalizer produces a clean, committed artifact and integrator creates a ca
     assert.equal(finalized.artifact.verificationResults[0].status, "passed");
     assert.equal(git(worktree, ["status", "--porcelain"]), "");
     const integration = await new Integrator({ repository: root, runtimeDir: join(root, "runtime"), generatedDir: "docs/orchestration-generated" }).integrate({ artifacts: [finalized.artifact], overlay });
-    assert.equal(integration.manifest.status, "awaiting_human_merge");
+    assert.equal(integration.manifest.status, "candidate_ready");
     assert.equal(integration.manifest.localVerification.status, "passed");
     assert.equal(integration.manifest.remoteCi.status, "unavailable");
     assert.equal(integration.manifest.pullRequest.status, "unavailable");
@@ -75,7 +75,7 @@ test("finalizer and integrator preserve NUL-delimited paths with spaces and Unic
     const finalized = await new WorktreeFinalizer({ repository: root, generatedDir: "docs/orchestration-generated" }).finalize({ task: { id: "unicode-writer", role: "backend", allowedPaths: [changedPath], dependencies: [] }, worktree, branch: "swarm/unicode-writer", overlay, overlayPath: path });
     assert.deepEqual(finalized.artifact.changedPaths, [changedPath]);
     const integration = await new Integrator({ repository: root, runtimeDir: join(root, "runtime"), generatedDir: "docs/orchestration-generated" }).integrate({ artifacts: [finalized.artifact], overlay });
-    assert.equal(integration.manifest.status, "awaiting_human_merge");
+    assert.equal(integration.manifest.status, "candidate_ready");
     assert.equal(git(integration.manifest.worktree, ["show", `HEAD:${changedPath}`]), "export const value = 2;");
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
@@ -92,6 +92,6 @@ test("integrator applies a chained remediation artifact once after its predecess
     const remediation = await finalizer.finalize({ task: { id: "remediation", role: "backend", allowedPaths: ["src"], dependencies: ["qa"], artifactDependencies: ["writer"], artifactBaseSha: first.artifact.headSha }, worktree: remWorktree, branch: "swarm/remediation", overlay, overlayPath: path });
     assert.equal(remediation.artifact.baseSha, first.artifact.headSha); assert.deepEqual(remediation.artifact.dependencies, ["writer"]);
     const integration = await new Integrator({ repository: root, runtimeDir: join(root, "runtime"), generatedDir: "docs/orchestration-generated" }).integrate({ artifacts: [first.artifact, remediation.artifact], overlay });
-    assert.equal(integration.manifest.status, "awaiting_human_merge"); assert.deepEqual(integration.manifest.appliedArtifacts, ["writer", "remediation"]); assert.equal(git(integration.manifest.worktree, ["log", "--format=%s", "-2"]), "swarm: finalize remediation\nswarm: finalize writer");
+    assert.equal(integration.manifest.status, "candidate_ready"); assert.deepEqual(integration.manifest.appliedArtifacts, ["writer", "remediation"]); assert.equal(git(integration.manifest.worktree, ["log", "--format=%s", "-2"]), "swarm: finalize remediation\nswarm: finalize writer");
   } finally { rmSync(root, { recursive: true, force: true }); }
 });

@@ -16,3 +16,13 @@ test("config rejects unsafe role capabilities and project paths", () => {
   assert.throws(() => load(config({ project: { documentationDir: "docs/in", generatedDir: "C:/escape" } })), /normalized relative/);
   assert.throws(() => load(config({ roles: { ...config().roles, qa: { ...config().roles.qa, approvalPolicy: "on-request" } } })), /approvalPolicy/);
 });
+
+test("new config defaults to fully autonomous delivery and retains explicit manual mode", () => {
+  const autonomous = load(config());
+  assert.equal(autonomous.autonomy.mode, "autonomous");
+  assert.equal(autonomous.autonomy.autoMerge, true);
+  assert.equal(autonomous.delivery.maxRemediationRounds, 3);
+  const manual = load(config({ autonomy: { mode: "manual", autoApproveWorkflowGates: false, autoRemediate: false, autoPush: false, autoCreatePullRequest: false, autoMerge: false, maxRemediationRounds: 1 }, delivery: { maxRemediationRounds: 1 } }));
+  assert.equal(manual.autonomy.mode, "manual");
+  assert.throws(() => load(config({ autonomy: { mode: "autonomous", autoApproveWorkflowGates: false } })), /requires all autonomy/);
+});

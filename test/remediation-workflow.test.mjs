@@ -31,6 +31,20 @@ test("Security remediation creates a chained writer, rechecks Security/QA, and i
     await router.runUntilIdle();
     const remediation = router.list().find((task) => /^Remediate /.test(task.title)); const remediationQa = router.list().find((task) => task.role === "qa" && task.sourceWriterTaskId === remediation?.id);
     assert.ok(remediation, JSON.stringify(router.list().map((task) => ({ role: task.role, title: task.title, status: task.status, error: task.error })))); assert.equal(remediation.status, "done"); assert.equal(remediation.artifactBaseSha, router.store.workerArtifact(writer.id).headSha); assert.equal(remediationQa.status, "done"); assert.equal(router.store.qualityReport(remediationQa.id).report.verdict, "pass");
-    const integrated = await router.integrateFinalized([writer.id, remediation.id]); assert.equal(integrated.manifest.status, "awaiting_human_merge"); assert.deepEqual(integrated.manifest.appliedArtifacts, [writer.id, remediation.id]);
+    const integrated = await router.integrateFinalized([writer.id, remediation.id]); assert.equal(integrated.manifest.status, "candidate_ready"); assert.deepEqual(integrated.manifest.appliedArtifacts, [writer.id, remediation.id]);
+  } finally { router?.close(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test("autonomous remediation-limit exhaustion is terminal instead of awaiting a human", async () => {
+  const root = mkdtempSync(join(tmpdir(), "delivery-remediation-limit-")); let router;
+  try {
+    git(root, ["init", "-b", "main"]); mkdirSync(join(root, "src")); mkdirSync(join(root, "test"));
+    writeFileSync(join(root, "package.json"), JSON.stringify({ packageManager: "npm@10", scripts: { test: "node --test" } })); writeFileSync(join(root, "package-lock.json"), "{}"); writeFileSync(join(root, "src", "value.mjs"), "export const value = 1;\n"); writeFileSync(join(root, "test", "value.test.mjs"), "import test from 'node:test'; test('v',()=>{});\n"); git(root, ["add", "."]); git(root, ["-c", "user.name=t", "-c", "user.email=t@e", "commit", "-m", "base"]);
+    const roles = Object.fromEntries(["bootstrap", "planner", "backend", "frontend", "database", "qa", "security", "devops"].map((role) => [role, { sandbox: role === "backend" ? "workspace-write" : "read-only", approvalPolicy: "never", tokenBudget: 200, usesWorktree: role === "backend" }]));
+    router = new SwarmRouter({ repository: root, runtimeDir: join(root, "runtime"), baseRef: "main", model: "fake", project: { name: "test", documentationDir: "docs/in", generatedDir: "docs/orchestration-generated" }, router: { maxConcurrentTasks: 2, maxChildrenPerTask: 20, maxDelegationDepth: 5, maxPlanTasks: 12, defaultParentBudget: 10000, turnTimeoutMs: 1000, approvalMode: "deny" }, autonomy: { mode: "autonomous", autoApproveWorkflowGates: true, autoRemediate: true, autoPush: true, autoCreatePullRequest: true, autoMerge: true, maxRemediationRounds: 0 }, budget: { weeklyTokenLimit: 10000, weeklyWindowDays: 7 }, quota: { throttleAtUsedPercent: 90, throttleWhenUnavailable: false }, delivery: { maxRemediationRounds: 0 }, roles, appServerClientFactory: () => new DeliveryFake() });
+    await router.ensureProjectOverlay(); const writer = router.enqueue({ role: "backend", title: "Writer", prompt: "Writer", allowedPaths: ["src"], acceptanceChecks: ["npm test"], estimatedTokens: 100 }); const security = router.enqueue({ role: "security", title: "Security review", prompt: "Review", parentTaskId: writer.id, dependencies: [writer.id], allowedPaths: ["src"], estimatedTokens: 100, sourceWriterTaskId: writer.id });
+    await router.runUntilIdle();
+    const terminal = router.store.getTask(security.id);
+    assert.equal(terminal.status, "failed"); assert.match(terminal.error, /limit.*exhausted/i); assert.equal(router.list().some((task) => /^Remediate /.test(task.title)), false);
   } finally { router?.close(); rmSync(root, { recursive: true, force: true }); }
 });
