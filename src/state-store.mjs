@@ -2,6 +2,7 @@ import { existsSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { assertRole, assertTransition } from "./domain.mjs";
+import { validateIntegrationBarrier, validateIntegrationCheckpoint, validatePlan, validateWorkerArtifactContract } from "./workflow-contract.mjs";
 
 const now = () => new Date().toISOString();
 const json = (value) => JSON.stringify(value ?? []);
@@ -58,7 +59,7 @@ export class StateStore {
         blueprint_id TEXT,
         requirement_ids_json TEXT NOT NULL DEFAULT '[]',
         interrupt_threshold_tokens INTEGER,
-        configured_budget_cap INTEGER
+        configured_budget_cap INTEGER, plan_batch_id TEXT, wave INTEGER, integration_barrier_id TEXT
       );
       CREATE TABLE IF NOT EXISTS events (
         sequence INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -184,6 +185,11 @@ export class StateStore {
         payload_json TEXT NOT NULL,
         created_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS plan_batches (id TEXT PRIMARY KEY, schema_version INTEGER NOT NULL, kind TEXT NOT NULL, delivery_run_id TEXT NOT NULL, blueprint_id TEXT NOT NULL, wave INTEGER NOT NULL, based_on_checkpoint_sha TEXT NOT NULL, tasks_json TEXT NOT NULL, created_at TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS integration_barriers (id TEXT PRIMARY KEY, schema_version INTEGER NOT NULL, kind TEXT NOT NULL, delivery_run_id TEXT NOT NULL, blueprint_id TEXT NOT NULL, wave INTEGER NOT NULL, base_sha TEXT NOT NULL, input_artifacts_json TEXT NOT NULL, status TEXT NOT NULL, checkpoint_id TEXT, error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS integration_checkpoints (id TEXT PRIMARY KEY, schema_version INTEGER NOT NULL, kind TEXT NOT NULL, delivery_run_id TEXT NOT NULL, blueprint_id TEXT NOT NULL, wave INTEGER NOT NULL, base_sha TEXT NOT NULL, input_artifacts_json TEXT NOT NULL, output_sha TEXT NOT NULL, verification_results_json TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS wave_reconciliations (delivery_run_id TEXT NOT NULL, wave INTEGER NOT NULL, checkpoint_id TEXT NOT NULL, checkpoint_sha TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(delivery_run_id, wave));
+      CREATE TABLE IF NOT EXISTS scoped_replans (id TEXT PRIMARY KEY, delivery_run_id TEXT, blueprint_id TEXT, failed_task_id TEXT NOT NULL, invalidated_task_ids_json TEXT NOT NULL, prior_plan_batch_id TEXT, replacement_plan_batch_id TEXT, status TEXT NOT NULL, created_at TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status, created_at);
       CREATE INDEX IF NOT EXISTS idx_tasks_thread ON tasks(thread_id);
       CREATE INDEX IF NOT EXISTS idx_events_task ON events(task_id, sequence);
@@ -205,6 +211,7 @@ export class StateStore {
     this.#addColumnIfMissing("tasks", "interrupt_threshold_tokens", "INTEGER");
     this.#addColumnIfMissing("tasks", "configured_budget_cap", "INTEGER");
     this.#addColumnIfMissing("tasks", "token_usage_source", "TEXT");
+    this.#addColumnIfMissing("tasks", "plan_batch_id", "TEXT"); this.#addColumnIfMissing("tasks", "wave", "INTEGER"); this.#addColumnIfMissing("tasks", "integration_barrier_id", "TEXT");
     this.hasTokenUsageSource = true;
     this.#addColumnIfMissing("delivery_runs", "owner_pid", "INTEGER");
     this.#addColumnIfMissing("delivery_runs", "owner_session_id", "TEXT");
@@ -285,6 +292,7 @@ export class StateStore {
 
   setArtifactLineage(taskId, { artifactBaseSha, artifactDependencies }) {
     if (!this.getTask(taskId)) throw new Error(`Task not found: ${taskId}`);
+    if (!Array.isArray(artifactDependencies) || artifactDependencies.length > 1) throw new Error("WorkerArtifact may have exactly zero or one parent artifact ID"); if (!/^[a-f0-9]{40,64}$/i.test(artifactBaseSha ?? "")) throw new Error("WorkerArtifact lineage requires a verified Git SHA");
     this.db.prepare("UPDATE tasks SET artifact_base_sha = ?, artifact_dependencies_json = ?, updated_at = ? WHERE id = ? AND status = 'queued'").run(artifactBaseSha, json(artifactDependencies), now(), taskId);
     return this.getTask(taskId);
   }
@@ -316,7 +324,7 @@ export class StateStore {
     this.db.exec("BEGIN IMMEDIATE");
     try {
       const candidates = this.db.prepare("SELECT * FROM tasks WHERE status = 'queued' ORDER BY created_at").all();
-      const row = candidates.find((candidate) => parse(candidate.dependencies_json, []).every((id) => this.getTask(id)?.status === "done"));
+      const row = candidates.find((candidate) => parse(candidate.dependencies_json, []).every((id) => this.getTask(id)?.status === "done") && (!candidate.integration_barrier_id || this.integrationBarrier(candidate.integration_barrier_id)?.status === "passed"));
       if (!row) { this.db.exec("COMMIT"); return null; }
       const timestamp = now();
 
@@ -457,8 +465,9 @@ export class StateStore {
 
   recordWorkerArtifact(taskId, artifactPath, artifact) {
     const task = this.getTask(taskId);
+    validateWorkerArtifactContract(artifact); if (artifact.taskId !== taskId) throw new Error("WorkerArtifact taskId does not match persistence target"); if (this.workerArtifact(taskId)) throw new Error(`WorkerArtifact for ${taskId} is immutable and already persisted`);
     this.#mutate(taskId, "worker/artifact", { artifactPath, schemaVersion: artifact.schemaVersion }, () => {
-      this.db.prepare(`INSERT OR REPLACE INTO worker_artifacts(task_id, schema_version, artifact_path, artifact_json, created_at)
+      this.db.prepare(`INSERT INTO worker_artifacts(task_id, schema_version, artifact_path, artifact_json, created_at)
         VALUES (?, ?, ?, ?, ?)` ).run(taskId, artifact.schemaVersion, artifactPath, JSON.stringify(artifact), now());
       for (const requirementId of task?.requirementIds ?? []) this.#insertTraceability({ requirementId, blueprintId: task.blueprintId, taskId, artifactPath, checkpoint: "artifact", payload: { artifactTaskId: taskId } });
     });
@@ -466,13 +475,27 @@ export class StateStore {
 
   workerArtifact(taskId) {
     const row = this.db.prepare("SELECT artifact_json FROM worker_artifacts WHERE task_id = ?").get(taskId);
-    return row ? JSON.parse(row.artifact_json) : null;
+    if (!row) return null; const artifact = JSON.parse(row.artifact_json); try { validateWorkerArtifactContract(artifact); return artifact; } catch { return null; }
   }
 
   workerArtifactRecord(taskId) {
     const row = this.db.prepare("SELECT artifact_path, artifact_json FROM worker_artifacts WHERE task_id = ?").get(taskId);
-    return row ? { path: row.artifact_path, artifact: JSON.parse(row.artifact_json) } : null;
+    if (!row) return null; const artifact = JSON.parse(row.artifact_json); try { validateWorkerArtifactContract(artifact); return { path: row.artifact_path, artifact }; } catch { return { path: row.artifact_path, artifact, trusted: false }; }
   }
+  createPlanBatch(batch, tasks = []) { validatePlan(batch, { maxTasks: Math.max(batch.tasks?.length ?? 0, 1), requirePlanBatch: true }); if (this.db.prepare("SELECT id FROM plan_batches WHERE id = ?").get(batch.id)) throw new Error(`PlanBatch ${batch.id} is immutable and already persisted`); if (!Array.isArray(tasks) || tasks.length < batch.tasks.length) throw new Error("PlanBatch task materialization must include every planned writer"); this.db.prepare("INSERT INTO plan_batches(id,schema_version,kind,delivery_run_id,blueprint_id,wave,based_on_checkpoint_sha,tasks_json,created_at) VALUES (?,?,?,?,?,?,?,?,?)").run(batch.id,batch.schemaVersion,batch.kind,batch.deliveryRunId,batch.blueprintId,batch.wave,batch.basedOnCheckpointSha,JSON.stringify(batch.tasks),batch.createdAt); try { this.createTasks(tasks); for (const task of tasks) this.db.prepare("UPDATE tasks SET plan_batch_id=?, wave=?, integration_barrier_id=? WHERE id=?").run(batch.id,batch.wave,task.integrationBarrierId ?? null,task.id); } catch (error) { this.db.prepare("DELETE FROM plan_batches WHERE id=?").run(batch.id); throw error; } return this.planBatch(batch.id); }
+  planBatch(id) { const row=this.db.prepare("SELECT * FROM plan_batches WHERE id=?").get(id); return row ? {schemaVersion:row.schema_version,kind:row.kind,id:row.id,deliveryRunId:row.delivery_run_id,blueprintId:row.blueprint_id,wave:row.wave,basedOnCheckpointSha:row.based_on_checkpoint_sha,tasks:parse(row.tasks_json,[]),createdAt:row.created_at}:null; }
+  planBatches(deliveryRunId) { return this.db.prepare("SELECT id FROM plan_batches WHERE delivery_run_id=? ORDER BY wave,created_at").all(deliveryRunId).map((row)=>this.planBatch(row.id)); }
+  createIntegrationBarrier(barrier) { validateIntegrationBarrier(barrier); this.db.prepare("INSERT INTO integration_barriers(id,schema_version,kind,delivery_run_id,blueprint_id,wave,base_sha,input_artifacts_json,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)").run(barrier.id,barrier.schemaVersion,barrier.kind,barrier.deliveryRunId,barrier.blueprintId,barrier.wave,barrier.baseSha,JSON.stringify(barrier.inputArtifacts),barrier.status,barrier.createdAt,barrier.createdAt); return this.integrationBarrier(barrier.id); }
+  integrationBarrier(id) { const row=this.db.prepare("SELECT * FROM integration_barriers WHERE id=?").get(id); return row ? {schemaVersion:row.schema_version,kind:row.kind,id:row.id,deliveryRunId:row.delivery_run_id,blueprintId:row.blueprint_id,wave:row.wave,baseSha:row.base_sha,inputArtifacts:parse(row.input_artifacts_json,[]),status:row.status,checkpointId:row.checkpoint_id,error:row.error,createdAt:row.created_at}:null; }
+  setIntegrationBarrier(taskId,barrierId) { this.db.prepare("UPDATE tasks SET integration_barrier_id=?,updated_at=? WHERE id=? AND status='queued'").run(barrierId,now(),taskId); return this.getTask(taskId); }
+  readyIntegrationBarriers(deliveryRunId=null) { const sql=deliveryRunId?"SELECT id FROM integration_barriers WHERE delivery_run_id=? AND status='pending'":"SELECT id FROM integration_barriers WHERE status='pending'"; return this.db.prepare(sql).all(...(deliveryRunId?[deliveryRunId]:[])).map((row)=>this.integrationBarrier(row.id)).filter((b)=>b.inputArtifacts.every((i)=>Boolean(this.workerArtifact(i.artifactId)))); }
+  claimIntegrationBarrier(id) { return this.db.prepare("UPDATE integration_barriers SET status='running',updated_at=? WHERE id=? AND status='pending'").run(now(),id).changes===1?this.integrationBarrier(id):null; }
+  failIntegrationBarrier(id,error) { this.db.prepare("UPDATE integration_barriers SET status='failed',error=?,updated_at=? WHERE id=?").run(error,now(),id); }
+  recordIntegrationCheckpoint(c,{barrierId}={}) { validateIntegrationCheckpoint(c); this.db.prepare("INSERT INTO integration_checkpoints(id,schema_version,kind,delivery_run_id,blueprint_id,wave,base_sha,input_artifacts_json,output_sha,verification_results_json,status,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)").run(c.id,c.schemaVersion,c.kind,c.deliveryRunId,c.blueprintId,c.wave,c.baseSha,JSON.stringify(c.inputArtifacts),c.outputSha,JSON.stringify(c.verificationResults),c.status,c.createdAt); if(barrierId)this.db.prepare("UPDATE integration_barriers SET status='passed',checkpoint_id=?,updated_at=? WHERE id=?").run(c.id,now(),barrierId); return this.integrationCheckpoint(c.id); }
+  integrationCheckpoint(id) { const row=this.db.prepare("SELECT * FROM integration_checkpoints WHERE id=?").get(id); return row?{schemaVersion:row.schema_version,kind:row.kind,id:row.id,deliveryRunId:row.delivery_run_id,blueprintId:row.blueprint_id,wave:row.wave,baseSha:row.base_sha,inputArtifacts:parse(row.input_artifacts_json,[]),outputSha:row.output_sha,verificationResults:parse(row.verification_results_json,[]),status:row.status,createdAt:row.created_at}:null; }
+  reconcileWave({deliveryRunId,wave,checkpointId}) { const c=this.integrationCheckpoint(checkpointId); if(!c||c.status!=="passed")throw new Error("Wave reconciliation requires a successful verified IntegrationCheckpoint"); this.db.prepare("INSERT INTO wave_reconciliations(delivery_run_id,wave,checkpoint_id,checkpoint_sha,status,created_at) VALUES (?,?,?,?,?,?)").run(deliveryRunId,wave,checkpointId,c.outputSha,"reconciled",now()); return this.currentCheckpoint(deliveryRunId); }
+  currentCheckpoint(deliveryRunId) { const row=this.db.prepare("SELECT checkpoint_id,checkpoint_sha,wave FROM wave_reconciliations WHERE delivery_run_id=? ORDER BY wave DESC LIMIT 1").get(deliveryRunId); return row?{checkpointId:row.checkpoint_id,outputSha:row.checkpoint_sha,wave:row.wave}:null; }
+  recordScopedReplan(v) { this.db.prepare("INSERT INTO scoped_replans(id,delivery_run_id,blueprint_id,failed_task_id,invalidated_task_ids_json,prior_plan_batch_id,replacement_plan_batch_id,status,created_at) VALUES (?,?,?,?,?,?,?,?,?)").run(v.id,v.deliveryRunId??null,v.blueprintId??null,v.failedTaskId,JSON.stringify(v.invalidatedTaskIds??[]),v.priorPlanBatchId??null,null,v.status??"pending",v.createdAt??now()); }
 
   recordQualityReport({ qaTaskId, writerTaskId, reportPath, report }) {
     const task = this.getTask(qaTaskId);
@@ -733,6 +756,7 @@ export class StateStore {
       error: row.error, resultPath: row.result_path,
       riskFlags: parse(row.risk_flags_json, []), supportingDomains: parse(row.supporting_domains_json, []),
       artifactBaseSha: row.artifact_base_sha, artifactDependencies: parse(row.artifact_dependencies_json, []),
+      planBatchId: row.plan_batch_id, wave: row.wave, integrationBarrierId: row.integration_barrier_id,
       remediationRound: row.remediation_round, sourceWriterTaskId: row.source_writer_task_id,
       deliveryRunId: row.delivery_run_id, blueprintId: row.blueprint_id, requirementIds: parse(row.requirement_ids_json, []), interruptThresholdTokens: row.interrupt_threshold_tokens, configuredBudgetCap: row.configured_budget_cap,
       budgetInterrupt: this.budgetInterruption(row.id)

@@ -3,12 +3,13 @@ import { join, relative } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { EventEmitter } from "node:events";
+import { execFileSync } from "node:child_process";
 import { AppServerClient } from "./app-server-client.mjs";
 import { BudgetGovernor } from "./budget-governor.mjs";
 import { depthOf, finalStatusForRole, assertRole, ENGINEERING_DOMAINS } from "./domain.mjs";
 import { StateStore } from "./state-store.mjs";
 import { WorktreeManager } from "./worktree-manager.mjs";
-import { extractOrchestrationJson, validateBootstrap, validatePlan } from "./workflow-contract.mjs";
+import { extractOrchestrationJson, validateBootstrap, validatePlan, validateIntegrationCheckpoint } from "./workflow-contract.mjs";
 import { BudgetAccountAdapter } from "./budget-account-adapter.mjs";
 import { commandCwd, commandsForPaths, generateProjectOverlay, loadProjectOverlay, projectOverlayExecutionSnapshot } from "./project-overlay.mjs";
 import { WorktreeFinalizer } from "./worktree-finalizer.mjs";
@@ -19,6 +20,7 @@ import { GitHubCiAdapter, GitHubMergeAdapter, GitHubPullRequestAdapter, RemoteAd
 import { runManagedProcess } from "./managed-process-runner.mjs";
 import { provisionDeterministicScaffold } from "./deterministic-scaffold.mjs";
 import { specificationBlockers } from "./product-blueprint.mjs";
+const gitSha = (repository, ref) => execFileSync("git", ["-C", repository, "rev-parse", "--verify", `${ref}^{commit}`], { encoding: "utf8" }).trim();
 
 export function formatTaskPrompt({ task, worktree, project, overlaySnapshot = null, documentationAvailable = true }) {
   const lines = [
@@ -492,8 +494,9 @@ export class SwarmRouter extends EventEmitter {
     while (true) {
       if (this.stopRequested || scheduler.failed || this.budgetInterruptedTasks.size) { scheduler.blockedBudget ||= this.budgetInterruptedTasks.size > 0; return; }
       if (this.quotaThrottleStatus().throttled) { scheduler.blockedQuota = true; return; }
-      const task = this.store.claimNext();
+      const barriersRan = await this.#runReadyIntegrationBarriers(); const task = this.store.claimNext();
       if (!task) {
+        if (barriersRan) continue;
         if (!scheduler.active) return;
         await new Promise((resolve) => setTimeout(resolve, 100));
         continue;
@@ -509,8 +512,8 @@ export class SwarmRouter extends EventEmitter {
             catch { recovery = null; }
           }
           const detail = recovery ? `${error.message} Recovery worktree: ${recovery.worktree} (${recovery.clean ? "clean" : "dirty"}). ${recovery.action}` : error.message;
-          this.store.transition(task.id, "failed", { error: detail });
-          await this.#failFastAfterTaskFailure(client, scheduler, task.id, detail);
+          if (/specification_gap/i.test(detail)) { this.store.transition(task.id, "blocked_specification", { error: detail }); if (task.deliveryRunId) this.store.updateDeliveryRun(task.deliveryRunId, { state: "blocked_specification", publish: { reason: detail } }); }
+          else { this.store.transition(task.id, "failed", { error: detail }); this.#recordScopedFailure(task, detail); }
         }
       } finally { this.#forgetTaskTurn(task.id); scheduler.active -= 1; }
     }
@@ -790,7 +793,7 @@ export class SwarmRouter extends EventEmitter {
     const maxRepairTurns = 2;
     for (let attempt = 0; attempt <= maxRepairTurns; attempt += 1) {
       try {
-        this.#materializePlan(task, extractOrchestrationJson(resultText));
+        const parsed = extractOrchestrationJson(resultText); if (parsed?.outcome === "specification_gap") throw new Error(`specification_gap: ${parsed.reason ?? "planner identified a required missing specification"}`); this.#materializePlan(task, parsed);
         return resultText;
       } catch (error) {
         if (attempt === maxRepairTurns) throw error;
@@ -1038,7 +1041,11 @@ export class SwarmRouter extends EventEmitter {
   #materializePlan(plannerTask, parsedPlan) {
     const stored = this.store.productBlueprint(plannerTask.blueprintId);
     if (!stored) throw new Error(`Planner task ${plannerTask.id} has no persisted ProductBlueprint`);
-    const plan = validatePlan(normalizePlannerPlanForProject(parsedPlan, this.config.project.productRoots), { maxTasks: this.config.router.maxPlanTasks, productRoots: this.config.project.productRoots, blueprint: stored.blueprint });
+    const planRunId = plannerTask.deliveryRunId ?? `standalone:${plannerTask.id}`, previous = this.store.currentCheckpoint(planRunId);
+    const batchInput = parsedPlan?.kind === "PlanBatch" ? parsedPlan : { ...parsedPlan, schemaVersion: 1, kind: "PlanBatch", id: randomUUID(), deliveryRunId: planRunId, wave: previous ? previous.wave + 1 : 1, basedOnCheckpointSha: previous?.outputSha ?? gitSha(this.config.repository, this.config.baseRef), createdAt: new Date().toISOString() };
+    const plan = validatePlan(normalizePlannerPlanForProject(batchInput, this.config.project.productRoots), { maxTasks: this.config.router.maxPlanTasks, productRoots: this.config.project.productRoots, blueprint: stored.blueprint, requirePlanBatch: true });
+    if (plan.deliveryRunId !== planRunId) throw new Error("PlanBatch deliveryRunId must match Planner delivery run");
+    const existingBatches = this.store.planBatches(plan.deliveryRunId); if (existingBatches.length) { const checkpoint = this.store.currentCheckpoint(plan.deliveryRunId); if (!checkpoint || plan.wave !== checkpoint.wave + 1 || plan.basedOnCheckpointSha !== checkpoint.outputSha) throw new Error("Next PlanBatch requires successful reconciliation of the current verified checkpoint"); } else if (plan.wave !== 1 || plan.basedOnCheckpointSha !== gitSha(this.config.repository, this.config.baseRef)) throw new Error("PlanBatch wave 1 must use the controller verified repository baseline");
     const orderedPlanIds = new Map();
     const pending = [...plan.tasks];
     const dispatch = [];
@@ -1078,13 +1085,11 @@ export class SwarmRouter extends EventEmitter {
       const writerPredecessors = dependencies
         .filter((dependency) => dependency !== plannerTask.id)
         .filter((dependency) => this.config.roles[primaryRoleByTaskId.get(dependency)]?.sandbox === "workspace-write");
-      if (writerPredecessors.length > 1) {
-        throw new Error(`Planner validation: writer '${item.id}' has multiple writer artifact predecessors; split or serialize the plan until controller-owned fan-in artifacts are supported`);
-      }
+      const fanIn = writerPredecessors.length > 1;
       const prompt = item.id === "scaffold-product"
         ? "[[product-scaffold]]\nController-owned scaffold contract: create every declared product root now. frontend/ must be a runnable Next.js application with package.json, npm lockfile, build and test scripts. backend/ must be an ASP.NET Core Web API solution with an xUnit test project. Do not create placeholders, plans, or a partial root. Run the declared checks after files are written."
         : item.prompt;
-      specs.push({ id: primaryId, role: item.primaryDomain, parentTaskId: plannerTask.id, title: item.title, prompt, allowedPaths: item.allowedPaths, acceptanceChecks: item.acceptanceChecks, dependencies, estimatedTokens: item.estimatedTokens, tokenBudget: primary.tokenBudget, maxAttempts: 1, humanApprovalRequired: elevatedGate, riskFlags: item.riskFlags, supportingDomains: item.supportingDomains, artifactDependencies: writerPredecessors, blueprintId: stored.blueprint.blueprintId, requirementIds: item.requirementIds, deliveryRunId: plannerTask.deliveryRunId ?? this.activeDeliveryRunId });
+      specs.push({ id: primaryId, role: item.primaryDomain, parentTaskId: plannerTask.id, title: item.title, prompt, allowedPaths: item.allowedPaths, acceptanceChecks: item.acceptanceChecks, dependencies, estimatedTokens: item.estimatedTokens, tokenBudget: primary.tokenBudget, maxAttempts: 1, humanApprovalRequired: elevatedGate, riskFlags: item.riskFlags, supportingDomains: item.supportingDomains, artifactBaseSha: primary.sandbox === "workspace-write" ? plan.basedOnCheckpointSha : null, artifactDependencies: fanIn ? [] : writerPredecessors, integrationBarrierId: fanIn ? `pending:${primaryId}` : null, blueprintId: stored.blueprint.blueprintId, requirementIds: item.requirementIds, deliveryRunId: planRunId, planBatchId: plan.id, wave: plan.wave });
       let predecessorId = primaryId;
       const mandatoryReview = primary.sandbox === "workspace-write";
       if ((mandatoryReview || securityRequired) && item.primaryDomain !== "security") {
@@ -1099,7 +1104,7 @@ export class SwarmRouter extends EventEmitter {
         specs.push({ id: randomUUID(), role: "qa", parentTaskId: predecessorId, title: `QA: ${item.title}`, prompt: `Verify finalized writer artifact '${item.title}' against acceptance checks. Return the required QualityGateReport only.`, allowedPaths: item.allowedPaths, acceptanceChecks: item.acceptanceChecks, dependencies: [predecessorId], estimatedTokens: estimate, tokenBudget: qa.tokenBudget, maxAttempts: 1, humanApprovalRequired: false, riskFlags: item.riskFlags, supportingDomains: ["qa"], sourceWriterTaskId: primaryId, blueprintId: stored.blueprint.blueprintId, requirementIds: item.requirementIds, deliveryRunId: plannerTask.deliveryRunId ?? this.activeDeliveryRunId });
       }
     }
-    this.store.createTasks(specs);
+    this.store.createPlanBatch(plan, specs);
   }
 
   async #refreshProjectOverlayFromWorktree(worktree) {
@@ -1120,22 +1125,23 @@ export class SwarmRouter extends EventEmitter {
     for (const task of this.store.listTasks()) {
       if (task.id === predecessor.id || !task.dependencies.includes(predecessor.id) || this.config.roles[task.role]?.sandbox !== "workspace-write") continue;
       const writerPredecessors = task.dependencies.filter((dependency) => this.config.roles[this.store.getTask(dependency)?.role]?.sandbox === "workspace-write");
-      if (writerPredecessors.length > 1) throw new Error(`Writer task ${task.id} has multiple writer artifact predecessors; controller-owned fan-in artifacts are not supported`);
-      if (writerPredecessors.length === 1) this.store.setArtifactLineage(task.id, { artifactBaseSha: artifact.headSha, artifactDependencies: writerPredecessors });
+      if (writerPredecessors.length === 1 && !task.integrationBarrierId) this.store.setArtifactLineage(task.id, { artifactBaseSha: artifact.headSha, artifactDependencies: writerPredecessors });
     }
 
   }
   _assertWriterArtifactLineage(task) {
     const writerPredecessors = task.dependencies.filter((dependency) => this.config.roles[this.store.getTask(dependency)?.role]?.sandbox === "workspace-write");
-    if (writerPredecessors.length > 1) throw new Error(`Writer task ${task.id} has multiple writer artifact predecessors; controller-owned fan-in artifacts are not supported`);
+    if (writerPredecessors.length > 1) { const barrier = this.store.integrationBarrier(task.integrationBarrierId), checkpoint = barrier?.checkpointId ? this.store.integrationCheckpoint(barrier.checkpointId) : null; if (!barrier || barrier.status !== "passed" || !checkpoint) throw new Error(`Writer task ${task.id} cannot start before its IntegrationBarrier checkpoint`); validateIntegrationCheckpoint(checkpoint); if (task.artifactBaseSha !== checkpoint.outputSha || (task.artifactDependencies ?? []).length) throw new Error(`Writer task ${task.id} must start exactly from IntegrationCheckpoint output SHA`); return; }
     if (!writerPredecessors.length) return;
     const predecessorId = writerPredecessors[0];
     const predecessor = this.store.workerArtifact(predecessorId);
     if (!predecessor) throw new Error(`Writer task ${task.id} cannot start before predecessor ${predecessorId} has a WorkerArtifact`);
-    if (task.artifactBaseSha !== predecessor.headSha || !task.artifactDependencies.includes(predecessorId)) {
+    if (task.artifactBaseSha !== predecessor.headSha || task.artifactDependencies.length !== 1 || task.artifactDependencies[0] !== predecessorId) {
       throw new Error(`Writer task ${task.id} is missing artifact lineage from predecessor ${predecessorId}`);
     }
   }
+  async #runReadyIntegrationBarriers() { let progressed=false; for (const task of this.store.listTasks()) { if(this.config.roles[task.role]?.sandbox!=="workspace-write"||!String(task.integrationBarrierId??"").startsWith("pending:")||task.status!=="queued")continue; const ids=task.dependencies.filter((id)=>this.config.roles[this.store.getTask(id)?.role]?.sandbox==="workspace-write"), artifacts=ids.map((id)=>this.store.workerArtifact(id)); if(ids.length<2||artifacts.some((a)=>!a))continue; const barrier={schemaVersion:1,kind:"IntegrationBarrier",id:randomUUID(),deliveryRunId:task.deliveryRunId,blueprintId:task.blueprintId,wave:task.wave,baseSha:task.artifactBaseSha,inputArtifacts:artifacts.map((a)=>({artifactId:a.taskId,headSha:a.headSha})),status:"pending",createdAt:new Date().toISOString()}; this.store.createIntegrationBarrier(barrier);this.store.setIntegrationBarrier(task.id,barrier.id);progressed=true; } for(const pending of this.store.readyIntegrationBarriers(this.activeDeliveryRunId)){const barrier=this.store.claimIntegrationBarrier(pending.id);if(!barrier)continue;progressed=true;const result=await new Integrator({...this.config,processRunner:this.processRunner}).integrateBarrier({barrier,artifacts:barrier.inputArtifacts.map((i)=>this.store.workerArtifact(i.artifactId)),overlay:this.#workerOverlayContext().overlay});if(result.status!=="passed"){this.store.failIntegrationBarrier(barrier.id,result.error);continue;}const checkpoint={schemaVersion:1,kind:"IntegrationCheckpoint",id:randomUUID(),deliveryRunId:barrier.deliveryRunId,blueprintId:barrier.blueprintId,wave:barrier.wave,baseSha:barrier.baseSha,inputArtifacts:barrier.inputArtifacts,outputSha:result.outputSha,verificationResults:result.verificationResults,status:"passed",createdAt:new Date().toISOString()};this.store.recordIntegrationCheckpoint(checkpoint,{barrierId:barrier.id});this.store.reconcileWave({deliveryRunId:barrier.deliveryRunId,wave:barrier.wave,checkpointId:checkpoint.id});for(const next of this.store.listTasks().filter((i)=>i.integrationBarrierId===barrier.id&&i.status==="queued"))this.store.setArtifactLineage(next.id,{artifactBaseSha:checkpoint.outputSha,artifactDependencies:[]});}return progressed; }
+  #recordScopedFailure(task, detail) { const tasks=this.store.listTasks(), affected=new Set([task.id]);let changed=true;while(changed){changed=false;for(const candidate of tasks)if(!affected.has(candidate.id)&&candidate.dependencies.some((id)=>affected.has(id))){affected.add(candidate.id);changed=true;}}this.store.recordScopedReplan({id:randomUUID(),deliveryRunId:task.deliveryRunId,blueprintId:task.blueprintId,failedTaskId:task.id,invalidatedTaskIds:[...affected].filter((id)=>id!==task.id&&this.store.getTask(id)?.status==="queued"),priorPlanBatchId:task.planBatchId,status:"pending",createdAt:new Date().toISOString()}); }
   #inheritedWorktree(task) {
     let parent = task.parentTaskId ? this.store.getTask(task.parentTaskId) : null;
     while (parent) {

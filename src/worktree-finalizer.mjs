@@ -5,6 +5,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { commandCwd, commandsForPaths } from "./project-overlay.mjs";
 import { runManagedProcess } from "./managed-process-runner.mjs";
+import { validateWorkerArtifactContract } from "./workflow-contract.mjs";
 
 const exec = promisify(execFile);
 const ARTIFACT_VERSION = 1;
@@ -36,6 +37,8 @@ export class WorktreeFinalizer {
   async finalize({ task, worktree, branch, overlay, overlayPath }) {
     if (!worktree || !branch) throw new Error("Writer task has no isolated worktree or branch");
     const artifactBaseSha = task.artifactBaseSha ?? overlay.repository.baseSha;
+    const parentIds = task.artifactDependencies ?? [];
+    if (!Array.isArray(parentIds) || parentIds.length > 1) throw new Error("WorkerArtifact may have exactly zero or one parent artifact ID");
     const [worktreeRoot, headBefore, mergeBase, status, names] = await Promise.all([
       git(worktree, ["rev-parse", "--show-toplevel"]), git(worktree, ["rev-parse", "HEAD"]),
       git(worktree, ["merge-base", artifactBaseSha, "HEAD"]), gitRaw(worktree, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]),
@@ -81,18 +84,19 @@ export class WorktreeFinalizer {
       schemaVersion: ARTIFACT_VERSION, kind: "WorkerArtifact", taskId: task.id, workUnitId: task.workUnitId ?? task.id, workerId: task.role,
       baseSha: artifactBaseSha, branch, headSha, treeSha, commitRange: `${headBefore}..${headSha}`,
       diffChecksum: digest(diff), changedPaths: stagedPaths, verificationResults, policyResult: { status: "passed", violations: [] },
-      overlay: { schemaVersion: overlay.schemaVersion, path: overlayPath }, dependencies: task.artifactDependencies ?? task.dependencies ?? [],
+      overlay: { schemaVersion: overlay.schemaVersion, path: overlayPath }, parentArtifactId: parentIds[0] ?? null, dependencies: parentIds,
       finalizedBy: { component: "WorktreeFinalizer", version: ARTIFACT_VERSION, identity: this.runtimeIdentity.name, finalizedAt: new Date().toISOString(), worktreeRoot: toPosix(worktreeRoot) }
     };
     const artifactsDir = join(this.repository, this.generatedDir, "worker-artifacts");
     mkdirSync(artifactsDir, { recursive: true });
     const absolutePath = join(artifactsDir, `${task.id}.v${ARTIFACT_VERSION}.json`);
     writeFileSync(absolutePath, JSON.stringify(artifact, null, 2) + "\n", "utf8");
-    return { artifact, path: toPosix(relative(this.repository, absolutePath)) };
+    validateWorkerArtifact(artifact); return { artifact, path: toPosix(relative(this.repository, absolutePath)) };
   }
 }
 
 export function validateWorkerArtifact(value) {
+  validateWorkerArtifactContract(value);
   if (!value || value.schemaVersion !== ARTIFACT_VERSION || value.kind !== "WorkerArtifact") throw new Error("Invalid WorkerArtifact version or kind");
   for (const key of ["taskId", "baseSha", "branch", "headSha", "treeSha", "commitRange", "diffChecksum", "changedPaths", "verificationResults", "policyResult", "overlay", "finalizedBy"]) if (!(key in value)) throw new Error(`WorkerArtifact missing ${key}`);
   if (!Array.isArray(value.changedPaths) || !value.changedPaths.length || !/^[a-f0-9]{64}$/i.test(value.diffChecksum)) throw new Error("WorkerArtifact contains invalid diff metadata");

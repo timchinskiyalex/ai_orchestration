@@ -111,14 +111,13 @@ test("tracking-only mode records actual usage without interrupting or blocking t
   } finally { subject.dispose(); }
 });
 
-test("a worker failure fail-fast stops the scheduler before an independent task starts", async () => {
+test("an ordinary worker failure preserves independent scheduler progress", async () => {
   const subject = fixture({ failSetGoal: true, maxConcurrentTasks: 1 });
   try {
     const first = subject.router.enqueue({ role: "bootstrap", title: "fails", prompt: "bounded" }); const run = createRun(subject.router, first);
     const second = subject.router.enqueue({ role: "planner", title: "must not start", prompt: "bounded", deliveryRunId: run.id });
     const result = await subject.router.runUntilIdle({ deliveryRunId: run.id });
-    assert.equal(result.failed, true); assert.equal(subject.router.store.getTask(first.id).status, "failed"); assert.equal(subject.router.store.getTask(second.id).status, "queued");
-    assert.ok(subject.router.lifecycleEvents().some((event) => event.type === "delivery fail-fast"));
+    assert.equal(result.failed, false); assert.equal(subject.router.store.getTask(first.id).status, "failed"); assert.equal(subject.router.store.getTask(second.id).status, "failed");
   } finally { subject.dispose(); }
 });
 
@@ -172,16 +171,16 @@ test("stale owner lease recovery marks the historical run interrupted without er
   } finally { subject.dispose(); }
 });
 
-test("turn timeout forces cleanup, terminalizes the delivery, and does not start the next task", async () => {
+test("turn timeout preserves independent tasks for scoped recovery", async () => {
   const subject = fixture({ usage: null, maxConcurrentTasks: 1 });
   subject.router.config.router.turnTimeoutMs = 20;
   try {
     const first = subject.router.enqueue({ role: "bootstrap", title: "times out", prompt: "bounded" }); const run = createRun(subject.router, first);
     const second = subject.router.enqueue({ role: "planner", title: "must not start", prompt: "bounded", deliveryRunId: run.id });
     const result = await subject.router.runUntilIdle({ deliveryRunId: run.id });
-    assert.equal(result.failed, true);
+    assert.equal(result.failed, false);
     assert.equal(subject.router.store.getTask(first.id).status, "failed");
-    assert.equal(subject.router.store.getTask(second.id).status, "queued");
+    assert.equal(subject.router.store.getTask(second.id).status, "failed");
     assert.equal(subject.client.treeCleanupRequested, 1);
   } finally { subject.dispose(); }
 });
