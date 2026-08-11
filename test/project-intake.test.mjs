@@ -21,6 +21,8 @@ test("documentation intake copies only Markdown and writes an inventory inside t
     assert.equal(readFileSync(join(repository, "docs", "orchestration-input", "nested", "api.md"), "utf8"), "# API\n");
     const inventory = JSON.parse(readFileSync(result.inventoryPath, "utf8"));
     assert.deepEqual(inventory.files.map((item) => item.path), ["nested/api.md", "overview.md"]);
+    assert.equal(inventory.files.every((item) => /^doc-[a-f0-9]{20}$/.test(item.documentId) && /^[a-f0-9]{64}$/.test(item.sha256)), true);
+    assert.match(inventory.documentSetDigest, /^[a-f0-9]{64}$/);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

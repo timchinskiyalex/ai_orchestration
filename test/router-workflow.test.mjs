@@ -18,7 +18,7 @@ function config(root) {
   };
 }
 
-test("project workflow starts Bootstrap and approval automatically queues Planner", () => {
+test("project workflow refuses to queue Planner without a persisted ProductBlueprint", () => {
   const root = mkdtempSync(join(tmpdir(), "orchestration-router-"));
   mkdirSync(join(root, "docs", "orchestration-input"), { recursive: true });
   writeFileSync(join(root, "docs", "orchestration-input", "inventory.json"), "{}", "utf8");
@@ -29,13 +29,7 @@ test("project workflow starts Bootstrap and approval automatically queues Planne
     router.store.transition(bootstrap.id, "preparing");
     router.store.transition(bootstrap.id, "running");
     router.store.transition(bootstrap.id, "awaiting_human");
-    const { next, shouldRun } = router.approveHumanGate(bootstrap.id);
-    assert.equal(next.role, "planner");
-    assert.deepEqual(next.dependencies, [bootstrap.id]);
-    assert.equal(shouldRun, true);
-    const budget = router.budgetSummary();
-    assert.equal(budget.plannedTokens, 200);
-    assert.equal(budget.projectedPercent, 4);
+    assert.throws(() => router.approveHumanGate(bootstrap.id), /persisted ProductBlueprint/);
   } finally {
     router.close();
     rmSync(root, { recursive: true, force: true });

@@ -3,9 +3,12 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SwarmRouter } from "../src/router.mjs";
+import { fakeBlueprint } from "./product-blueprint-fixture.mjs";
+import { documentIdForPath, documentSetDigest } from "../src/product-blueprint.mjs";
 
 const git = (cwd, args) => execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8" }).trim();
 
@@ -27,7 +30,7 @@ class LineageClient extends EventEmitter {
   async readThread({ threadId }) {
     const goal = this.threads.get(threadId).goal;
     const text = /^Bootstrap/.test(goal)
-      ? "```json\n{\"summary\":\"ok\",\"assumptions\":[],\"risks\":[],\"humanGates\":[]}\n```"
+      ? `\`\`\`json\n${JSON.stringify(fakeBlueprint(this.threads.get(threadId).cwd))}\n\`\`\``
       : /^Plan /.test(goal)
         ? `\`\`\`json\n${JSON.stringify(this.plan)}\n\`\`\``
         : /^Security review:/.test(goal) || /^QA:/.test(goal)
@@ -37,18 +40,18 @@ class LineageClient extends EventEmitter {
   }
 }
 
-const writer = (id, title, dependsOn = []) => ({ id, title, prompt: title, primaryDomain: "backend", supportingDomains: [], riskFlags: [], humanApprovalRequired: false, estimatedTokens: 20, dependsOn, allowedPaths: [`src/${id === "writer-a" ? "a" : "b"}.mjs`], acceptanceChecks: [] });
+const writer = (id, title, dependsOn = []) => ({ id, title, prompt: title, primaryDomain: "backend", supportingDomains: [], riskFlags: [], humanApprovalRequired: false, estimatedTokens: 20, dependsOn, allowedPaths: [`src/${id === "writer-a" ? "a" : "b"}.mjs`], acceptanceChecks: [], requirementIds: ["fix-value"] });
 function config(root, client) {
   const roles = Object.fromEntries(["bootstrap", "planner", "backend", "frontend", "database", "qa", "security", "devops"].map((role) => [role, { sandbox: role === "backend" ? "workspace-write" : "read-only", approvalPolicy: "never", tokenBudget: 100, usesWorktree: role === "backend" }]));
   return { repository: root, runtimeDir: join(root, "runtime"), baseRef: "main", model: "fake", project: { name: "lineage", documentationDir: "docs/orchestration-input", generatedDir: "docs/orchestration-generated", productRoots: [] }, router: { maxConcurrentTasks: 1, maxChildrenPerTask: 10, maxDelegationDepth: 5, maxPlanTasks: 5, defaultParentBudget: 1000, turnTimeoutMs: 1000, approvalMode: "deny" }, autonomy: { mode: "autonomous", autoApproveWorkflowGates: true, autoRemediate: true }, budget: { weeklyTokenLimit: 10000, weeklyWindowDays: 7 }, quota: { throttleAtUsedPercent: 90, throttleWhenUnavailable: false }, roles, appServerClientFactory: () => client };
 }
 function setup(client) {
   const root = mkdtempSync(join(tmpdir(), "planner-lineage-"));
-  git(root, ["init", "-b", "main"]); mkdirSync(join(root, "src")); mkdirSync(join(root, "docs", "orchestration-input"), { recursive: true }); writeFileSync(join(root, "docs", "orchestration-input", "inventory.json"), "{}"); writeFileSync(join(root, "src", "base.mjs"), "export const base = true;\n"); writeFileSync(join(root, "package.json"), JSON.stringify({ packageManager: "npm@10", scripts: {} })); writeFileSync(join(root, "package-lock.json"), "{}"); git(root, ["add", "."]); git(root, ["-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "base"]); return root;
+  git(root, ["init", "-b", "main"]); mkdirSync(join(root, "src")); mkdirSync(join(root, "docs", "orchestration-input"), { recursive: true }); const path = "requirements.md"; const file = { documentId: documentIdForPath(path), path, sha256: createHash("sha256").update("Fix value.\n").digest("hex") }; writeFileSync(join(root, "docs", "orchestration-input", path), "Fix value.\n"); writeFileSync(join(root, "docs", "orchestration-input", "inventory.json"), JSON.stringify({ files: [file], documentSetDigest: documentSetDigest([file]) })); writeFileSync(join(root, "src", "base.mjs"), "export const base = true;\n"); writeFileSync(join(root, "package.json"), JSON.stringify({ packageManager: "npm@10", scripts: {} })); writeFileSync(join(root, "package-lock.json"), "{}"); git(root, ["add", "."]); git(root, ["-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "base"]); return root;
 }
 
 test("planner writer edge propagates artifact worktree lineage and integration order", async () => {
-  const plan = { tasks: [writer("writer-a", "Write A"), writer("writer-b", "Write B", ["writer-a"])] }; const client = new LineageClient(plan); const root = setup(client); let router;
+  const plan = { blueprintId: "pb-test", tasks: [writer("writer-a", "Write A"), writer("writer-b", "Write B", ["writer-a"])] }; const client = new LineageClient(plan); const root = setup(client); let router;
   try {
     router = new SwarmRouter(config(root, client)); await router.ensureProjectOverlay(); router.startProject(); await router.runUntilIdle();
     const a = router.list().find((task) => task.title === "Write A"); const b = router.list().find((task) => task.title === "Write B"); const aArtifact = router.store.workerArtifact(a.id); const bArtifact = router.store.workerArtifact(b.id); assert.ok(aArtifact && bArtifact, JSON.stringify(router.list().map((task) => ({ title: task.title, role: task.role, status: task.status, error: task.error }))));
@@ -58,7 +61,7 @@ test("planner writer edge propagates artifact worktree lineage and integration o
 });
 
 test("planner rejects repairable writer artifact fan-in", async () => {
-  const plan = { tasks: [writer("writer-a", "Write A"), writer("writer-c", "Write C"), writer("writer-b", "Write B", ["writer-a", "writer-c"])] }; const client = new LineageClient(plan); const root = setup(client); let router;
+  const plan = { blueprintId: "pb-test", tasks: [writer("writer-a", "Write A"), writer("writer-c", "Write C"), writer("writer-b", "Write B", ["writer-a", "writer-c"])] }; const client = new LineageClient(plan); const root = setup(client); let router;
   try {
     router = new SwarmRouter(config(root, client)); await router.ensureProjectOverlay(); router.startProject(); await router.runUntilIdle();
     const planner = router.list().find((task) => task.role === "planner"); assert.equal(planner.status, "failed"); assert.match(planner.error, /multiple writer artifact predecessors/); assert.equal(router.list().filter((task) => task.title === "Write A" || task.title === "Write B" || task.title === "Write C").length, 0);

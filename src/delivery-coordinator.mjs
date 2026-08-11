@@ -9,6 +9,7 @@ function manualGateFor(tasks) {
 }
 
 function terminalForTask(task) {
+  if (task.status === "blocked_specification") return { state: "blocked_specification", reason: task.error ?? "Product specification is incomplete or contradictory" };
   if (task.status === "blocked_budget") return { state: "blocked_budget", reason: task.error ?? "Local scheduler hard cap blocked task execution" };
   if (task.status === "awaiting_approval") return { state: "failed", reason: task.error ?? "Unexpected App Server approval request" };
   return { state: "failed", reason: task.error ?? task.status };
@@ -41,7 +42,7 @@ export class DeliveryCoordinator {
     this.router.recoverStaleDeliveries();
     const run = this.router.store.currentDeliveryRun();
     if (!run) throw new Error("No delivery run exists; start with npm run deliver -- --source <docs-dir>");
-    if (["completed_merged", "completed_candidate_ready", "failed", "blocked_budget", "blocked_quota", "conflict_blocked"].includes(run.state)) return run;
+    if (["completed_merged", "completed_candidate_ready", "failed", "blocked_budget", "blocked_quota", "blocked_specification", "conflict_blocked"].includes(run.state)) return run;
     const resumed = ["interrupted", "blocked_credentials", "blocked_ci", "blocked_branch_protection"].includes(run.state)
       ? this.router.resumeDeliveryRun(run.id)
       : (this.router.activateDeliveryRun(run.id), run);
@@ -81,7 +82,7 @@ export class DeliveryCoordinator {
       const gate = manualGateFor(tasks);
       if (gate) return this.#awaiting(run, gate);
     }
-    const terminalTask = tasks.find((task) => ["failed", "cancelled", "blocked_budget", "interrupted", "awaiting_approval"].includes(task.status));
+    const terminalTask = tasks.find((task) => ["failed", "cancelled", "blocked_budget", "blocked_specification", "interrupted", "awaiting_approval"].includes(task.status));
     if (terminalTask) {
       const terminal = terminalForTask(terminalTask);
       return this.router.store.updateDeliveryRun(run.id, { state: terminal.state, publish: { taskId: terminalTask.id, reason: terminal.reason, recovery: { action: "Inspect the task result/report and preserved worktree, correct the source condition, then start a fresh delivery run." } } });

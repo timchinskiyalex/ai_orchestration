@@ -1,5 +1,6 @@
 function fail(message) { throw new Error(`Invalid orchestration JSON: ${message}`); }
 import { enforceRoutingInvariants } from "./routing-evaluator.mjs";
+import { assertMandatoryRequirementCoverage, resolveDeclaredPolicyDefaults, validateProductBlueprint, validateRequirementIds } from "./product-blueprint.mjs";
 const domains = new Set(["backend", "frontend", "database", "qa", "security", "devops"]);
 const riskFlags = new Set(["public_api_change", "auth_or_authorization", "secret_handling", "sensitive_data", "destructive_data_change", "schema_change", "production_write", "network_exposure", "permission_change", "dependency_supply_chain", "irreversible_operation", "high_blast_radius"]);
 
@@ -10,32 +11,31 @@ export function extractOrchestrationJson(text) {
   catch { fail("agent response must contain one valid JSON object in a fenced block"); }
 }
 
-export function validateBootstrap(value) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) fail("bootstrap result must be an object");
-  for (const key of ["summary", "assumptions", "risks", "humanGates"]) {
-    if (!(key in value)) fail(`bootstrap result is missing '${key}'`);
-  }
-  if (typeof value.summary !== "string" || !Array.isArray(value.assumptions) || !Array.isArray(value.risks) || !Array.isArray(value.humanGates)) {
-    fail("bootstrap fields have invalid types");
-  }
-  return value;
+export function validateBootstrap(value, { sourceDocuments = null } = {}) {
+  try { return resolveDeclaredPolicyDefaults(validateProductBlueprint(value, { sourceDocuments })); }
+  catch (error) { fail(error.message.replace(/^Invalid ProductBlueprint: /, "")); }
 }
 
-export function validatePlan(value, { maxTasks, productRoots = [] }) {
+export function validatePlan(value, { maxTasks, productRoots = [], blueprint = null }) {
   if (!value || typeof value !== "object" || !Array.isArray(value.tasks)) fail("plan must contain a tasks array");
+  if (blueprint && value.blueprintId !== blueprint.blueprintId) fail("plan blueprintId must match the persisted ProductBlueprint");
   if (!value.tasks.length) fail("plan must contain at least one task");
   if (value.tasks.length > maxTasks) fail(`plan exceeds configured maxPlanTasks (${maxTasks})`);
   const ids = new Set();
   for (const task of value.tasks) {
     if (!task || typeof task !== "object") fail("every task must be an object");
-    for (const key of ["id", "title", "prompt", "primaryDomain", "supportingDomains", "riskFlags", "estimatedTokens", "dependsOn", "allowedPaths", "acceptanceChecks", "humanApprovalRequired"]) {
+    for (const key of ["id", "title", "prompt", "primaryDomain", "supportingDomains", "riskFlags", "estimatedTokens", "dependsOn", "allowedPaths", "acceptanceChecks", "humanApprovalRequired", ...(blueprint ? ["requirementIds"] : [])]) {
       if (!(key in task)) fail(`task is missing '${key}'`);
     }
     if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(task.id)) fail(`task id '${task.id}' is unsafe`);
     if (ids.has(task.id)) fail(`task id '${task.id}' is duplicated`);
     ids.add(task.id);
     if (typeof task.title !== "string" || typeof task.prompt !== "string" || !task.title.trim() || !task.prompt.trim()) fail(`task '${task.id}' needs title and prompt`);
-    if (![task.supportingDomains, task.riskFlags, task.dependsOn, task.allowedPaths, task.acceptanceChecks].every(Array.isArray)) fail(`task '${task.id}' array fields are invalid`);
+    if (![task.supportingDomains, task.riskFlags, task.dependsOn, task.allowedPaths, task.acceptanceChecks, ...(blueprint ? [task.requirementIds] : [])].every(Array.isArray)) fail(`task '${task.id}' array fields are invalid`);
+    if (blueprint) {
+      try { validateRequirementIds(task.requirementIds, blueprint); }
+      catch (error) { fail(`task '${task.id}' ${error.message.replace(/^Invalid ProductBlueprint: /, "")}`); }
+    }
     if (!domains.has(task.primaryDomain) || task.supportingDomains.some((domain) => !domains.has(domain))) fail(`task '${task.id}' has an unknown domain`);
     if (task.riskFlags.some((flag) => !riskFlags.has(flag))) fail(`task '${task.id}' has an unknown risk flag`);
     if (!Number.isInteger(task.estimatedTokens) || task.estimatedTokens < 1) fail(`task '${task.id}' needs a positive token estimate`);
@@ -70,6 +70,10 @@ export function validatePlan(value, { maxTasks, productRoots = [] }) {
     visited.add(id);
   };
   for (const task of value.tasks) visit(task.id);
-  try { return enforceRoutingInvariants(value); }
+  try {
+    const plan = enforceRoutingInvariants(value);
+    if (blueprint) assertMandatoryRequirementCoverage(plan, blueprint);
+    return plan;
+  }
   catch (error) { fail(error.message.replace(/^Unsafe routing plan: /, "")); }
 }

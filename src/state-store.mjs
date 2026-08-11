@@ -55,6 +55,8 @@ export class StateStore {
         remediation_round INTEGER NOT NULL DEFAULT 0,
         source_writer_task_id TEXT,
         delivery_run_id TEXT,
+        blueprint_id TEXT,
+        requirement_ids_json TEXT NOT NULL DEFAULT '[]',
         interrupt_threshold_tokens INTEGER,
         configured_budget_cap INTEGER
       );
@@ -133,6 +135,8 @@ export class StateStore {
         heartbeat_at TEXT,
         interrupted_at TEXT,
         recovery_json TEXT,
+        blueprint_id TEXT,
+        completion_contract_version INTEGER NOT NULL DEFAULT 0,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
@@ -157,6 +161,28 @@ export class StateStore {
         reason TEXT NOT NULL,
         interrupted_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS product_blueprints (
+        blueprint_id TEXT PRIMARY KEY,
+        schema_version INTEGER NOT NULL,
+        artifact_path TEXT NOT NULL,
+        digest TEXT NOT NULL,
+        document_set_digest TEXT NOT NULL,
+        bootstrap_task_id TEXT REFERENCES tasks(id),
+        delivery_run_id TEXT REFERENCES delivery_runs(id),
+        blueprint_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS traceability_records (
+        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+        requirement_id TEXT NOT NULL,
+        blueprint_id TEXT NOT NULL REFERENCES product_blueprints(blueprint_id),
+        task_id TEXT REFERENCES tasks(id),
+        artifact_path TEXT,
+        verification_path TEXT,
+        checkpoint TEXT,
+        payload_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
       CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status, created_at);
       CREATE INDEX IF NOT EXISTS idx_tasks_thread ON tasks(thread_id);
       CREATE INDEX IF NOT EXISTS idx_events_task ON events(task_id, sequence);
@@ -173,6 +199,8 @@ export class StateStore {
     this.#addColumnIfMissing("tasks", "remediation_round", "INTEGER NOT NULL DEFAULT 0");
     this.#addColumnIfMissing("tasks", "source_writer_task_id", "TEXT");
     this.#addColumnIfMissing("tasks", "delivery_run_id", "TEXT");
+    this.#addColumnIfMissing("tasks", "blueprint_id", "TEXT");
+    this.#addColumnIfMissing("tasks", "requirement_ids_json", "TEXT NOT NULL DEFAULT '[]'");
     this.#addColumnIfMissing("tasks", "interrupt_threshold_tokens", "INTEGER");
     this.#addColumnIfMissing("tasks", "configured_budget_cap", "INTEGER");
     this.#addColumnIfMissing("tasks", "token_usage_source", "TEXT");
@@ -185,23 +213,29 @@ export class StateStore {
     this.#addColumnIfMissing("delivery_runs", "candidate_branch", "TEXT");
     this.#addColumnIfMissing("delivery_runs", "candidate_sha", "TEXT");
     this.#addColumnIfMissing("delivery_runs", "publication_checkpoint_json", "TEXT");
+    this.#addColumnIfMissing("delivery_runs", "blueprint_id", "TEXT");
+    this.#addColumnIfMissing("delivery_runs", "completion_contract_version", "INTEGER NOT NULL DEFAULT 0");
+    // Older resumable runs have no immutable intake contract. Preserve every
+    // row, but prevent them from silently continuing under the new semantics.
+    this.#blockLegacyRunsWithoutBlueprint();
   }
 
   close() { this.db.close(); }
 
   createTask(task) {
     assertRole(task.role);
+    this.#validateTaskBlueprint(task);
     const timestamp = now();
     const initialStatus = task.humanApprovalRequired ? "awaiting_human" : "queued";
     this.#mutate(task.id, `task/${initialStatus}`, { role: task.role, title: task.title, humanApprovalRequired: Boolean(task.humanApprovalRequired) }, () => this.db.prepare(`INSERT INTO tasks (
       id, parent_task_id, role, title, prompt, status, allowed_paths_json,
       acceptance_checks_json, dependencies_json, human_approval_required, token_budget, estimated_tokens, max_attempts, created_at, updated_at,
-      risk_flags_json, supporting_domains_json, artifact_base_sha, artifact_dependencies_json, remediation_round, source_writer_task_id, delivery_run_id
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      risk_flags_json, supporting_domains_json, artifact_base_sha, artifact_dependencies_json, remediation_round, source_writer_task_id, delivery_run_id, blueprint_id, requirement_ids_json
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
       task.id, task.parentTaskId ?? null, task.role, task.title, task.prompt,
       initialStatus, json(task.allowedPaths), json(task.acceptanceChecks), json(task.dependencies), task.humanApprovalRequired ? 1 : 0, task.tokenBudget, task.estimatedTokens ?? task.tokenBudget,
       task.maxAttempts, timestamp, timestamp, json(task.riskFlags), json(task.supportingDomains), task.artifactBaseSha ?? null,
-      json(task.artifactDependencies), task.remediationRound ?? 0, task.sourceWriterTaskId ?? null, task.deliveryRunId ?? null
+      json(task.artifactDependencies), task.remediationRound ?? 0, task.sourceWriterTaskId ?? null, task.deliveryRunId ?? null, task.blueprintId ?? null, json(task.requirementIds)
     ));
     return this.getTask(task.id);
   }
@@ -213,6 +247,7 @@ export class StateStore {
     const ids = new Set();
     for (const task of tasks) {
       assertRole(task.role);
+      this.#validateTaskBlueprint(task);
       if (!task.id || ids.has(task.id) || this.getTask(task.id)) throw new Error("Batch task ids must be unique and unused");
       ids.add(task.id);
     }
@@ -224,14 +259,15 @@ export class StateStore {
         this.db.prepare(`INSERT INTO tasks (
           id, parent_task_id, role, title, prompt, status, allowed_paths_json,
           acceptance_checks_json, dependencies_json, human_approval_required, token_budget, estimated_tokens, max_attempts, created_at, updated_at,
-          risk_flags_json, supporting_domains_json, artifact_base_sha, artifact_dependencies_json, remediation_round, source_writer_task_id, delivery_run_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)` ).run(
+          risk_flags_json, supporting_domains_json, artifact_base_sha, artifact_dependencies_json, remediation_round, source_writer_task_id, delivery_run_id, blueprint_id, requirement_ids_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)` ).run(
           task.id, task.parentTaskId ?? null, task.role, task.title, task.prompt,
           initialStatus, json(task.allowedPaths), json(task.acceptanceChecks), json(task.dependencies), task.humanApprovalRequired ? 1 : 0,
           task.tokenBudget, task.estimatedTokens ?? task.tokenBudget, task.maxAttempts ?? 1, timestamp, timestamp,
-          json(task.riskFlags), json(task.supportingDomains), task.artifactBaseSha ?? null, json(task.artifactDependencies), task.remediationRound ?? 0, task.sourceWriterTaskId ?? null, task.deliveryRunId ?? null
+          json(task.riskFlags), json(task.supportingDomains), task.artifactBaseSha ?? null, json(task.artifactDependencies), task.remediationRound ?? 0, task.sourceWriterTaskId ?? null, task.deliveryRunId ?? null, task.blueprintId ?? null, json(task.requirementIds)
         );
         this.#insertEvent(task.id, `task/${initialStatus}`, { role: task.role, title: task.title, humanApprovalRequired: Boolean(task.humanApprovalRequired) });
+        for (const requirementId of task.requirementIds ?? []) this.#insertTraceability({ requirementId, blueprintId: task.blueprintId, taskId: task.id, checkpoint: "planned", payload: { role: task.role, parentTaskId: task.parentTaskId ?? null } });
       }
       this.db.exec("COMMIT");
     } catch (error) {
@@ -418,8 +454,12 @@ export class StateStore {
   }
 
   recordWorkerArtifact(taskId, artifactPath, artifact) {
-    this.#mutate(taskId, "worker/artifact", { artifactPath, schemaVersion: artifact.schemaVersion }, () => this.db.prepare(`INSERT OR REPLACE INTO worker_artifacts(task_id, schema_version, artifact_path, artifact_json, created_at)
-      VALUES (?, ?, ?, ?, ?)` ).run(taskId, artifact.schemaVersion, artifactPath, JSON.stringify(artifact), now()));
+    const task = this.getTask(taskId);
+    this.#mutate(taskId, "worker/artifact", { artifactPath, schemaVersion: artifact.schemaVersion }, () => {
+      this.db.prepare(`INSERT OR REPLACE INTO worker_artifacts(task_id, schema_version, artifact_path, artifact_json, created_at)
+        VALUES (?, ?, ?, ?, ?)` ).run(taskId, artifact.schemaVersion, artifactPath, JSON.stringify(artifact), now());
+      for (const requirementId of task?.requirementIds ?? []) this.#insertTraceability({ requirementId, blueprintId: task.blueprintId, taskId, artifactPath, checkpoint: "artifact", payload: { artifactTaskId: taskId } });
+    });
   }
 
   workerArtifact(taskId) {
@@ -433,8 +473,12 @@ export class StateStore {
   }
 
   recordQualityReport({ qaTaskId, writerTaskId, reportPath, report }) {
-    this.#mutate(qaTaskId, "quality/report", { writerTaskId, reportPath, verdict: report.verdict }, () => this.db.prepare(`INSERT OR REPLACE INTO quality_reports(qa_task_id, writer_task_id, schema_version, report_path, report_json, created_at)
-      VALUES (?, ?, ?, ?, ?, ?)` ).run(qaTaskId, writerTaskId, report.schemaVersion, reportPath, JSON.stringify(report), now()));
+    const task = this.getTask(qaTaskId);
+    this.#mutate(qaTaskId, "quality/report", { writerTaskId, reportPath, verdict: report.verdict }, () => {
+      this.db.prepare(`INSERT OR REPLACE INTO quality_reports(qa_task_id, writer_task_id, schema_version, report_path, report_json, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)` ).run(qaTaskId, writerTaskId, report.schemaVersion, reportPath, JSON.stringify(report), now());
+      for (const requirementId of task?.requirementIds ?? []) this.#insertTraceability({ requirementId, blueprintId: task.blueprintId, taskId: qaTaskId, verificationPath: reportPath, checkpoint: "verification", payload: { kind: "qa", verdict: report.verdict } });
+    });
   }
 
   qualityReport(qaTaskId) {
@@ -443,8 +487,12 @@ export class StateStore {
   }
 
   recordSecurityReport({ securityTaskId, writerTaskId, reportPath, report }) {
-    this.#mutate(securityTaskId, "security/report", { writerTaskId, reportPath, verdict: report.verdict }, () => this.db.prepare(`INSERT OR REPLACE INTO security_reports(security_task_id, writer_task_id, schema_version, report_path, report_json, created_at)
-      VALUES (?, ?, ?, ?, ?, ?)` ).run(securityTaskId, writerTaskId, report.schemaVersion, reportPath, JSON.stringify(report), now()));
+    const task = this.getTask(securityTaskId);
+    this.#mutate(securityTaskId, "security/report", { writerTaskId, reportPath, verdict: report.verdict }, () => {
+      this.db.prepare(`INSERT OR REPLACE INTO security_reports(security_task_id, writer_task_id, schema_version, report_path, report_json, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)` ).run(securityTaskId, writerTaskId, report.schemaVersion, reportPath, JSON.stringify(report), now());
+      for (const requirementId of task?.requirementIds ?? []) this.#insertTraceability({ requirementId, blueprintId: task.blueprintId, taskId: securityTaskId, verificationPath: reportPath, checkpoint: "verification", payload: { kind: "security", verdict: report.verdict } });
+    });
   }
 
   securityReport(securityTaskId) {
@@ -459,7 +507,7 @@ export class StateStore {
     try {
       const active = this.db.prepare("SELECT id FROM delivery_runs WHERE state IN ('running','awaiting_human','awaiting_human_remote_handoff') LIMIT 1").get();
       if (active) throw new Error(`Delivery already owned by active run: ${active.id}`);
-      this.db.prepare("INSERT INTO delivery_runs(id, schema_version, state, source, bootstrap_task_id, confirm_remote_push, owner_pid, owner_session_id, heartbeat_at, created_at, updated_at) VALUES (?, 1, 'running', ?, ?, ?, ?, ?, ?, ?, ?)").run(id, source, bootstrapTaskId, confirmRemotePush ? 1 : 0, ownerPid, ownerSessionId, timestamp, timestamp, timestamp);
+      this.db.prepare("INSERT INTO delivery_runs(id, schema_version, state, source, bootstrap_task_id, confirm_remote_push, owner_pid, owner_session_id, heartbeat_at, completion_contract_version, created_at, updated_at) VALUES (?, 1, 'running', ?, ?, ?, ?, ?, ?, 1, ?, ?)").run(id, source, bootstrapTaskId, confirmRemotePush ? 1 : 0, ownerPid, ownerSessionId, timestamp, timestamp, timestamp);
       this.#insertEvent(bootstrapTaskId, "delivery/created", { deliveryRunId: id, confirmRemotePush: Boolean(confirmRemotePush), ownerPid, ownerSessionId, heartbeatAt: timestamp });
       this.db.exec("COMMIT");
     } catch (error) { this.db.exec("ROLLBACK"); throw error; }
@@ -506,6 +554,44 @@ export class StateStore {
       this.db.exec("COMMIT");
     } catch (error) { this.db.exec("ROLLBACK"); throw error; }
     return this.deliveryRun(id);
+  }
+
+  recordProductBlueprint({ blueprint, artifactPath, digest, bootstrapTaskId = null, deliveryRunId = null }) {
+    const existing = this.db.prepare("SELECT artifact_path FROM product_blueprints WHERE blueprint_id = ?").get(blueprint.blueprintId);
+    if (existing) throw new Error(`ProductBlueprint '${blueprint.blueprintId}' is immutable and already persisted at ${existing.artifact_path}`);
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.prepare(`INSERT INTO product_blueprints(blueprint_id, schema_version, artifact_path, digest, document_set_digest, bootstrap_task_id, delivery_run_id, blueprint_json, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(blueprint.blueprintId, blueprint.schemaVersion, artifactPath, digest, blueprint.documentSetDigest, bootstrapTaskId, deliveryRunId, JSON.stringify(blueprint), now());
+      this.#insertEvent(bootstrapTaskId, "blueprint/persisted", { blueprintId: blueprint.blueprintId, artifactPath, digest, deliveryRunId });
+      this.db.exec("COMMIT");
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    return this.productBlueprint(blueprint.blueprintId);
+  }
+
+  productBlueprint(blueprintId) {
+    const row = this.db.prepare("SELECT artifact_path, digest, document_set_digest, bootstrap_task_id, delivery_run_id, blueprint_json, created_at FROM product_blueprints WHERE blueprint_id = ?").get(blueprintId);
+    return row ? { blueprint: JSON.parse(row.blueprint_json), artifactPath: row.artifact_path, digest: row.digest, documentSetDigest: row.document_set_digest, bootstrapTaskId: row.bootstrap_task_id, deliveryRunId: row.delivery_run_id, createdAt: row.created_at } : null;
+  }
+
+  productBlueprintForBootstrap(bootstrapTaskId) {
+    const row = this.db.prepare("SELECT blueprint_id FROM product_blueprints WHERE bootstrap_task_id = ? ORDER BY created_at DESC LIMIT 1").get(bootstrapTaskId);
+    return row ? this.productBlueprint(row.blueprint_id) : null;
+  }
+
+  linkBlueprintToDelivery(deliveryRunId, blueprintId) {
+    if (!this.productBlueprint(blueprintId)) throw new Error(`ProductBlueprint '${blueprintId}' was not persisted`);
+    this.#mutate(null, "delivery/blueprint-linked", { deliveryRunId, blueprintId }, () => this.db.prepare("UPDATE delivery_runs SET blueprint_id = ?, updated_at = ? WHERE id = ? AND blueprint_id IS NULL").run(blueprintId, now(), deliveryRunId));
+    return this.deliveryRun(deliveryRunId);
+  }
+
+  recordTraceability({ requirementId, blueprintId, taskId = null, artifactPath = null, verificationPath = null, checkpoint = null, payload = {} }) {
+    if (!this.productBlueprint(blueprintId)) throw new Error(`Traceability requires persisted ProductBlueprint '${blueprintId}'`);
+    this.#mutate(taskId, "traceability/recorded", { requirementId, blueprintId, artifactPath, verificationPath, checkpoint }, () => this.#insertTraceability({ requirementId, blueprintId, taskId, artifactPath, verificationPath, checkpoint, payload }));
+  }
+
+  traceabilityForRequirement(requirementId) {
+    return this.db.prepare("SELECT * FROM traceability_records WHERE requirement_id = ? ORDER BY sequence").all(requirementId).map((row) => ({ sequence: row.sequence, requirementId: row.requirement_id, blueprintId: row.blueprint_id, taskId: row.task_id, artifactPath: row.artifact_path, verificationPath: row.verification_path, checkpoint: row.checkpoint, payload: parse(row.payload_json, {}), createdAt: row.created_at }));
   }
 
   resumeDeliveryRun(id, { ownerPid, ownerSessionId }) {
@@ -644,18 +730,48 @@ export class StateStore {
       riskFlags: parse(row.risk_flags_json, []), supportingDomains: parse(row.supporting_domains_json, []),
       artifactBaseSha: row.artifact_base_sha, artifactDependencies: parse(row.artifact_dependencies_json, []),
       remediationRound: row.remediation_round, sourceWriterTaskId: row.source_writer_task_id,
-      deliveryRunId: row.delivery_run_id, interruptThresholdTokens: row.interrupt_threshold_tokens, configuredBudgetCap: row.configured_budget_cap,
+      deliveryRunId: row.delivery_run_id, blueprintId: row.blueprint_id, requirementIds: parse(row.requirement_ids_json, []), interruptThresholdTokens: row.interrupt_threshold_tokens, configuredBudgetCap: row.configured_budget_cap,
       budgetInterrupt: this.budgetInterruption(row.id)
     };
   }
 
   #mapDeliveryRun(row) {
-    return { id: row.id, schemaVersion: row.schema_version, state: row.state, source: row.source, bootstrapTaskId: row.bootstrap_task_id, integrationPath: row.integration_path, candidate: row.candidate_branch && row.candidate_sha ? { branch: row.candidate_branch, sha: row.candidate_sha } : null, publicationCheckpoint: parse(row.publication_checkpoint_json, null), publish: parse(row.publish_json, null), confirmRemotePush: Boolean(row.confirm_remote_push), ownerPid: row.owner_pid, ownerSessionId: row.owner_session_id, heartbeatAt: row.heartbeat_at, interruptedAt: row.interrupted_at, recovery: parse(row.recovery_json, null), createdAt: row.created_at, updatedAt: row.updated_at };
+    return { id: row.id, schemaVersion: row.schema_version, state: row.state, source: row.source, bootstrapTaskId: row.bootstrap_task_id, blueprintId: row.blueprint_id, completionContractVersion: row.completion_contract_version ?? 0, integrationPath: row.integration_path, candidate: row.candidate_branch && row.candidate_sha ? { branch: row.candidate_branch, sha: row.candidate_sha } : null, publicationCheckpoint: parse(row.publication_checkpoint_json, null), publish: parse(row.publish_json, null), confirmRemotePush: Boolean(row.confirm_remote_push), ownerPid: row.owner_pid, ownerSessionId: row.owner_session_id, heartbeatAt: row.heartbeat_at, interruptedAt: row.interrupted_at, recovery: parse(row.recovery_json, null), createdAt: row.created_at, updatedAt: row.updated_at };
   }
 
   #addColumnIfMissing(table, column, definition) {
     const columns = this.db.prepare(`PRAGMA table_info(${table})`).all();
     if (!columns.some((item) => item.name === column)) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  }
+
+  #validateTaskBlueprint(task) {
+    if (!task.blueprintId && !(task.requirementIds?.length)) return;
+    if (!task.blueprintId || !Array.isArray(task.requirementIds) || (!task.requirementIds.length && !["bootstrap", "planner"].includes(task.role))) throw new Error("Blueprint-linked task requires blueprintId and non-empty requirementIds");
+    const stored = this.productBlueprint(task.blueprintId);
+    if (!stored) throw new Error(`Task references unknown ProductBlueprint '${task.blueprintId}'`);
+    const known = new Set(stored.blueprint.requirements.map((requirement) => requirement.requirementId));
+    for (const requirementId of task.requirementIds) if (!known.has(requirementId)) throw new Error(`Task references unknown ProductBlueprint requirement '${requirementId}'`);
+  }
+
+  #blockLegacyRunsWithoutBlueprint() {
+    const states = ["running", "awaiting_human", "awaiting_human_remote_handoff", "interrupted", "blocked_credentials", "blocked_ci", "blocked_branch_protection"];
+    const rows = this.db.prepare(`SELECT id, bootstrap_task_id FROM delivery_runs WHERE blueprint_id IS NULL AND completion_contract_version = 0 AND state IN (${states.map(() => "?").join(",")})`).all(...states);
+    if (!rows.length) return;
+    const timestamp = now();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      for (const row of rows) {
+        const reason = "legacy_contract_incomplete: persisted resumable/in-progress run has no ProductBlueprint";
+        this.db.prepare("UPDATE delivery_runs SET state = 'blocked_specification', publish_json = ?, owner_pid = NULL, owner_session_id = NULL, heartbeat_at = NULL, updated_at = ? WHERE id = ?").run(JSON.stringify({ reason, recovery: { action: "Start a fresh delivery from source documentation; historical artifacts and tasks remain retained." } }), timestamp, row.id);
+        this.db.prepare("UPDATE tasks SET status = 'blocked_specification', error = ?, updated_at = ? WHERE delivery_run_id = ? AND status IN ('queued','preparing','running','awaiting_approval','awaiting_human','interrupted')").run(reason, timestamp, row.id);
+        this.#insertEvent(row.bootstrap_task_id, "delivery/blocked_specification", { deliveryRunId: row.id, reason });
+      }
+      this.db.exec("COMMIT");
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+  }
+
+  #insertTraceability({ requirementId, blueprintId, taskId = null, artifactPath = null, verificationPath = null, checkpoint = null, payload = {} }) {
+    this.db.prepare("INSERT INTO traceability_records(requirement_id, blueprint_id, task_id, artifact_path, verification_path, checkpoint, payload_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)").run(requirementId, blueprintId, taskId, artifactPath, verificationPath, checkpoint, JSON.stringify(payload), now());
   }
 
   #hasColumn(table, column) {

@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 import { DeliveryCoordinator } from "../src/delivery-coordinator.mjs";
 import { SwarmRouter } from "../src/router.mjs";
+import { fakeBlueprint, fakePlan } from "./product-blueprint-fixture.mjs";
 
 const git = (cwd, args) => execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8" }).trim();
 class DeliveryClient extends EventEmitter {
@@ -17,7 +18,7 @@ class DeliveryClient extends EventEmitter {
   async setGoal(goal) { this.goals.push(goal); this.threads.get(goal.threadId).goal = goal.objective; }
   async startTurn({ threadId }) { return { turn: { id: `turn-${threadId}` } }; }
   async waitForTurn(threadId, turnId) { const thread = this.threads.get(threadId); if (/Writer/.test(thread.goal)) writeFileSync(join(thread.cwd, "src", "value.mjs"), "export const value = 2;\n"); return { id: turnId, status: "completed" }; }
-  async readThread({ threadId }) { const thread = this.threads.get(threadId); const text = /^Bootstrap/.test(thread.goal) ? "```json\n{\"summary\":\"ok\",\"assumptions\":[],\"risks\":[],\"humanGates\":[]}\n```" : /^Plan /.test(thread.goal) ? "```json\n{\"tasks\":[{\"id\":\"writer\",\"title\":\"Writer\",\"prompt\":\"Writer\",\"primaryDomain\":\"backend\",\"supportingDomains\":[],\"riskFlags\":[],\"humanApprovalRequired\":false,\"estimatedTokens\":20,\"dependsOn\":[],\"allowedPaths\":[\"src/value.mjs\"],\"acceptanceChecks\":[\"npm test\"]}]}\n```" : /^Security review:/.test(thread.goal) ? "```json\n{\"verdict\":\"pass\",\"summary\":\"secure\",\"findings\":[],\"executedChecks\":[],\"notRunChecks\":[]}\n```" : /^QA:/.test(thread.goal) ? "```json\n{\"verdict\":\"pass\",\"summary\":\"quality verified\",\"findings\":[],\"executedChecks\":[],\"notRunChecks\":[]}\n```" : "writer complete"; return { thread: { turns: [{ id: `turn-${threadId}`, items: [{ type: "agentMessage", text }] }] } }; }
+  async readThread({ threadId }) { const thread = this.threads.get(threadId); const text = /^Bootstrap/.test(thread.goal) ? `\`\`\`json\n${JSON.stringify(fakeBlueprint(thread.cwd))}\n\`\`\`` : /^Plan /.test(thread.goal) ? `\`\`\`json\n${JSON.stringify(fakePlan())}\n\`\`\`` : /^Security review:/.test(thread.goal) ? "```json\n{\"verdict\":\"pass\",\"summary\":\"secure\",\"findings\":[],\"executedChecks\":[],\"notRunChecks\":[]}\n```" : /^QA:/.test(thread.goal) ? "```json\n{\"verdict\":\"pass\",\"summary\":\"quality verified\",\"findings\":[],\"executedChecks\":[],\"notRunChecks\":[]}\n```" : "writer complete"; return { thread: { turns: [{ id: `turn-${threadId}`, items: [{ type: "agentMessage", text }] }] } }; }
 }
 class CorrectingPlannerClient extends DeliveryClient {
   constructor() { super(); this.plannerReads = 0; }
@@ -27,7 +28,7 @@ class CorrectingPlannerClient extends DeliveryClient {
       this.plannerReads += 1;
       const text = this.plannerReads === 1
         ? "```json\n{\"tasks\":[{\"id\":\"writer\",\"title\":\"Writer\",\"prompt\":\"Writer\",\"primaryDomain\":\"backend\",\"supportingDomains\":[],\"riskFlags\":[\"invented_flag\"],\"humanApprovalRequired\":false,\"estimatedTokens\":20,\"dependsOn\":[],\"allowedPaths\":[\"src/value.mjs\"],\"acceptanceChecks\":[\"npm test\"]}]}\n```"
-        : "```json\n{\"tasks\":[{\"id\":\"writer\",\"title\":\"Writer\",\"prompt\":\"Writer\",\"primaryDomain\":\"backend\",\"supportingDomains\":[],\"riskFlags\":[],\"humanApprovalRequired\":false,\"estimatedTokens\":20,\"dependsOn\":[],\"allowedPaths\":[\"src/value.mjs\"],\"acceptanceChecks\":[\"npm test\"]}]}\n```";
+        : `\`\`\`json\n${JSON.stringify(fakePlan())}\n\`\`\``;
       return { thread: { turns: [{ id: `turn-${threadId}`, items: [{ type: "agentMessage", text }] }] } };
     }
     return super.readThread({ threadId });
