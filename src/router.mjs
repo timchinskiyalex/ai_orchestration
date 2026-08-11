@@ -498,9 +498,12 @@ export class SwarmRouter extends EventEmitter {
     this.threadTasks.set(threadId, task.id);
     this.#lifecycle("thread started", { taskId: task.id, threadId });
     const goal = { threadId, objective: `${task.title}\n\n${task.prompt}`, status: "active" };
-    // In tracking-only mode, tokenBudget remains controller telemetry only. Sending
-    // it to App Server turns a forecast into an agent-visible execution cap.
-    if (this.#enforcesLocalBudget()) goal.tokenBudget = task.tokenBudget;
+    // Delivery workers in tracking-only mode must not receive a token cap: it
+    // turns the forecast into an agent-visible execution limit. Bootstrap and
+    // Planner are deliberately bounded planning conversations, not product
+    // workers; their soft goal budget keeps a malformed planning turn from
+    // consuming the full delivery allowance before any code is written.
+    if (this.#enforcesLocalBudget() || ["bootstrap", "planner"].includes(task.role)) goal.tokenBudget = task.tokenBudget;
     await client.setGoal(goal);
     const turnOptions = { threadId, input: [{ type: "text", text: this.#taskPrompt(task, worktree, overlayContext?.snapshot) }] };
     // The generated App Server schema explicitly allows `effort`; it does not
@@ -766,7 +769,7 @@ export class SwarmRouter extends EventEmitter {
 
   #structuredOutputContract(role) {
     if (role === "bootstrap") return `Return only one fenced JSON object with this schema:\n{"summary":"string","assumptions":["string"],"risks":["string"],"humanGates":["string"]}`;
-    if (role === "planner") return `Return only one fenced JSON object with this schema:\n{"tasks":[{"id":"safe-kebab-id","title":"string","prompt":"specific implementation instruction","primaryDomain":"backend|frontend|database|qa|security|devops","supportingDomains":["qa|security|..."],"riskFlags":["public_api_change|schema_change|..."],"humanApprovalRequired":false,"estimatedTokens":8000,"dependsOn":["other-task-id"],"allowedPaths":["path"],"acceptanceChecks":["test or check"]}]}. allowedPaths must be explicit. Auth, network, permission, sensitive-data and supply-chain flags require security. Schema/destructive work must use database and humanApprovalRequired=true. Do not create implementation tasks for ambiguity; report it to the human instead.`;
+    if (role === "planner") return `Return only one fenced JSON object with this schema:\n{"tasks":[{"id":"safe-kebab-id","title":"string","prompt":"specific implementation instruction","primaryDomain":"backend|frontend|database|qa|security|devops","supportingDomains":["qa|security|..."],"riskFlags":["public_api_change|schema_change|..."],"humanApprovalRequired":false,"estimatedTokens":8000,"dependsOn":["other-task-id"],"allowedPaths":["path"],"acceptanceChecks":["test or check"]}]}. Return the JSON as your first and only deliverable: do not use web search, do not install packages, do not run tests, and do not explore source code beyond the imported Markdown inventory. allowedPaths must be explicit. Auth, network, permission, sensitive-data and supply-chain flags require security. Schema/destructive work must use database and humanApprovalRequired=true. Do not create implementation tasks for ambiguity; report it to the human instead.`;
     if (role === "qa") return `Return only one fenced JSON QualityGateReport: {"verdict":"pass|remediation_required|blocked","summary":"string","findings":[{"id":"stable-id","severity":"low|medium|high|critical","path":"relative/path","evidence":"concrete safe evidence","requiredFix":"specific fix","verification":"specific verification"}],"executedChecks":[],"notRunChecks":[]}. Never include secrets or raw command output. A pass requires no findings.`;
     if (role === "security") return `Return only one fenced JSON SecurityGateReport: {"verdict":"pass|remediation_required|blocked","summary":"string","findings":[{"id":"stable-id","severity":"low|medium|high|critical","path":"relative/path","evidence":"concrete safe evidence","requiredFix":"specific fix","verification":"specific verification"}],"executedChecks":[],"notRunChecks":[]}. Never include secrets or raw command output. A pass requires no findings.`;
     return "Return a concise Markdown report with evidence; do not return orchestration JSON.";

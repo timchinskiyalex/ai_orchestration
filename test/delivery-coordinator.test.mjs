@@ -62,13 +62,14 @@ test("a fresh delivery cancels stranded historical tasks but preserves their rec
   } finally { router.close(); rmSync(fixture.root, { recursive: true, force: true }); }
 });
 
-test("tracking-only delivery does not send a token cap to App Server goals", async () => {
+test("tracking-only delivery keeps worker goals uncapped while bounding planning goals", async () => {
   const fixture = setup(false); fixture.config.budget.enforceLocalLimits = false;
   const client = new DeliveryClient(); fixture.config.appServerClientFactory = () => client;
   const router = new SwarmRouter(fixture.config); const coordinator = new DeliveryCoordinator(router);
   try {
     await coordinator.begin({ source: fixture.source });
-    assert.ok(client.goals.length > 0);
-    assert.equal(client.goals.some((goal) => "tokenBudget" in goal), false);
+    assert.ok(client.goals.length > 2);
+    assert.equal(client.goals.filter((goal) => /^(Bootstrap|Plan )/.test(goal.objective)).every((goal) => "tokenBudget" in goal), true);
+    assert.equal(client.goals.filter((goal) => !/^(Bootstrap|Plan )/.test(goal.objective)).some((goal) => "tokenBudget" in goal), false);
   } finally { router.close(); rmSync(fixture.root, { recursive: true, force: true }); }
 });
