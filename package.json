@@ -20,7 +20,7 @@
     "develop": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/start-delivery.ps1",
     "create-instance": "node src/index.mjs create-instance",
     "run": "node src/index.mjs run",
-    "test": "node --test",
+    "test": "node --test test/*.test.mjs",
     "e2e:live": "node scripts/e2e-live.mjs",
     "e2e:cleanup": "node scripts/e2e-cleanup.mjs",
     "test:app-server-schema": "node scripts/app-server-schema-preflight.mjs"

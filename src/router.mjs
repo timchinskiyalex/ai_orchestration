@@ -710,12 +710,14 @@ export class SwarmRouter extends EventEmitter {
       this.store.setThread(task.id, { threadId, turnId: requestedTurnId });
       this.activeTurns.set(task.id, { taskId: task.id, threadId, turnId: requestedTurnId });
       this.#lifecycle("scaffold repair turn started", { taskId: task.id, threadId, turnId: requestedTurnId, attempt: attempt + 1, missingRoots });
-      const turn = await client.waitForTurn(threadId, requestedTurnId, this.config.router.turnTimeoutMs);
+      const watched = await this.#waitForScaffoldTurn(client, task, threadId, requestedTurnId, worktree);
+      const turn = watched.turn;
       const resolvedTurnId = turn.id ?? requestedTurnId;
       this.#adoptResolvedTurnId(task.id, threadId, resolvedTurnId);
       this.activeTurns.delete(task.id);
       if (turn.status !== "completed") throw new Error(`Scaffold corrective turn did not complete: ${turn.error?.message ?? turn.status}`);
-      resultText = await this.#readAgentResult(client, threadId, resolvedTurnId);
+      resultText = watched.resultText ?? await this.#readAgentResult(client, threadId, resolvedTurnId);
+      if (watched.overlayContext) overlayContext = watched.overlayContext;
     }
     throw new Error("Scaffold completion retry loop terminated unexpectedly");
   }
@@ -725,6 +727,8 @@ export class SwarmRouter extends EventEmitter {
       .then((turn) => ({ type: "turn", turn }), (error) => ({ type: "error", error }));
     const pollMs = Math.max(250, Number(this.config.router.scaffoldCompletionPollMs ?? 2_000));
     const partialGraceMs = Math.max(pollMs, Number(this.config.router.scaffoldPartialGraceMs ?? 30_000));
+    const noProgressGraceMs = Math.max(pollMs, Number(this.config.router.scaffoldNoProgressGraceMs ?? 45_000));
+    const startedAt = Date.now();
     let partialObservedAt = null;
     let timer;
     const ready = new Promise((resolve) => {
@@ -737,6 +741,8 @@ export class SwarmRouter extends EventEmitter {
           if (components.length && missingRoots.length && missingRoots.length < components.length) {
             partialObservedAt ??= Date.now();
             if (Date.now() - partialObservedAt >= partialGraceMs) resolve({ type: "partial", overlayContext, missingRoots });
+          } else if (components.length && missingRoots.length === components.length && Date.now() - startedAt >= noProgressGraceMs) {
+            resolve({ type: "no-progress", overlayContext, missingRoots });
           } else partialObservedAt = null;
         } catch {
           // Partial scaffolds are normal while the worker is writing files.
@@ -750,13 +756,13 @@ export class SwarmRouter extends EventEmitter {
     if (outcome.type === "error") throw outcome.error;
     if (outcome.type === "turn") return { turn: outcome.turn };
     if (outcome.type === "ready") this.#lifecycle("scaffold accepted from worktree", { taskId: task.id, threadId, turnId, components: outcome.overlayContext.overlay.components.map((component) => component.root) });
-    else this.#lifecycle("scaffold partial progress interrupted", { taskId: task.id, threadId, turnId, missingRoots: outcome.missingRoots });
+    else this.#lifecycle(outcome.type === "partial" ? "scaffold partial progress interrupted" : "scaffold no-progress interrupted", { taskId: task.id, threadId, turnId, missingRoots: outcome.missingRoots });
     await client.interruptTurn({ threadId, turnId }).catch(() => {});
     return {
       turn: { id: turnId, status: "completed" },
       resultText: outcome.type === "ready"
         ? "Scaffold accepted by the controller after all declared product roots were verified in the isolated worktree."
-        : `Scaffold was stopped after verified partial progress. The controller must now create the missing declared roots: ${outcome.missingRoots.join(", ")}.`,
+        : `Scaffold was stopped because declared roots are still missing: ${outcome.missingRoots.join(", ")}. The controller must now create only those roots.`,
       overlayContext: outcome.overlayContext
     };
   }
