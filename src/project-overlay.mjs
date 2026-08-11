@@ -62,7 +62,9 @@ function productModule(component) { return { present: component.state === "scaff
 function nodeComponent(component, root, ledger) {
   const directory = join(root, component.path); const files = walk(directory); const packagePath = "package.json";
   if (!existsSync(join(directory, packagePath))) return { id: component.id, root: component.path, adapter: component.adapter, state: existsSync(directory) ? "incomplete" : "unscaffolded", evidence: [] };
-  const packageJson = JSON.parse(safeRead(join(directory, packagePath))); const manager = detectPackageManager(packageJson, files, ledger, `${component.path}/package.json`);
+  const packageJson = JSON.parse(safeRead(join(directory, packagePath))); let manager;
+  try { manager = detectPackageManager(packageJson, files, ledger, `${component.path}/package.json`); }
+  catch (error) { return { id: component.id, root: component.path, adapter: component.adapter, state: "incomplete", evidence: [{ path: `${component.path}/package.json`, reason: String(error.message) }] }; }
   const scripts = Object.entries(packageJson.scripts ?? {}).map(([name, command]) => ({ name, command, source: `${component.path}/package.json`, confidence: "declared" }));
   const verificationCommands = scripts.filter((item) => nodeVerificationScripts.has(item.name)).map((item) => ({ id: `${component.id}:package-script:${item.name}`, component: component.id, cwd: component.path, ...packageCommand(manager.name, item.name), source: item.source, confidence: "declared" }));
   evidence(ledger, `${component.path}/package.json`, "package.json", "json", { name: packageJson.name ?? null, scripts: scripts.map((item) => item.name) }, "verified");

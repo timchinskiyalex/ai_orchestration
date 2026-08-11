@@ -739,8 +739,9 @@ export class SwarmRouter extends EventEmitter {
       if (!component) throw new Error(`No allowlisted scaffold adapter is configured for '${root}'`);
       if (component.adapter === "next-node") {
         const npx = process.platform === "win32" ? "npx.cmd" : "npx";
-        await exec(npx, ["create-next-app@latest", root, "--ts", "--eslint", "--app", "--src-dir", "--use-npm", "--yes"], { cwd: worktree, timeout: 300_000, windowsHide: true });
         const packagePath = join(worktree, root, "package.json");
+        if (!existsSync(packagePath)) await exec(npx, ["create-next-app@latest", root, "--ts", "--eslint", "--app", "--src-dir", "--use-npm", "--yes"], { cwd: worktree, timeout: 300_000, windowsHide: true });
+        else await exec(process.platform === "win32" ? "npm.cmd" : "npm", ["install", "--package-lock-only", "--ignore-scripts"], { cwd: join(worktree, root), timeout: 180_000, windowsHide: true });
         const packageJson = JSON.parse(readFileSync(packagePath, "utf8"));
         packageJson.scripts ??= {};
         packageJson.scripts.test ??= "node --test";

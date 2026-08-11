@@ -25,6 +25,16 @@ test("greenfield multi-stack ignores controller package manager and scopes verif
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test("partially created Node product root is reported as incomplete instead of aborting overlay discovery", async () => {
+  const root = mkdtempSync(join(tmpdir(), "multi-stack-incomplete-"));
+  try {
+    git(root, ["init", "-b", "main"]); writeFileSync(join(root, "package.json"), JSON.stringify({ name: "controller" })); git(root, ["add", "."]); git(root, ["-c", "user.name=t", "-c", "user.email=t@e", "commit", "-m", "base"]);
+    mkdirSync(join(root, "frontend")); writeFileSync(join(root, "frontend", "package.json"), JSON.stringify({ name: "frontend", scripts: { build: "next build" } }));
+    const overlay = await generateProjectOverlay({ repository: root, baseRef: "main", project: { productRoots: roots } });
+    assert.equal(overlay.overlay.components.find((component) => component.id === "frontend").state, "incomplete");
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test("greenfield DAG requires the scaffold writer before product tasks", () => {
   assert.throws(() => validatePlan({ tasks: [task("api", "backend", ["backend/src"]) ] }, { maxTasks: 3, productRoots: roots }), /scaffold-product/);
   const plan = validatePlan({ tasks: [task("scaffold-product", "devops", ["frontend", "backend"]), task("api", "backend", ["backend/src"], ["scaffold-product"]), task("ui", "frontend", ["frontend/app"], ["scaffold-product"])] }, { maxTasks: 4, productRoots: roots });
