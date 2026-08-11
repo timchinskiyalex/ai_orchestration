@@ -307,11 +307,11 @@ export class SwarmRouter extends EventEmitter {
     }
   }
 
-  async runToIntegration({ alreadyIdle = false } = {}) {
-    const gates = this.store.listTasks().filter((task) => ["awaiting_human", "awaiting_approval"].includes(task.status));
+  async runToIntegration({ alreadyIdle = false, deliveryRunId = this.activeDeliveryRunId } = {}) {
+    const gates = this.store.listTasks().filter((task) => (!deliveryRunId || task.deliveryRunId === deliveryRunId) && ["awaiting_human", "awaiting_approval"].includes(task.status));
     if (gates.length) throw new Error(`Run-to-integration refuses to bypass human gates: ${gates.map((task) => task.id).join(", ")}`);
     if (!alreadyIdle) await this.runUntilIdle();
-    const tasks = this.store.listTasks();
+    const tasks = this.store.listTasks().filter((task) => !deliveryRunId || task.deliveryRunId === deliveryRunId);
     const unfinished = tasks.filter((task) => ENGINEERING_DOMAINS.has(task.role) && task.status !== "done");
     if (unfinished.length) throw new Error(`Run-to-integration stopped before completion: ${unfinished.map((task) => `${task.id}:${task.status}`).join(", ")}`);
     const writerIds = tasks.filter((task) => this.config.roles[task.role]?.sandbox === "workspace-write" && task.status === "done").map((task) => task.id);

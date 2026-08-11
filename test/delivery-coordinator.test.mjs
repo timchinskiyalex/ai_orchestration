@@ -50,3 +50,14 @@ test("completed autonomous delivery is restart-idempotent", async () => {
     const restarted = await coordinator.resume(fakeRemote(calls)); assert.equal(restarted.state, "completed_merged"); assert.deepEqual(calls, { push: 1, pr: 1, ci: 1, merge: 1 });
   } finally { router.close(); rmSync(fixture.root, { recursive: true, force: true }); }
 });
+
+test("a fresh delivery cancels stranded historical tasks but preserves their records", async () => {
+  const fixture = setup(true); const router = new SwarmRouter(fixture.config); const coordinator = new DeliveryCoordinator(router); const calls = { push: 0, pr: 0, ci: 0, merge: 0 };
+  try {
+    const stranded = router.enqueue({ role: "backend", title: "old stranded task", prompt: "old", estimatedTokens: 20 });
+    const final = await coordinator.begin({ source: fixture.source, ...fakeRemote(calls) });
+    assert.equal(router.store.getTask(stranded.id).status, "cancelled");
+    assert.match(router.store.getTask(stranded.id).error, /superseded_by_fresh_delivery/);
+    assert.equal(final.state, "completed_merged");
+  } finally { router.close(); rmSync(fixture.root, { recursive: true, force: true }); }
+});

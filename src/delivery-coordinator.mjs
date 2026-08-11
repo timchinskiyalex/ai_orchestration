@@ -21,6 +21,13 @@ export class DeliveryCoordinator {
     this.router.recoverStaleDeliveries();
     const current = this.router.store.currentDeliveryRun();
     if (current && ["running", "awaiting_human", "awaiting_human_remote_handoff"].includes(current.state)) throw new Error(`A delivery run is already active: ${current.id}. Use npm run deliver -- --resume.`);
+    // A terminal controller run can still have never-claimed DAG rows. They are
+    // historical work, not a live delivery: retain their evidence but never let
+    // them block a deliberately fresh delivery.
+    const cancelled = this.router.store.cancelUnfinishedTasks({
+      reason: `superseded_by_fresh_delivery${current ? `:${current.id}` : ""}`
+    });
+    if (cancelled.length) this.router.store.recordEvent(null, "delivery/fresh-start-cleanup", { previousDeliveryRunId: current?.id ?? null, cancelledTaskIds: cancelled.map((task) => task.id) });
     const intake = ingestDocumentation({ source, repository: this.router.config.repository, destinationRelative: this.router.config.project.documentationDir });
     const overlay = await this.router.ensureProjectOverlay();
     const bootstrap = this.router.startProject();
@@ -63,7 +70,7 @@ export class DeliveryCoordinator {
     if (execution?.blockedQuota) return this.router.store.updateDeliveryRun(run.id, { state: "blocked_quota", publish: { reason: execution.quota?.reason ?? "App Server quota policy blocked new turns", quota: execution.quota } });
     if (execution?.interrupted) return this.router.store.deliveryRun(run.id);
     if (execution?.blockedBudget) return this.router.store.deliveryRun(run.id)?.state === "blocked_budget" ? this.router.store.deliveryRun(run.id) : this.router.store.updateDeliveryRun(run.id, { state: "blocked_budget", publish: { reason: "Budget watchdog interrupted an active turn" } });
-    const tasks = this.router.list();
+    const tasks = this.router.list().filter((task) => task.deliveryRunId === run.id);
     if (!this.router.isAutonomous()) {
       const gate = manualGateFor(tasks);
       if (gate) return this.#awaiting(run, gate);
@@ -76,7 +83,7 @@ export class DeliveryCoordinator {
     const engineering = tasks.filter((task) => ENGINEERING_DOMAINS.has(task.role));
     if (!engineering.length || engineering.some((task) => task.status !== "done")) return this.router.store.updateDeliveryRun(run.id, { state: "failed", publish: { reason: "Delivery stopped without a completed engineering DAG", recovery: { action: "Inspect the persisted scheduler state and task dependencies." } } });
     let integration;
-    try { integration = await this.router.runToIntegration({ alreadyIdle: true }); }
+    try { integration = await this.router.runToIntegration({ alreadyIdle: true, deliveryRunId: run.id }); }
     catch (error) { return this.router.store.updateDeliveryRun(run.id, { state: "conflict_blocked", publish: { reason: String(error.message).slice(0, 500), recovery: { action: "Inspect the retained candidate/worktree and verification results." } } }); }
     if (integration.integration.manifest.status !== "candidate_ready") return this.router.store.updateDeliveryRun(run.id, { state: "conflict_blocked", integrationPath: integration.integration.path, publish: { reason: integration.integration.manifest.blockedReason, recovery: integration.integration.manifest.recovery } });
     const publish = await this.router.publishCandidate(integration.integration, context);

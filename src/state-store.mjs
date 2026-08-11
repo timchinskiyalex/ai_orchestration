@@ -237,6 +237,22 @@ export class StateStore {
     return this.db.prepare("SELECT * FROM tasks ORDER BY created_at ASC").all().map((row) => this.#mapTask(row));
   }
 
+  cancelUnfinishedTasks({ reason, deliveryRunId = null } = {}) {
+    const cancellable = ["queued", "preparing", "running", "awaiting_approval", "awaiting_review", "awaiting_human", "blocked_budget"];
+    const tasks = this.db.prepare(`SELECT * FROM tasks WHERE status IN (${cancellable.map(() => "?").join(", ")})${deliveryRunId ? " AND delivery_run_id = ?" : ""} ORDER BY created_at`).all(...cancellable, ...(deliveryRunId ? [deliveryRunId] : []));
+    if (!tasks.length) return [];
+    const timestamp = now();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      for (const task of tasks) {
+        this.db.prepare("UPDATE tasks SET status = 'cancelled', error = ?, updated_at = ? WHERE id = ?").run(reason ?? "cancelled", timestamp, task.id);
+        this.#insertEvent(task.id, "task/status", { from: task.status, to: "cancelled", error: reason ?? "cancelled", recovery: "historical task retained; it will not be resumed" });
+      }
+      this.db.exec("COMMIT");
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    return tasks.map((task) => this.getTask(task.id));
+  }
+
   childCount(parentTaskId) {
     return this.db.prepare("SELECT COUNT(*) AS count FROM tasks WHERE parent_task_id = ?").get(parentTaskId).count;
   }
