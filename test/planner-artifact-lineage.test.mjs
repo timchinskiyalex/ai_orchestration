@@ -24,6 +24,7 @@ class LineageClient extends EventEmitter {
   async waitForTurn(threadId, turnId) {
     const thread = this.threads.get(threadId);
     if (/^Write A\n\nWrite A$/.test(thread.goal)) { this.writerBases.set("writer-a", git(thread.cwd, ["rev-parse", "HEAD"])); writeFileSync(join(thread.cwd, "src", "a.mjs"), "export const a = true;\n"); }
+    if (/^Write C\n\nWrite C$/.test(thread.goal)) { this.writerBases.set("writer-c", git(thread.cwd, ["rev-parse", "HEAD"])); writeFileSync(join(thread.cwd, "src", "c.mjs"), "export const c = true;\n"); }
     if (/^Write B\n\nWrite B$/.test(thread.goal)) { this.writerBases.set("writer-b", git(thread.cwd, ["rev-parse", "HEAD"])); writeFileSync(join(thread.cwd, "src", "b.mjs"), "export const b = true;\n"); }
     return { id: turnId, status: "completed" };
   }
@@ -40,7 +41,7 @@ class LineageClient extends EventEmitter {
   }
 }
 
-const writer = (id, title, dependsOn = []) => ({ id, title, prompt: title, primaryDomain: "backend", supportingDomains: [], riskFlags: [], humanApprovalRequired: false, estimatedTokens: 20, dependsOn, allowedPaths: [`src/${id === "writer-a" ? "a" : "b"}.mjs`], acceptanceChecks: [], requirementIds: ["fix-value"] });
+const writer = (id, title, dependsOn = []) => ({ id, title, prompt: title, primaryDomain: "backend", supportingDomains: [], riskFlags: [], humanApprovalRequired: false, estimatedTokens: 20, dependsOn, allowedPaths: [`src/${id === "writer-a" ? "a" : id === "writer-c" ? "c" : "b"}.mjs`], acceptanceChecks: [], requirementIds: ["fix-value"] });
 function config(root, client) {
   const roles = Object.fromEntries(["bootstrap", "planner", "backend", "frontend", "database", "qa", "security", "devops"].map((role) => [role, { sandbox: role === "backend" ? "workspace-write" : "read-only", approvalPolicy: "never", tokenBudget: 100, usesWorktree: role === "backend" }]));
   return { repository: root, runtimeDir: join(root, "runtime"), baseRef: "main", model: "fake", project: { name: "lineage", documentationDir: "docs/orchestration-input", generatedDir: "docs/orchestration-generated", productRoots: [] }, router: { maxConcurrentTasks: 1, maxChildrenPerTask: 10, maxDelegationDepth: 5, maxPlanTasks: 5, defaultParentBudget: 1000, turnTimeoutMs: 1000, approvalMode: "deny" }, autonomy: { mode: "autonomous", autoApproveWorkflowGates: true, autoRemediate: true }, budget: { weeklyTokenLimit: 10000, weeklyWindowDays: 7 }, quota: { throttleAtUsedPercent: 90, throttleWhenUnavailable: false }, roles, appServerClientFactory: () => client };
@@ -60,10 +61,11 @@ test("planner writer edge propagates artifact worktree lineage and integration o
   } finally { router?.close(); rmSync(root, { recursive: true, force: true }); }
 });
 
-test("planner rejects repairable writer artifact fan-in", async () => {
+test("controller-owned barrier turns writer fan-in into a verified checkpoint baseline", async () => {
   const plan = { blueprintId: "pb-test", tasks: [writer("writer-a", "Write A"), writer("writer-c", "Write C"), writer("writer-b", "Write B", ["writer-a", "writer-c"])] }; const client = new LineageClient(plan); const root = setup(client); let router;
   try {
     router = new SwarmRouter(config(root, client)); await router.ensureProjectOverlay(); router.startProject(); await router.runUntilIdle();
-    const planner = router.list().find((task) => task.role === "planner"); assert.equal(planner.status, "failed"); assert.match(planner.error, /multiple writer artifact predecessors/); assert.equal(router.list().filter((task) => task.title === "Write A" || task.title === "Write B" || task.title === "Write C").length, 0);
+    const b = router.list().find((task) => task.title === "Write B"); const barrier = router.store.integrationBarrier(b.integrationBarrierId); const checkpoint = router.store.integrationCheckpoint(barrier.checkpointId);
+    assert.equal(barrier.status, "passed"); assert.equal(checkpoint.status, "passed"); assert.equal(client.writerBases.get("writer-b"), checkpoint.outputSha); assert.equal(b.artifactBaseSha, checkpoint.outputSha); assert.deepEqual(router.store.workerArtifact(b.id).dependencies, []);
   } finally { router?.close(); rmSync(root, { recursive: true, force: true }); }
 });

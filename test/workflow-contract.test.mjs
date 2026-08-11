@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { extractOrchestrationJson, validateBootstrap, validatePlan } from "../src/workflow-contract.mjs";
+import { extractOrchestrationJson, validateBootstrap, validatePlan, validateWorkerArtifactContract } from "../src/workflow-contract.mjs";
 import { documentSetDigest } from "../src/product-blueprint.mjs";
 
 const docs = [{ documentId: "doc-input", path: "input.md", sha256: "a".repeat(64) }];
@@ -31,4 +31,15 @@ test("plan contract rejects dependency cycles", () => {
     { id: "one", title: "One", prompt: "Do one", primaryDomain: "backend", supportingDomains: [], riskFlags: [], humanApprovalRequired: false, estimatedTokens: 1000, dependsOn: ["two"], allowedPaths: ["src"], acceptanceChecks: [], requirementIds: ["req-one"] },
     { id: "two", title: "Two", prompt: "Do two", primaryDomain: "backend", supportingDomains: [], riskFlags: [], humanApprovalRequired: false, estimatedTokens: 1000, dependsOn: ["one"], allowedPaths: ["src"], acceptanceChecks: [], requirementIds: ["req-one"] }
   ] }, { maxTasks: 3, blueprint }), /cycle/);
+});
+
+test("PlanBatch requires a verified base before strict materialization", () => {
+  assert.throws(() => validatePlan({ blueprintId: "pb-test", tasks: [] }, { maxTasks: 1, blueprint, requirePlanBatch: true }), /PlanBatch is missing/);
+  const batch = validatePlan({ schemaVersion: 1, kind: "PlanBatch", id: "batch-1", deliveryRunId: "run-1", blueprintId: "pb-test", wave: 1, basedOnCheckpointSha: "a".repeat(40), createdAt: "2026-01-01T00:00:00.000Z", tasks: [{ id: "writer", title: "Writer", prompt: "Write", primaryDomain: "backend", supportingDomains: [], riskFlags: [], humanApprovalRequired: false, estimatedTokens: 1, dependsOn: [], allowedPaths: ["src"], acceptanceChecks: [], requirementIds: ["req-one"] }] }, { maxTasks: 1, blueprint, requirePlanBatch: true });
+  assert.equal(batch.kind, "PlanBatch");
+});
+
+test("WorkerArtifact rejects a multi-parent identity", () => {
+  const artifact = { schemaVersion: 1, kind: "WorkerArtifact", taskId: "writer", baseSha: "a".repeat(40), headSha: "b".repeat(40), dependencies: ["a", "b"] };
+  assert.throws(() => validateWorkerArtifactContract(artifact), /zero or one parent/);
 });
