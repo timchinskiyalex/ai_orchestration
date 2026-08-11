@@ -37,7 +37,13 @@ export class StateStore {
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         error TEXT,
-        result_path TEXT
+        result_path TEXT,
+        risk_flags_json TEXT NOT NULL DEFAULT '[]',
+        supporting_domains_json TEXT NOT NULL DEFAULT '[]',
+        artifact_base_sha TEXT,
+        artifact_dependencies_json TEXT NOT NULL DEFAULT '[]',
+        remediation_round INTEGER NOT NULL DEFAULT 0,
+        source_writer_task_id TEXT
       );
       CREATE TABLE IF NOT EXISTS events (
         sequence INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -81,6 +87,22 @@ export class StateStore {
         forecast_json TEXT NOT NULL,
         created_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS quality_reports (
+        qa_task_id TEXT PRIMARY KEY REFERENCES tasks(id),
+        writer_task_id TEXT NOT NULL REFERENCES tasks(id),
+        schema_version INTEGER NOT NULL,
+        report_path TEXT NOT NULL,
+        report_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS external_actions (
+        idempotency_key TEXT PRIMARY KEY,
+        kind TEXT NOT NULL,
+        status TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
       CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status, created_at);
       CREATE INDEX IF NOT EXISTS idx_tasks_thread ON tasks(thread_id);
       CREATE INDEX IF NOT EXISTS idx_events_task ON events(task_id, sequence);
@@ -90,6 +112,12 @@ export class StateStore {
     this.#addColumnIfMissing("tasks", "estimated_tokens", "INTEGER NOT NULL DEFAULT 0");
     this.#addColumnIfMissing("tasks", "human_approval_required", "INTEGER NOT NULL DEFAULT 0");
     this.#addColumnIfMissing("tasks", "human_approved", "INTEGER NOT NULL DEFAULT 0");
+    this.#addColumnIfMissing("tasks", "risk_flags_json", "TEXT NOT NULL DEFAULT '[]'");
+    this.#addColumnIfMissing("tasks", "supporting_domains_json", "TEXT NOT NULL DEFAULT '[]'");
+    this.#addColumnIfMissing("tasks", "artifact_base_sha", "TEXT");
+    this.#addColumnIfMissing("tasks", "artifact_dependencies_json", "TEXT NOT NULL DEFAULT '[]'");
+    this.#addColumnIfMissing("tasks", "remediation_round", "INTEGER NOT NULL DEFAULT 0");
+    this.#addColumnIfMissing("tasks", "source_writer_task_id", "TEXT");
   }
 
   close() { this.db.close(); }
@@ -100,11 +128,13 @@ export class StateStore {
     const initialStatus = task.humanApprovalRequired ? "awaiting_human" : "queued";
     this.#mutate(task.id, `task/${initialStatus}`, { role: task.role, title: task.title, humanApprovalRequired: Boolean(task.humanApprovalRequired) }, () => this.db.prepare(`INSERT INTO tasks (
       id, parent_task_id, role, title, prompt, status, allowed_paths_json,
-      acceptance_checks_json, dependencies_json, human_approval_required, token_budget, estimated_tokens, max_attempts, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      acceptance_checks_json, dependencies_json, human_approval_required, token_budget, estimated_tokens, max_attempts, created_at, updated_at,
+      risk_flags_json, supporting_domains_json, artifact_base_sha, artifact_dependencies_json, remediation_round, source_writer_task_id
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
       task.id, task.parentTaskId ?? null, task.role, task.title, task.prompt,
       initialStatus, json(task.allowedPaths), json(task.acceptanceChecks), json(task.dependencies), task.humanApprovalRequired ? 1 : 0, task.tokenBudget, task.estimatedTokens ?? task.tokenBudget,
-      task.maxAttempts, timestamp, timestamp
+      task.maxAttempts, timestamp, timestamp, json(task.riskFlags), json(task.supportingDomains), task.artifactBaseSha ?? null,
+      json(task.artifactDependencies), task.remediationRound ?? 0, task.sourceWriterTaskId ?? null
     ));
     return this.getTask(task.id);
   }
@@ -126,11 +156,13 @@ export class StateStore {
         const initialStatus = task.humanApprovalRequired ? "awaiting_human" : "queued";
         this.db.prepare(`INSERT INTO tasks (
           id, parent_task_id, role, title, prompt, status, allowed_paths_json,
-          acceptance_checks_json, dependencies_json, human_approval_required, token_budget, estimated_tokens, max_attempts, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)` ).run(
+          acceptance_checks_json, dependencies_json, human_approval_required, token_budget, estimated_tokens, max_attempts, created_at, updated_at,
+          risk_flags_json, supporting_domains_json, artifact_base_sha, artifact_dependencies_json, remediation_round, source_writer_task_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)` ).run(
           task.id, task.parentTaskId ?? null, task.role, task.title, task.prompt,
           initialStatus, json(task.allowedPaths), json(task.acceptanceChecks), json(task.dependencies), task.humanApprovalRequired ? 1 : 0,
-          task.tokenBudget, task.estimatedTokens ?? task.tokenBudget, task.maxAttempts ?? 1, timestamp, timestamp
+          task.tokenBudget, task.estimatedTokens ?? task.tokenBudget, task.maxAttempts ?? 1, timestamp, timestamp,
+          json(task.riskFlags), json(task.supportingDomains), task.artifactBaseSha ?? null, json(task.artifactDependencies), task.remediationRound ?? 0, task.sourceWriterTaskId ?? null
         );
         this.#insertEvent(task.id, `task/${initialStatus}`, { role: task.role, title: task.title, humanApprovalRequired: Boolean(task.humanApprovalRequired) });
       }
@@ -224,7 +256,19 @@ export class StateStore {
   }
 
   recordEvent(taskId, type, payload) {
-    this.#insertEvent(taskId, type, payload);
+    this.db.exec("BEGIN IMMEDIATE");
+    try { this.#insertEvent(taskId, type, payload); this.db.exec("COMMIT"); }
+    catch (error) { this.db.exec("ROLLBACK"); throw error; }
+  }
+
+  events({ after = 0, limit = 500 } = {}) {
+    return this.db.prepare("SELECT sequence, task_id, type, payload_json, created_at FROM events WHERE sequence > ? ORDER BY sequence ASC LIMIT ?").all(after, limit)
+      .map((row) => ({ sequence: row.sequence, taskId: row.task_id, type: row.type, payload: parse(row.payload_json, {}), createdAt: row.created_at }));
+  }
+
+  recentEvents(limit = 20) {
+    return this.db.prepare("SELECT sequence, task_id, type, payload_json, created_at FROM events ORDER BY sequence DESC LIMIT ?").all(limit)
+      .reverse().map((row) => ({ sequence: row.sequence, taskId: row.task_id, type: row.type, payload: parse(row.payload_json, {}), createdAt: row.created_at }));
   }
 
   recordApproval({ requestId, taskId, method, payload, decision = null }) {
@@ -267,6 +311,44 @@ export class StateStore {
     return row ? { path: row.artifact_path, artifact: JSON.parse(row.artifact_json) } : null;
   }
 
+  recordQualityReport({ qaTaskId, writerTaskId, reportPath, report }) {
+    this.#mutate(qaTaskId, "quality/report", { writerTaskId, reportPath, verdict: report.verdict }, () => this.db.prepare(`INSERT OR REPLACE INTO quality_reports(qa_task_id, writer_task_id, schema_version, report_path, report_json, created_at)
+      VALUES (?, ?, ?, ?, ?, ?)` ).run(qaTaskId, writerTaskId, report.schemaVersion, reportPath, JSON.stringify(report), now()));
+  }
+
+  qualityReport(qaTaskId) {
+    const row = this.db.prepare("SELECT report_path, report_json FROM quality_reports WHERE qa_task_id = ?").get(qaTaskId);
+    return row ? { path: row.report_path, report: JSON.parse(row.report_json) } : null;
+  }
+
+  recordExternalAction({ idempotencyKey, kind, status, payload = {} }) {
+    const existing = this.db.prepare("SELECT payload_json, status FROM external_actions WHERE idempotency_key = ?").get(idempotencyKey);
+    if (existing) return { duplicate: true, status: existing.status, payload: JSON.parse(existing.payload_json) };
+    const timestamp = now();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.prepare("INSERT INTO external_actions(idempotency_key, kind, status, payload_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)").run(idempotencyKey, kind, status, JSON.stringify(payload), timestamp, timestamp);
+      this.#insertEvent(null, "external/action", { kind, status, idempotencyKey });
+      this.db.exec("COMMIT");
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    return { duplicate: false, status, payload };
+  }
+
+  externalAction(idempotencyKey) {
+    const row = this.db.prepare("SELECT kind, status, payload_json, created_at, updated_at FROM external_actions WHERE idempotency_key = ?").get(idempotencyKey);
+    return row ? { kind: row.kind, status: row.status, payload: JSON.parse(row.payload_json), createdAt: row.created_at, updatedAt: row.updated_at } : null;
+  }
+
+  updateExternalAction(idempotencyKey, { status, payload }) {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.prepare("UPDATE external_actions SET status = ?, payload_json = ?, updated_at = ? WHERE idempotency_key = ?").run(status, JSON.stringify(payload ?? {}), now(), idempotencyKey);
+      this.#insertEvent(null, "external/action", { idempotencyKey, status });
+      this.db.exec("COMMIT");
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    return this.externalAction(idempotencyKey);
+  }
+
   recordIntegrationManifest(manifestPath, manifest) {
     this.db.exec("BEGIN IMMEDIATE");
     try {
@@ -295,7 +377,10 @@ export class StateStore {
       tokenBudget: row.token_budget, tokenUsed: row.token_used, attempt: row.attempt,
       estimatedTokens: row.estimated_tokens,
       maxAttempts: row.max_attempts, createdAt: row.created_at, updatedAt: row.updated_at,
-      error: row.error, resultPath: row.result_path
+      error: row.error, resultPath: row.result_path,
+      riskFlags: parse(row.risk_flags_json, []), supportingDomains: parse(row.supporting_domains_json, []),
+      artifactBaseSha: row.artifact_base_sha, artifactDependencies: parse(row.artifact_dependencies_json, []),
+      remediationRound: row.remediation_round, sourceWriterTaskId: row.source_writer_task_id
     };
   }
 

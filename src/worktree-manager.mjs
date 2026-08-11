@@ -52,12 +52,13 @@ export class WorktreeManager {
     if (unsafePaths.length) throw new Error(`Target repository has uncommitted code changes; refuse to create swarm worktrees: ${unsafePaths.join(", ")}`);
   }
 
-  async create(taskId) {
+  async create(taskId, { baseSha = this.baseRef } = {}) {
     const name = safePart(taskId);
     const worktree = resolve(this.root, name);
     const branch = `swarm/${name}`;
     if (existsSync(worktree)) throw new Error(`Worktree already exists: ${worktree}`);
-    await exec("git", ["-C", this.repository, "worktree", "add", "-b", branch, worktree, this.baseRef]);
+    if (typeof baseSha !== "string" || !/^[A-Za-z0-9._/-]+$/.test(baseSha)) throw new Error("Worktree base must be a Git ref or SHA");
+    await exec("git", ["-C", this.repository, "worktree", "add", "-b", branch, worktree, baseSha]);
     return { worktree, branch };
   }
 

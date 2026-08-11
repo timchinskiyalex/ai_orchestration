@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, relative } from "node:path";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
@@ -13,6 +13,12 @@ import { BudgetAccountAdapter } from "./budget-account-adapter.mjs";
 import { generateProjectOverlay, loadProjectOverlay, projectOverlayExecutionSnapshot } from "./project-overlay.mjs";
 import { WorktreeFinalizer } from "./worktree-finalizer.mjs";
 import { Integrator } from "./integrator.mjs";
+import { remediationScope, requiresHumanQualityGate, validateQualityGateReport } from "./quality-gate.mjs";
+import { RemoteCiAdapter, RemoteGitAdapter } from "./remote-adapters.mjs";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+
+const exec = promisify(execFile);
 
 export function formatTaskPrompt({ task, worktree, project, overlaySnapshot = null, documentationAvailable = true }) {
   const lines = [
@@ -53,6 +59,7 @@ export class SwarmRouter extends EventEmitter {
     this.finalizer = new WorktreeFinalizer({ repository: config.repository, generatedDir: config.project.generatedDir });
     this.lifecycleTrace = [];
     this.lastAppServerDiagnostics = null;
+    this.lifecyclePath = join(config.runtimeDir, "lifecycle.jsonl");
   }
 
   init() {
@@ -89,7 +96,7 @@ export class SwarmRouter extends EventEmitter {
     return { task, threadRead, ...this.appServerDiagnostics() };
   }
 
-  enqueue({ role, title, prompt, parentTaskId = null, allowedPaths = [], acceptanceChecks = [], dependencies = [], estimatedTokens = null, humanApprovalRequired = false }) {
+  enqueue({ role, title, prompt, parentTaskId = null, allowedPaths = [], acceptanceChecks = [], dependencies = [], estimatedTokens = null, humanApprovalRequired = false, riskFlags = [], supportingDomains = [], artifactBaseSha = null, artifactDependencies = [], remediationRound = 0, sourceWriterTaskId = null }) {
     assertRole(role);
     if (!title?.trim() || !prompt?.trim()) throw new Error("title and prompt are required");
     const roleConfig = this.config.roles[role];
@@ -99,11 +106,31 @@ export class SwarmRouter extends EventEmitter {
     this.#validateDependencies(dependencies);
     return this.store.createTask({
       id: randomUUID(), parentTaskId, role, title: title.trim(), prompt: prompt.trim(),
-      allowedPaths, acceptanceChecks, dependencies, humanApprovalRequired, estimatedTokens: estimate, tokenBudget: roleConfig.tokenBudget, maxAttempts: 1
+      allowedPaths, acceptanceChecks, dependencies, humanApprovalRequired, estimatedTokens: estimate, tokenBudget: roleConfig.tokenBudget, maxAttempts: 1,
+      riskFlags, supportingDomains, artifactBaseSha, artifactDependencies, remediationRound, sourceWriterTaskId
     });
   }
 
   list() { return this.store.listTasks(); }
+
+  statusSnapshot() {
+    const readiness = this.executionReadiness();
+    const tasks = this.list();
+    const reports = tasks.filter((task) => task.role === "qa").map((task) => ({ taskId: task.id, ...this.store.qualityReport(task.id) })).filter((item) => item.report);
+    return {
+      schemaVersion: 1,
+      generatedAt: new Date().toISOString(),
+      tasks: tasks.map((task) => ({ id: task.id, title: task.title, role: task.role, status: task.status, dependencies: task.dependencies, blocker: task.error ?? null, tokenUsed: task.tokenUsed, estimatedTokens: task.estimatedTokens, threadId: task.threadId, turnId: task.turnId, worktree: task.worktree, remediationRound: task.remediationRound })),
+      activeTurns: tasks.filter((task) => task.status === "running").map((task) => ({ taskId: task.id, threadId: task.threadId, turnId: task.turnId })),
+      realConcurrency: tasks.filter((task) => task.status === "running").length,
+      localBudget: readiness.localBudget,
+      localForecast: readiness.localForecast,
+      appServerQuotaWindows: readiness.accountQuota.quotaWindows ?? [],
+      quotaThrottle: readiness.quotaThrottle,
+      qualityReports: reports.map(({ taskId, path, report }) => ({ taskId, path, verdict: report.verdict, findings: report.findings.length })),
+      lifecycle: this.store.recentEvents(20)
+    };
+  }
 
   budgetSummary() {
     const limit = this.config.budget.weeklyTokenLimit;
@@ -167,6 +194,30 @@ export class SwarmRouter extends EventEmitter {
     return result;
   }
 
+  async publishCandidate(integration, { confirmRemotePush = false, remoteGitAdapter = null, remoteCiAdapter = null } = {}) {
+    const manifest = integration?.manifest;
+    if (!manifest || manifest.status !== "awaiting_human_merge") return { terminalState: "conflict_blocked", status: "conflict_blocked", reason: manifest?.blockedReason ?? "No verified candidate integration manifest" };
+    const remote = this.config.remote ?? {};
+    if (!confirmRemotePush || !remote.enabled) return { terminalState: "awaiting_human", status: "awaiting_human_remote_handoff", reason: "Remote push is disabled or requires explicit --confirm-remote-push", candidate: { branch: manifest.branch, sha: manifest.candidateSha } };
+    const idempotencyKey = `push:${remote.remoteName}:${manifest.branch}:${manifest.candidateSha}`;
+    let action = this.store.externalAction(idempotencyKey);
+    if (!action) {
+      this.store.recordExternalAction({ idempotencyKey, kind: "remote-push", status: "started", payload: { branch: manifest.branch, sha: manifest.candidateSha } });
+      const adapter = remoteGitAdapter ?? new RemoteGitAdapter({ repository: this.config.repository, remoteName: remote.remoteName, allowedRemotes: remote.allowedRemotes, branchPrefix: remote.candidateBranchPrefix });
+      try {
+        const pushed = await adapter.pushCandidate({ branch: manifest.branch, sha: manifest.candidateSha, confirmRemotePush, idempotencyKey });
+        action = this.store.updateExternalAction(idempotencyKey, { status: "passed", payload: pushed });
+      } catch (error) {
+        this.store.updateExternalAction(idempotencyKey, { status: "failed", payload: { reason: String(error.message).slice(0, 500) } });
+        return { terminalState: "awaiting_human", status: "awaiting_human_remote_handoff", reason: "Remote push failed; inspect recorded recovery", candidate: { branch: manifest.branch, sha: manifest.candidateSha } };
+      }
+    }
+    if (action.status !== "passed") return { terminalState: "awaiting_human", status: "awaiting_human_remote_handoff", reason: "Remote push has incomplete recovery state" };
+    const ci = await (remoteCiAdapter ?? new RemoteCiAdapter()).verify({ branch: manifest.branch, sha: manifest.candidateSha });
+    if (remote.requireCi && ci.status !== "passed") return { terminalState: "awaiting_human", status: "awaiting_human_remote_handoff", reason: ci.reason ?? "Configured remote CI is not passed", remotePush: action.payload, remoteCi: ci };
+    return { terminalState: "completed_candidate_ready", status: "completed_candidate_ready", candidate: { branch: manifest.branch, sha: manifest.candidateSha }, remotePush: action.payload, remoteCi: ci, humanMergeGate: manifest.humanMergeGate };
+  }
+
   async runToIntegration() {
     const gates = this.store.listTasks().filter((task) => ["awaiting_human", "awaiting_approval"].includes(task.status));
     if (gates.length) throw new Error(`Run-to-integration refuses to bypass human gates: ${gates.map((task) => task.id).join(", ")}`);
@@ -183,6 +234,8 @@ export class SwarmRouter extends EventEmitter {
   startProject() {
     const inventory = join(this.config.repository, this.config.project.documentationDir, "inventory.json");
     if (!existsSync(inventory)) throw new Error(`Project documentation has not been imported: ${inventory}`);
+    const existingBootstrap = this.store.listTasks().find((task) => task.role === "bootstrap" && !task.parentTaskId);
+    if (existingBootstrap) return existingBootstrap;
     if (this.store.listTasks().length) throw new Error("This instance already has orchestration tasks; create a fresh instance for another project run");
     return this.enqueue({
       role: "bootstrap",
@@ -306,7 +359,13 @@ export class SwarmRouter extends EventEmitter {
 
     let worktree = task.worktree;
     let branch = task.branch;
-    if (roleConfig.usesWorktree) {
+    if (task.artifactBaseSha && roleConfig.sandbox === "workspace-write") {
+      ({ worktree, branch } = await this.worktrees.create(task.id, { baseSha: task.artifactBaseSha }));
+    } else if (task.sourceWriterTaskId) {
+      const writer = this.store.getTask(task.sourceWriterTaskId);
+      if (!writer?.worktree || !writer?.branch) throw new Error(`Review task ${task.id} has no finalized writer worktree`);
+      ({ worktree, branch } = writer);
+    } else if (roleConfig.usesWorktree) {
       const inherited = this.#inheritedWorktree(task);
       if (inherited) ({ worktree, branch } = inherited);
       else ({ worktree, branch } = await this.worktrees.create(task.id));
@@ -341,10 +400,26 @@ export class SwarmRouter extends EventEmitter {
     if (current.status === "awaiting_approval") return;
     if (turn.status === "completed") {
       const resultText = await this.#readAgentResult(client, threadId, resolvedTurnId);
-      const resultPath = this.#saveAgentResult(task, resultText);
-      this.store.setResultPath(task.id, resultPath);
+      let resultPath;
       if (task.role === "bootstrap") validateBootstrap(extractOrchestrationJson(resultText));
       if (task.role === "planner") this.#materializePlan(task, extractOrchestrationJson(resultText));
+      if (task.role === "qa") {
+        const report = validateQualityGateReport(extractOrchestrationJson(resultText));
+        const checks = await this.#runDeclaredVerification(worktree, overlayContext.overlay);
+        report.executedChecks = [...report.executedChecks, ...checks.passed];
+        report.notRunChecks = [...report.notRunChecks, ...checks.notRun];
+        if (checks.failed.length) {
+          report.verdict = "blocked";
+          report.summary = "Controller verification failed; human review is required.";
+        }
+        resultPath = this.#saveQualityReport(task, report);
+        this.store.setResultPath(task.id, resultPath);
+        this.store.recordQualityReport({ qaTaskId: task.id, writerTaskId: task.sourceWriterTaskId, reportPath: resultPath, report });
+        await this.#handleQualityGate(task, report);
+        return;
+      }
+      resultPath = this.#saveAgentResult(task, resultText);
+      this.store.setResultPath(task.id, resultPath);
       if (roleConfig.sandbox === "workspace-write") {
         const finalized = await this.finalizer.finalize({ task, worktree, branch, overlay: overlayContext.overlay, overlayPath: overlayContext.path });
         this.store.recordWorkerArtifact(task.id, finalized.path, finalized.artifact);
@@ -374,9 +449,84 @@ export class SwarmRouter extends EventEmitter {
     }
   }
 
+  async #runDeclaredVerification(worktree, overlay) {
+    const passed = []; const failed = []; const notRun = [];
+    for (const command of overlay.verificationCommands ?? []) {
+      try {
+        await exec(command.executable, command.args, { cwd: worktree, timeout: command.timeoutMs ?? 120_000, windowsHide: true });
+        passed.push({ id: command.id, source: "controller", status: "passed" });
+      } catch (error) {
+        failed.push({ id: command.id, source: "controller", status: "failed", error: String(error.message).slice(0, 500) });
+      }
+    }
+    if (!overlay.verificationCommands?.length) notRun.push({ id: "declared-verification", reason: "ProjectOverlay declared no verification command" });
+    return { passed, failed, notRun };
+  }
+
+  #saveQualityReport(task, report) {
+    const root = join(this.config.repository, this.config.project.generatedDir, "quality-reports");
+    mkdirSync(root, { recursive: true });
+    const path = join(root, `${task.id}.v${report.schemaVersion}.json`);
+    writeFileSync(path, `${JSON.stringify(report, null, 2)}\n`, "utf8");
+    return relative(this.config.repository, path).split("\\").join("/");
+  }
+
+  async #handleQualityGate(task, report) {
+    const writer = this.store.getTask(task.sourceWriterTaskId);
+    if (!writer) throw new Error(`Quality task ${task.id} has no source writer`);
+    const maxRounds = this.config.delivery?.maxRemediationRounds ?? 2;
+    const nextRound = (writer.remediationRound ?? 0) + 1;
+    if (report.verdict === "pass") {
+      this.store.transition(task.id, "done");
+      this.#lifecycle("quality gate passed", { taskId: task.id, writerTaskId: writer.id });
+      return;
+    }
+    if (requiresHumanQualityGate(report, report.verdict === "remediation_required" && nextRound > maxRounds)) {
+      this.store.transition(task.id, "awaiting_human", { error: report.verdict === "blocked" ? "Quality gate blocked" : "Quality findings require human escalation" });
+      this.#lifecycle("quality gate awaiting human", { taskId: task.id, writerTaskId: writer.id, verdict: report.verdict });
+      return;
+    }
+    const predecessor = this.store.workerArtifactRecord(writer.id);
+    if (!predecessor?.artifact) throw new Error(`Quality remediation requires finalized artifact for ${writer.id}`);
+    const allowedPaths = remediationScope(report, writer);
+    const remediation = this.enqueue({
+      role: writer.role,
+      parentTaskId: task.id,
+      title: `Remediate ${writer.title} (round ${nextRound})`,
+      prompt: `Apply only these validated QualityGate findings. Do not expand scope or risk: ${JSON.stringify(report.findings.map((finding) => ({ id: finding.id, path: finding.path, requiredFix: finding.requiredFix, verification: finding.verification })))}.`,
+      allowedPaths,
+      acceptanceChecks: report.findings.map((finding) => finding.verification),
+      dependencies: [task.id],
+      estimatedTokens: Math.min(this.config.roles[writer.role].tokenBudget, writer.estimatedTokens),
+      riskFlags: writer.riskFlags,
+      supportingDomains: ["security", "qa"],
+      artifactBaseSha: predecessor.artifact.headSha,
+      artifactDependencies: [writer.id],
+      remediationRound: nextRound,
+      sourceWriterTaskId: null
+    });
+    const security = this.enqueue({
+      role: "security", parentTaskId: remediation.id, title: `Security review: ${remediation.title}`,
+      prompt: `Review the finalized remediation artifact for '${writer.title}'. Do not expand scope; report only concrete security findings.`,
+      allowedPaths, acceptanceChecks: report.findings.map((finding) => finding.verification), dependencies: [remediation.id],
+      estimatedTokens: Math.min(this.config.roles.security.tokenBudget, Math.max(1, Math.ceil(remediation.estimatedTokens * 0.35))),
+      riskFlags: writer.riskFlags, supportingDomains: ["security"], sourceWriterTaskId: remediation.id
+    });
+    this.enqueue({
+      role: "qa", parentTaskId: security.id, title: `QA: ${remediation.title}`,
+      prompt: `Verify the finalized remediation artifact for '${writer.title}'. Return the required QualityGateReport only.`,
+      allowedPaths, acceptanceChecks: report.findings.map((finding) => finding.verification), dependencies: [security.id],
+      estimatedTokens: Math.min(this.config.roles.qa.tokenBudget, Math.max(1, Math.ceil(remediation.estimatedTokens * 0.4))),
+      riskFlags: writer.riskFlags, supportingDomains: ["qa"], sourceWriterTaskId: remediation.id
+    });
+    this.store.transition(task.id, "done");
+    this.#lifecycle("remediation queued", { taskId: remediation.id, writerTaskId: writer.id, remediationRound: nextRound });
+  }
+
   #structuredOutputContract(role) {
     if (role === "bootstrap") return `Return only one fenced JSON object with this schema:\n{"summary":"string","assumptions":["string"],"risks":["string"],"humanGates":["string"]}`;
     if (role === "planner") return `Return only one fenced JSON object with this schema:\n{"tasks":[{"id":"safe-kebab-id","title":"string","prompt":"specific implementation instruction","primaryDomain":"backend|frontend|database|qa|security|devops","supportingDomains":["qa|security|..."],"riskFlags":["public_api_change|schema_change|..."],"humanApprovalRequired":false,"estimatedTokens":8000,"dependsOn":["other-task-id"],"allowedPaths":["path"],"acceptanceChecks":["test or check"]}]}. allowedPaths must be explicit. Auth, network, permission, sensitive-data and supply-chain flags require security. Schema/destructive work must use database and humanApprovalRequired=true. Do not create implementation tasks for ambiguity; report it to the human instead.`;
+    if (role === "qa") return `Return only one fenced JSON QualityGateReport: {"verdict":"pass|remediation_required|blocked","summary":"string","findings":[{"id":"stable-id","severity":"low|medium|high|critical","path":"relative/path","evidence":"concrete safe evidence","requiredFix":"specific fix","verification":"specific verification"}],"executedChecks":[],"notRunChecks":[]}. Never include secrets or raw command output. A pass requires no findings.`;
     return "Return a concise Markdown report with evidence; do not return orchestration JSON.";
   }
 
@@ -414,7 +564,7 @@ export class SwarmRouter extends EventEmitter {
       dispatch.push({ item, securityRequired, elevatedGate, dependencyPlanIds: [...item.dependsOn] });
       orderedPlanIds.set(item.id, true);
     }
-    const needsSupport = dispatch.some(({ item, securityRequired }) => (securityRequired && item.primaryDomain !== "security") || (item.supportingDomains.includes("qa") && item.primaryDomain !== "qa"));
+    const needsSupport = dispatch.some(({ item, securityRequired }) => this.config.roles[item.primaryDomain]?.sandbox === "workspace-write" || (securityRequired && item.primaryDomain !== "security") || (item.supportingDomains.includes("qa") && item.primaryDomain !== "qa"));
     const plannerDepth = depthOf(plannerTask, (id) => this.store.getTask(id));
     if (plannerDepth + 1 > this.config.router.maxDelegationDepth || (needsSupport && plannerDepth + 2 > this.config.router.maxDelegationDepth)) throw new Error("Validated plan exceeds delegation depth limit");
     if (this.store.childCount(plannerTask.id) + dispatch.length > this.config.router.maxChildrenPerTask) throw new Error("Validated plan exceeds child task limit");
@@ -433,18 +583,19 @@ export class SwarmRouter extends EventEmitter {
     for (const { item, elevatedGate, securityRequired, dependencyPlanIds } of dispatch) {
       const primary = assertRoute(item.primaryDomain, item.estimatedTokens);
       const primaryId = primaryIds.get(item.id);
-      specs.push({ id: primaryId, role: item.primaryDomain, parentTaskId: plannerTask.id, title: item.title, prompt: item.prompt, allowedPaths: item.allowedPaths, acceptanceChecks: item.acceptanceChecks, dependencies: [plannerTask.id, ...dependencyPlanIds.map((dependency) => primaryIds.get(dependency))], estimatedTokens: item.estimatedTokens, tokenBudget: primary.tokenBudget, maxAttempts: 1, humanApprovalRequired: elevatedGate });
+      specs.push({ id: primaryId, role: item.primaryDomain, parentTaskId: plannerTask.id, title: item.title, prompt: item.prompt, allowedPaths: item.allowedPaths, acceptanceChecks: item.acceptanceChecks, dependencies: [plannerTask.id, ...dependencyPlanIds.map((dependency) => primaryIds.get(dependency))], estimatedTokens: item.estimatedTokens, tokenBudget: primary.tokenBudget, maxAttempts: 1, humanApprovalRequired: elevatedGate, riskFlags: item.riskFlags, supportingDomains: item.supportingDomains });
       let predecessorId = primaryId;
-      if (securityRequired && item.primaryDomain !== "security") {
+      const mandatoryReview = primary.sandbox === "workspace-write";
+      if ((mandatoryReview || securityRequired) && item.primaryDomain !== "security") {
         const estimate = Math.min(this.config.roles.security?.tokenBudget ?? 0, Math.max(1000, Math.ceil(item.estimatedTokens * 0.35)));
         const security = assertRoute("security", estimate);
         predecessorId = randomUUID();
-        specs.push({ id: predecessorId, role: "security", parentTaskId: primaryId, title: `Security review: ${item.title}`, prompt: `Review '${item.title}' for the declared risk flags: ${item.riskFlags.join(", ") || "none"}. Report concrete findings and required remediations.`, allowedPaths: item.allowedPaths, acceptanceChecks: item.acceptanceChecks, dependencies: [primaryId], estimatedTokens: estimate, tokenBudget: security.tokenBudget, maxAttempts: 1, humanApprovalRequired: false });
+        specs.push({ id: predecessorId, role: "security", parentTaskId: primaryId, title: `Security review: ${item.title}`, prompt: `Review finalized writer artifact '${item.title}' for declared risk flags: ${item.riskFlags.join(", ") || "none"}. Report concrete findings and required remediations.`, allowedPaths: item.allowedPaths, acceptanceChecks: item.acceptanceChecks, dependencies: [primaryId], estimatedTokens: estimate, tokenBudget: security.tokenBudget, maxAttempts: 1, humanApprovalRequired: false, riskFlags: item.riskFlags, supportingDomains: ["security"], sourceWriterTaskId: primaryId });
       }
-      if (item.supportingDomains.includes("qa") && item.primaryDomain !== "qa") {
+      if ((mandatoryReview || item.supportingDomains.includes("qa")) && item.primaryDomain !== "qa") {
         const estimate = Math.min(this.config.roles.qa?.tokenBudget ?? 0, Math.max(1000, Math.ceil(item.estimatedTokens * 0.4)));
         const qa = assertRoute("qa", estimate);
-        specs.push({ id: randomUUID(), role: "qa", parentTaskId: predecessorId, title: `QA: ${item.title}`, prompt: `Verify '${item.title}' against acceptance checks. Distinguish executed evidence from checks not run.`, allowedPaths: item.allowedPaths, acceptanceChecks: item.acceptanceChecks, dependencies: [predecessorId], estimatedTokens: estimate, tokenBudget: qa.tokenBudget, maxAttempts: 1, humanApprovalRequired: false });
+        specs.push({ id: randomUUID(), role: "qa", parentTaskId: predecessorId, title: `QA: ${item.title}`, prompt: `Verify finalized writer artifact '${item.title}' against acceptance checks. Return the required QualityGateReport only.`, allowedPaths: item.allowedPaths, acceptanceChecks: item.acceptanceChecks, dependencies: [predecessorId], estimatedTokens: estimate, tokenBudget: qa.tokenBudget, maxAttempts: 1, humanApprovalRequired: false, riskFlags: item.riskFlags, supportingDomains: ["qa"], sourceWriterTaskId: primaryId });
       }
     }
     this.store.createTasks(specs);
@@ -495,6 +646,11 @@ export class SwarmRouter extends EventEmitter {
     const event = { timestamp: new Date().toISOString(), type, ...details };
     this.lifecycleTrace.push(event);
     if (this.lifecycleTrace.length > 100) this.lifecycleTrace.splice(0, this.lifecycleTrace.length - 100);
+    // SQLite is the source of truth; JSONL is an operationally convenient
+    // append-only mirror. Neither stores prompts, agent text, or payloads.
+    this.store.recordEvent(details.taskId ?? null, `lifecycle/${type}`, event);
+    mkdirSync(this.config.runtimeDir, { recursive: true });
+    appendFileSync(this.lifecyclePath, `${JSON.stringify(event)}\n`, "utf8");
     this.emit("lifecycle", event);
     return event;
   }

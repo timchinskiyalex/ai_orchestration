@@ -18,6 +18,7 @@ function option(name, required = true) {
   }
   return args[index + 1];
 }
+const hasFlag = (name) => args.includes(name);
 
 function usage() {
   console.log(`Usage:
@@ -29,6 +30,8 @@ function usage() {
   node src/index.mjs override-budget --task <planner-task-id> --reason <human-reason>
   node src/index.mjs integrate --tasks <finalized-task-id,finalized-task-id>
   node src/index.mjs run-to-integration
+  node src/index.mjs deliver --source <directory-with-project-docs> [--confirm-remote-push]
+  node src/index.mjs watch [--once] [--interval-ms <ms>]
   node src/index.mjs create-instance --target <empty-instance-repository> --name <project-name>
   node src/index.mjs enqueue --role <bootstrap|planner|backend|frontend|database|qa|security|devops> --title <text> --prompt <text> [--parent <taskId>]
   node src/index.mjs run`);
@@ -54,6 +57,9 @@ try {
   try {
     if (command === "init") console.log(router.init());
     else if (command === "status") {
+      if (hasFlag("--json")) {
+        console.log(JSON.stringify(router.statusSnapshot(), null, 2));
+      } else {
       console.table(router.list().map((task) => ({ id: task.id, role: task.role, status: task.status, title: task.title, used: task.tokenUsed, estimate: task.estimatedTokens, cap: task.tokenBudget })));
       const readiness = router.executionReadiness();
       const budget = readiness.localBudget;
@@ -69,6 +75,24 @@ try {
         status: latestE2e.status, startedAt: latestE2e.startedAt, finishedAt: latestE2e.finishedAt, durationMs: latestE2e.durationMs,
         stage: latestE2e.stage, taskId: latestE2e.task?.id ?? null, resultPath: latestE2e.resultPath ?? null
       } : { status: "no E2E report", startedAt: null, finishedAt: null, durationMs: null, stage: null, taskId: null, resultPath: null }]);
+      }
+    } else if (command === "watch") {
+      const intervalMs = Number(option("--interval-ms", false) ?? 1_000);
+      if (!Number.isInteger(intervalMs) || intervalMs < 250) throw new Error("--interval-ms must be an integer of at least 250");
+      const render = () => {
+        const snapshot = router.statusSnapshot();
+        console.log(JSON.stringify({ generatedAt: snapshot.generatedAt, tasks: snapshot.tasks.map((task) => ({ id: task.id, title: task.title, role: task.role, status: task.status, dependencies: task.dependencies, blocker: task.blocker, tokenUsed: task.tokenUsed })), activeTurns: snapshot.activeTurns, realConcurrency: snapshot.realConcurrency, localBudget: snapshot.localBudget, localForecast: snapshot.localForecast, appServerQuotaWindows: snapshot.appServerQuotaWindows, qualityReports: snapshot.qualityReports, requiredHumanAction: snapshot.tasks.filter((task) => ["awaiting_human", "awaiting_approval"].includes(task.status)).map((task) => task.id) }, null, 2));
+      };
+      render();
+      if (!hasFlag("--once")) await new Promise((resolve) => { const timer = setInterval(render, intervalMs); process.on("SIGINT", () => { clearInterval(timer); resolve(); }); });
+    } else if (command === "deliver") {
+      const result = ingestDocumentation({ source: option("--source"), repository: router.config.repository, destinationRelative: router.config.project.documentationDir });
+      const overlay = await router.ensureProjectOverlay();
+      const bootstrap = router.startProject();
+      await router.runUntilIdle();
+      const snapshot = router.statusSnapshot();
+      const gate = snapshot.tasks.find((task) => ["awaiting_human", "awaiting_approval"].includes(task.status));
+      console.log(JSON.stringify({ terminalState: gate ? "awaiting_human" : "failed", importedDocs: result.files, overlayPath: overlay.path, bootstrapTaskId: bootstrap.id, confirmRemotePushRecorded: hasFlag("--confirm-remote-push"), requiredHumanAction: gate ? { taskId: gate.id, status: gate.status, command: `npm run approve -- --task ${gate.id}` } : "Inspect status; delivery did not reach a valid human gate." }, null, 2));
     }
     else if (command === "ingest-docs") {
       const result = ingestDocumentation({ source: option("--source"), repository: router.config.repository, destinationRelative: router.config.project.documentationDir });

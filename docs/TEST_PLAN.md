@@ -11,6 +11,16 @@ npm run test:app-server-schema
 
 ## Quota-free full-flow regression
 
+`npm test` includes fake-App-Server delivery coverage for concurrency/dependencies, mandatory Security and QA, structured QualityGate reports, bounded remediation/escalation, chained artifacts, remote allowlisting and idempotency, restart persistence, and lifecycle history beyond 100 in-memory entries. It never spends quota.
+
+Before explicit live E2E or remote handoff run:
+
+```powershell
+npm test
+npm run test:app-server-schema
+git diff --check
+```
+
 `npm test` includes a deterministic fake-App-Server full flow: Bootstrap → human gate → Planner → security/QA materialization → human gate → writer finalization → local integration. Run it successfully before the only quota-spending command:
 
 ```powershell

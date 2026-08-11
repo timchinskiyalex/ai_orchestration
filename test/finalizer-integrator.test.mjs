@@ -79,3 +79,19 @@ test("finalizer and integrator preserve NUL-delimited paths with spaces and Unic
     assert.equal(git(integration.manifest.worktree, ["show", `HEAD:${changedPath}`]), "export const value = 2;");
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+test("integrator applies a chained remediation artifact once after its predecessor", async () => {
+  const root = mkdtempSync(join(tmpdir(), "orchestration-artifact-chain-"));
+  try {
+    git(root, ["init", "-b", "main"]); writeFileSync(join(root, "package.json"), JSON.stringify({ packageManager: "npm@10", scripts: {} })); writeFileSync(join(root, "package-lock.json"), "{}"); mkdirSync(join(root, "src")); writeFileSync(join(root, "src", "value.mjs"), "export const value = 1;\n");
+    git(root, ["add", "."]); git(root, ["-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "base"]);
+    const { overlay, path } = await generateProjectOverlay({ repository: root, baseRef: "main" }); const finalizer = new WorktreeFinalizer({ repository: root, generatedDir: "docs/orchestration-generated" });
+    const firstWorktree = join(root, "first"); git(root, ["worktree", "add", "-b", "swarm/first", firstWorktree, overlay.repository.baseSha]); writeFileSync(join(firstWorktree, "src", "value.mjs"), "export const value = 2;\n");
+    const first = await finalizer.finalize({ task: { id: "writer", role: "backend", allowedPaths: ["src"], dependencies: [] }, worktree: firstWorktree, branch: "swarm/first", overlay, overlayPath: path });
+    const remWorktree = join(root, "remediation"); git(root, ["worktree", "add", "-b", "swarm/remediation", remWorktree, first.artifact.headSha]); writeFileSync(join(remWorktree, "src", "value.mjs"), "export const value = 2; // remediated\n");
+    const remediation = await finalizer.finalize({ task: { id: "remediation", role: "backend", allowedPaths: ["src"], dependencies: ["qa"], artifactDependencies: ["writer"], artifactBaseSha: first.artifact.headSha }, worktree: remWorktree, branch: "swarm/remediation", overlay, overlayPath: path });
+    assert.equal(remediation.artifact.baseSha, first.artifact.headSha); assert.deepEqual(remediation.artifact.dependencies, ["writer"]);
+    const integration = await new Integrator({ repository: root, runtimeDir: join(root, "runtime"), generatedDir: "docs/orchestration-generated" }).integrate({ artifacts: [first.artifact, remediation.artifact], overlay });
+    assert.equal(integration.manifest.status, "awaiting_human_merge"); assert.deepEqual(integration.manifest.appliedArtifacts, ["writer", "remediation"]); assert.equal(git(integration.manifest.worktree, ["log", "--format=%s", "-2"]), "swarm: finalize remediation\nswarm: finalize writer");
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});

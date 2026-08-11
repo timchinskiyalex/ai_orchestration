@@ -31,6 +31,14 @@ export function loadConfig(configPath) {
   config.integration ??= {};
   config.integration.remoteCiExtension ??= null;
   config.integration.pullRequestExtension ??= null;
+  config.delivery ??= {};
+  config.delivery.maxRemediationRounds ??= 2;
+  config.remote ??= {};
+  config.remote.enabled ??= false;
+  config.remote.remoteName ??= "origin";
+  config.remote.allowedRemotes ??= ["origin"];
+  config.remote.candidateBranchPrefix ??= "swarm/candidate/";
+  config.remote.requireCi ??= false;
   const safeProjectPath = (name, value) => {
     if (typeof value !== "string" || !value.trim() || isAbsolute(value) || value.split(/[\\/]/).some((part) => part === "." || part === "..")) throw new Error(`${name} must be a normalized relative path inside the repository`);
     return value.replace(/\\/g, "/").replace(/\/+$/, "");
@@ -45,6 +53,10 @@ export function loadConfig(configPath) {
   if (!Number.isInteger(config.budget.weeklyWindowDays) || config.budget.weeklyWindowDays < 1) throw new Error("budget.weeklyWindowDays must be a positive integer");
   if (!Number.isInteger(config.quota.throttleAtUsedPercent) || config.quota.throttleAtUsedPercent < 1 || config.quota.throttleAtUsedPercent > 100) throw new Error("quota.throttleAtUsedPercent must be an integer from 1 to 100");
   if (typeof config.quota.throttleWhenUnavailable !== "boolean") throw new Error("quota.throttleWhenUnavailable must be boolean");
+  if (!Number.isInteger(config.delivery.maxRemediationRounds) || config.delivery.maxRemediationRounds < 0 || config.delivery.maxRemediationRounds > 10) throw new Error("delivery.maxRemediationRounds must be an integer from 0 to 10");
+  if (typeof config.remote.enabled !== "boolean" || typeof config.remote.requireCi !== "boolean") throw new Error("remote.enabled and remote.requireCi must be boolean");
+  if (typeof config.remote.remoteName !== "string" || !Array.isArray(config.remote.allowedRemotes) || !config.remote.allowedRemotes.every((item) => typeof item === "string") || !config.remote.allowedRemotes.includes(config.remote.remoteName)) throw new Error("remote.remoteName must be included in remote.allowedRemotes");
+  if (typeof config.remote.candidateBranchPrefix !== "string" || !config.remote.candidateBranchPrefix.startsWith("swarm/candidate/") || config.remote.candidateBranchPrefix.includes("..")) throw new Error("remote.candidateBranchPrefix must remain under swarm/candidate/");
   if (![null, "string"].includes(config.integration.remoteCiExtension === null ? null : typeof config.integration.remoteCiExtension)) throw new Error("integration.remoteCiExtension must be string or null");
   if (![null, "string"].includes(config.integration.pullRequestExtension === null ? null : typeof config.integration.pullRequestExtension)) throw new Error("integration.pullRequestExtension must be string or null");
   for (const role of ROLES) {

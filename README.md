@@ -1,5 +1,19 @@
 # AI Orchestration Template
 
+## Autonomous delivery loop
+
+```powershell
+npm run deliver -- --source 'D:\\path\\to\\requirements'
+npm run status -- --json
+npm run watch
+```
+
+`deliver` imports Markdown requirements, creates an evidence-backed ProjectOverlay, and runs only eligible stages. It never bypasses Bootstrap, Planner, risk, budget, QA, remediation, remote, CI, or product gates, so an approval boundary ends honestly as `awaiting_human`.
+
+Every finalized writer receives read-only Security review and a controller-validated `QualityGateReport`; plain agent text cannot pass QA. Remediation starts from the predecessor artifact SHA, is bounded by `delivery.maxRemediationRounds`, and escalates high/critical, blocked, changed-scope, or exhausted cases to a human.
+
+Remote push is disabled by default. `--confirm-remote-push` is required for an allowlisted adapter to push only a verified `swarm/candidate/*` branch. `main`/`master`, force-push, auto-merge, and production actions are refused. Missing CI/PR adapters are reported as human remote handoff, never as success. Local P50/P90 remains distinct from App Server quota windows.
+
 ## Live E2E report
 
 Run the quota-spending smoke test only with explicit confirmation:

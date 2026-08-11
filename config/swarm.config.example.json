@@ -29,6 +29,16 @@
     "remoteCiExtension": null,
     "pullRequestExtension": null
   },
+  "delivery": {
+    "maxRemediationRounds": 2
+  },
+  "remote": {
+    "enabled": false,
+    "remoteName": "origin",
+    "allowedRemotes": ["origin"],
+    "candidateBranchPrefix": "swarm/candidate/",
+    "requireCi": false
+  },
   "roles": {
     "bootstrap": {
       "sandbox": "read-only",

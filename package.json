@@ -14,6 +14,8 @@
     "override-budget": "node src/index.mjs override-budget",
     "integrate": "node src/index.mjs integrate",
     "run-to-integration": "node src/index.mjs run-to-integration",
+    "deliver": "node src/index.mjs deliver",
+    "watch": "node src/index.mjs watch",
     "create-instance": "node src/index.mjs create-instance",
     "run": "node src/index.mjs run",
     "test": "node --test",

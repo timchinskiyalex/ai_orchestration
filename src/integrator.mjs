@@ -42,8 +42,12 @@ export class Integrator {
     if (!Array.isArray(artifacts) || !artifacts.length) throw new Error("Integrator requires at least one WorkerArtifact");
     artifacts.forEach(validateWorkerArtifact);
     const sorted = this.#dependencyOrder(artifacts);
+    const byTaskId = new Map(sorted.map((artifact) => [artifact.taskId, artifact]));
     for (const artifact of sorted) {
-      if (artifact.baseSha !== overlay.repository.baseSha) throw new Error(`Artifact ${artifact.taskId} base SHA does not match ProjectOverlay`);
+      const artifactParents = (artifact.dependencies ?? []).map((id) => byTaskId.get(id)).filter(Boolean);
+      if (artifactParents.length > 1) throw new Error(`Artifact ${artifact.taskId} has multiple artifact parents; chained artifacts require one deterministic predecessor`);
+      const expectedBase = artifactParents[0]?.headSha ?? overlay.repository.baseSha;
+      if (artifact.baseSha !== expectedBase) throw new Error(`Artifact ${artifact.taskId} base SHA does not match its predecessor chain`);
       const mergeBase = await git(this.repository, ["merge-base", artifact.baseSha, artifact.headSha]);
       if (mergeBase !== artifact.baseSha) throw new Error(`Artifact ${artifact.taskId} is not descended from its base SHA`);
       const [diff, names, treeSha] = await Promise.all([
@@ -56,6 +60,8 @@ export class Integrator {
       if (JSON.stringify(nameStatusPaths(names).sort()) !== JSON.stringify([...artifact.changedPaths].sort())) throw new Error(`Artifact ${artifact.taskId} changed paths mismatch`);
     }
     for (let i = 0; i < sorted.length; i += 1) for (let j = 0; j < i; j += 1) {
+      const chained = (sorted[i].dependencies ?? []).includes(sorted[j].taskId);
+      if (chained) continue;
       if (intersects(sorted[i].changedPaths, sorted[j].changedPaths) || (sorted[i].changedPaths.some(sensitiveArea) && sorted[j].changedPaths.some(sensitiveArea))) {
         return this.#blocked(overlay, sorted, `CONFLICT_BLOCKED: semantic/security/migration/infrastructure path overlap between ${sorted[j].taskId} and ${sorted[i].taskId}`);
       }
@@ -63,7 +69,7 @@ export class Integrator {
     const id = randomUUID();
     const root = resolve(this.runtimeDir, "integrations");
     const worktree = join(root, id);
-    const branch = `swarm/integration/${id}`;
+    const branch = `swarm/candidate/${id}`;
     mkdirSync(root, { recursive: true });
     await exec("git", ["-C", this.repository, "worktree", "add", "-b", branch, worktree, overlay.repository.baseSha]);
     const applied = [];

@@ -39,3 +39,18 @@ test("state store does not claim a task before its dependencies finish", () => {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("SQLite lifecycle and external-action idempotency survive a restart", () => {
+  const dir = mkdtempSync(join(tmpdir(), "codex-swarm-restart-")); const path = join(dir, "state.sqlite");
+  let store = new StateStore(path);
+  try {
+    store.recordEvent(null, "lifecycle/turn started", { taskId: "task-a" });
+    for (let index = 0; index < 150; index += 1) store.recordEvent(null, "lifecycle/item completed", { index });
+    assert.equal(store.recordExternalAction({ idempotencyKey: "push:origin:candidate", kind: "remote-push", status: "started", payload: { branch: "swarm/candidate/a" } }).duplicate, false);
+    assert.equal(store.recordExternalAction({ idempotencyKey: "push:origin:candidate", kind: "remote-push", status: "started" }).duplicate, true);
+    store.updateExternalAction("push:origin:candidate", { status: "passed", payload: { sha: "a".repeat(40) } });
+    store.close(); store = new StateStore(path);
+    assert.equal(store.externalAction("push:origin:candidate").status, "passed");
+    assert.equal(store.events({ after: 0, limit: 500 }).length >= 153, true, "bounded in-memory traces cannot erase persisted lifecycle history");
+  } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
+});

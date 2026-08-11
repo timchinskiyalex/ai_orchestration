@@ -27,6 +27,12 @@ Router є єдиним control plane. Агент пропонує план аб�
 | Ізоляція контексту | thread + developer instructions + окремий `cwd`; для writer ролей — окремий Git worktree. |
 | Дочірні агенти | `parentTaskId`, depth і child cap у state store. Створення відбувається тільки CLI/Router-ом. |
 | Stopper | `maxConcurrentTasks`, `maxChildrenPerTask`, `maxDelegationDepth`, turn timeout і token budgets. |
+
+## Autonomous delivery additions
+
+Delivery lifecycle is persisted in SQLite append-only events and mirrored to `runtime/lifecycle.jsonl`; bounded in-memory telemetry is diagnostic-only. Writer worktrees finalize to artifacts, then mandatory Security and structured QA run before integration. Remediation writers use predecessor artifact heads and are bounded by `maxRemediationRounds`.
+
+Integration creates only `swarm/candidate/*`. An allowlisted, idempotent remote adapter needs explicit confirmation; protected branches, force-push, auto-merge, and production actions do not exist. Candidate readiness requires local verification, QA/Security, confirmed push, and configured remote CI.
 | API-ліміти | `thread/goal/set`, `thread/tokenUsage/updated`, reservation budget перед стартом і `blocked_budget`. |
 | Інтернет | Не ввімкнено за замовчуванням. Він має з’явитися як окрема Research роль із allow-list і policy. |
 | Людина у циклі | App Server approval → `awaiting_approval`; default — deny. Reviewer → `awaiting_human`. |

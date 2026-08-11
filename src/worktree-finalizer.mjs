@@ -31,13 +31,14 @@ export class WorktreeFinalizer {
 
   async finalize({ task, worktree, branch, overlay, overlayPath }) {
     if (!worktree || !branch) throw new Error("Writer task has no isolated worktree or branch");
+    const artifactBaseSha = task.artifactBaseSha ?? overlay.repository.baseSha;
     const [worktreeRoot, headBefore, mergeBase, status, names] = await Promise.all([
       git(worktree, ["rev-parse", "--show-toplevel"]), git(worktree, ["rev-parse", "HEAD"]),
-      git(worktree, ["merge-base", overlay.repository.baseSha, "HEAD"]), gitRaw(worktree, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]),
-      gitRaw(worktree, ["diff", "--name-status", "-z", overlay.repository.baseSha, "--"])
+      git(worktree, ["merge-base", artifactBaseSha, "HEAD"]), gitRaw(worktree, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]),
+      gitRaw(worktree, ["diff", "--name-status", "-z", artifactBaseSha, "--"])
     ]);
-    if (mergeBase !== overlay.repository.baseSha) throw new Error(`Worktree does not descend from overlay base SHA ${overlay.repository.baseSha}`);
-    if (headBefore !== overlay.repository.baseSha) throw new Error("Worker created commits; only the runtime/controller may commit a WorkerArtifact");
+    if (mergeBase !== artifactBaseSha) throw new Error(`Worktree does not descend from artifact base SHA ${artifactBaseSha}`);
+    if (headBefore !== artifactBaseSha) throw new Error("Worker created commits; only the runtime/controller may commit a WorkerArtifact");
     const changedPaths = [...new Set([...nameStatusPaths(names), ...statusPaths(status)])];
     if (!changedPaths.length) throw new Error("Worker produced no diff; refusing to create an empty WorkerArtifact");
     const violations = changedPaths.map((path) => ({ path, ...pathAllowed(path, task, overlay) })).filter((item) => !item.allowed);
@@ -54,7 +55,7 @@ export class WorktreeFinalizer {
       }
     }
     await git(worktree, ["add", "--", ...changedPaths]);
-    const diff = await git(worktree, ["diff", "--cached", "--binary", "--no-ext-diff", overlay.repository.baseSha, "--"]);
+    const diff = await git(worktree, ["diff", "--cached", "--binary", "--no-ext-diff", artifactBaseSha, "--"]);
     if (!diff) throw new Error("Finalizer staging produced no diff");
     await exec("git", ["-C", worktree, "-c", `user.name=${this.runtimeIdentity.name}`, "-c", `user.email=${this.runtimeIdentity.email}`, "commit", "-m", `swarm: finalize ${task.id}`]);
     const [headSha, treeSha, clean] = await Promise.all([
@@ -63,9 +64,9 @@ export class WorktreeFinalizer {
     if (clean) throw new Error("Finalized worktree is not clean");
     const artifact = {
       schemaVersion: ARTIFACT_VERSION, kind: "WorkerArtifact", taskId: task.id, workUnitId: task.workUnitId ?? task.id, workerId: task.role,
-      baseSha: overlay.repository.baseSha, branch, headSha, treeSha, commitRange: `${headBefore}..${headSha}`,
+      baseSha: artifactBaseSha, branch, headSha, treeSha, commitRange: `${headBefore}..${headSha}`,
       diffChecksum: digest(diff), changedPaths, verificationResults, policyResult: { status: "passed", violations: [] },
-      overlay: { schemaVersion: overlay.schemaVersion, path: overlayPath }, dependencies: task.dependencies ?? [],
+      overlay: { schemaVersion: overlay.schemaVersion, path: overlayPath }, dependencies: task.artifactDependencies ?? task.dependencies ?? [],
       finalizedBy: { component: "WorktreeFinalizer", version: ARTIFACT_VERSION, identity: this.runtimeIdentity.name, finalizedAt: new Date().toISOString(), worktreeRoot: toPosix(worktreeRoot) }
     };
     const artifactsDir = join(this.repository, this.generatedDir, "worker-artifacts");
