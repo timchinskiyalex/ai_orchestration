@@ -1,4 +1,4 @@
-import { mkdirSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { assertRole, assertTransition } from "./domain.mjs";
@@ -9,9 +9,13 @@ const parse = (value, fallback) => (value ? JSON.parse(value) : fallback);
 
 export class StateStore {
   constructor(filePath) {
+    const isNewDatabase = !existsSync(filePath);
     mkdirSync(dirname(filePath), { recursive: true });
     this.db = new DatabaseSync(filePath);
-    this.db.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;");
+    // Switching journal mode takes an exclusive SQLite lock. Do it once at
+    // database creation, never in every short-lived status/watch reader.
+    if (isNewDatabase) this.db.exec("PRAGMA journal_mode = WAL;");
+    this.db.exec("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 1000;");
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS tasks (
         id TEXT PRIMARY KEY,
