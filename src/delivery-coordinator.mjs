@@ -18,19 +18,24 @@ export class DeliveryCoordinator {
   constructor(router) { this.router = router; }
 
   async begin({ source, ...adapters }) {
+    this.router.recoverStaleDeliveries();
     const current = this.router.store.currentDeliveryRun();
     if (current && ["running", "awaiting_human", "awaiting_human_remote_handoff"].includes(current.state)) throw new Error(`A delivery run is already active: ${current.id}. Use npm run deliver -- --resume.`);
     const intake = ingestDocumentation({ source, repository: this.router.config.repository, destinationRelative: this.router.config.project.documentationDir });
     const overlay = await this.router.ensureProjectOverlay();
     const bootstrap = this.router.startProject();
     const run = this.router.store.createDeliveryRun({ id: randomUUID(), source, bootstrapTaskId: bootstrap.id, confirmRemotePush: this.router.isAutonomous() });
+    this.router.store.linkTaskToDelivery(bootstrap.id, run.id);
+    this.router.activateDeliveryRun(run.id);
     return this.#advance(run, { intake, overlayPath: overlay.path, ...adapters });
   }
 
   async resume(adapters = {}) {
+    this.router.recoverStaleDeliveries();
     const run = this.router.store.currentDeliveryRun();
     if (!run) throw new Error("No delivery run exists; start with npm run deliver -- --source <docs-dir>");
-    if (["completed_merged", "completed_candidate_ready", "failed", "blocked_budget", "blocked_quota", "blocked_credentials", "blocked_ci", "blocked_branch_protection", "conflict_blocked"].includes(run.state)) return run;
+    if (["completed_merged", "completed_candidate_ready", "failed", "blocked_budget", "blocked_quota", "blocked_credentials", "blocked_ci", "blocked_branch_protection", "conflict_blocked", "interrupted"].includes(run.state)) return run;
+    this.router.activateDeliveryRun(run.id);
     if (run.integrationPath) return this.#publishPersisted(run, adapters);
     return this.#advance(run, adapters);
   }
@@ -43,20 +48,27 @@ export class DeliveryCoordinator {
   }
 
   async #advance(run, context = {}) {
+    this.router.activateDeliveryRun(run.id);
     if (!this.router.isAutonomous()) {
       const existingGate = manualGateFor(this.router.list());
       if (existingGate) return this.#awaiting(run, existingGate);
     }
     let execution;
     try { execution = await this.router.runUntilIdle(); }
-    catch (error) { return this.router.store.updateDeliveryRun(run.id, { state: "failed", publish: { reason: String(error.message).slice(0, 500), recovery: { action: "Inspect the preserved task worktree and structured task error." } } }); }
+    catch (error) {
+      const current = this.router.store.deliveryRun(run.id);
+      if (current?.state === "interrupted") return current;
+      return this.router.store.updateDeliveryRun(run.id, { state: "failed", publish: { reason: String(error.message).slice(0, 500), recovery: { action: "Inspect the preserved task worktree and structured task error." } } });
+    }
     if (execution?.blockedQuota) return this.router.store.updateDeliveryRun(run.id, { state: "blocked_quota", publish: { reason: execution.quota?.reason ?? "App Server quota policy blocked new turns", quota: execution.quota } });
+    if (execution?.interrupted) return this.router.store.deliveryRun(run.id);
+    if (execution?.blockedBudget) return this.router.store.deliveryRun(run.id)?.state === "blocked_budget" ? this.router.store.deliveryRun(run.id) : this.router.store.updateDeliveryRun(run.id, { state: "blocked_budget", publish: { reason: "Budget watchdog interrupted an active turn" } });
     const tasks = this.router.list();
     if (!this.router.isAutonomous()) {
       const gate = manualGateFor(tasks);
       if (gate) return this.#awaiting(run, gate);
     }
-    const terminalTask = tasks.find((task) => ["failed", "cancelled", "blocked_budget", "awaiting_approval"].includes(task.status));
+    const terminalTask = tasks.find((task) => ["failed", "cancelled", "blocked_budget", "interrupted", "awaiting_approval"].includes(task.status));
     if (terminalTask) {
       const terminal = terminalForTask(terminalTask);
       return this.router.store.updateDeliveryRun(run.id, { state: terminal.state, publish: { taskId: terminalTask.id, reason: terminal.reason, recovery: { action: "Inspect the task result/report and preserved worktree, correct the source condition, then start a fresh delivery run." } } });

@@ -24,6 +24,7 @@ function usage() {
   console.log(`Usage:
   node src/index.mjs init
   node src/index.mjs status
+  node src/index.mjs recover
   node src/index.mjs ingest-docs --source <directory-with-project-docs>
   node src/index.mjs orchestrate --source <directory-with-project-docs>
   node src/index.mjs approve --task <task-id>
@@ -57,6 +58,10 @@ try {
   const router = new SwarmRouter(loadConfig(configPath));
   try {
     if (command === "init") console.log(router.init());
+    else if (command === "recover") {
+      const recovered = router.recoverStaleDeliveries();
+      console.log(JSON.stringify({ recovered: recovered.map((run) => ({ id: run.id, state: run.state, recovery: run.recovery })) }, null, 2));
+    }
     else if (command === "status") {
       if (hasFlag("--json")) {
         console.log(JSON.stringify(router.statusSnapshot(), null, 2));
@@ -89,6 +94,20 @@ try {
     } else if (command === "deliver") {
       const { DeliveryCoordinator } = await import("./delivery-coordinator.mjs");
       const coordinator = new DeliveryCoordinator(router);
+      router.on("lifecycle", (event) => {
+        const stage = {
+          "thread started": "task started",
+          "turn started": "turn started",
+          "turn completed": "turn completed",
+          "token usage updated": "usage update",
+          "budget interrupt requested": "budget interrupt",
+          "budget preflight blocked": "budget blocked",
+          "stale delivery recovered": "stale run recovered",
+          "app-server exited": "App Server exited",
+          "controller shutdown requested": "shutdown interrupt"
+        }[event.type];
+        if (stage) console.log(`[progress] ${stage}${event.taskId ? ` task=${event.taskId}` : ""}${event.threadId ? ` thread=${event.threadId}` : ""}${event.turnId ? ` turn=${event.turnId}` : ""}${event.tokenUsage ? ` usage=${JSON.stringify(event.tokenUsage)}` : ""}${event.actualTokens !== undefined ? ` usage=${event.actualTokens}/${event.threshold}` : ""}`);
+      });
       const delivery = hasFlag("--resume")
         ? await coordinator.resume()
         : await coordinator.begin({ source: option("--source") });

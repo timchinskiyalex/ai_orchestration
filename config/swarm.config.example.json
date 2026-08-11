@@ -32,14 +32,19 @@
   },
   "budget": {
     "weeklyTokenLimit": 500000,
-    "weeklyWindowDays": 7
+    "weeklyWindowDays": 7,
+    "hardRunTokenLimit": 200000,
+    "interruptSafetyMarginTokens": 12000
   },
   "quota": {
     "throttleAtUsedPercent": 90,
     "throttleWhenUnavailable": false
   },
   "delivery": {
-    "maxRemediationRounds": 3
+    "maxRemediationRounds": 3,
+    "leaseHeartbeatMs": 5000,
+    "staleLeaseMs": 30000,
+    "shutdownGraceMs": 3000
   },
   "remote": {
     "enabled": true,
@@ -56,48 +61,56 @@
       "sandbox": "read-only",
       "approvalPolicy": "never",
       "tokenBudget": 24000,
+      "interruptThresholdTokens": 12000,
       "usesWorktree": false
     },
     "planner": {
       "sandbox": "read-only",
       "approvalPolicy": "never",
       "tokenBudget": 16000,
+      "interruptThresholdTokens": 8000,
       "usesWorktree": false
     },
     "backend": {
       "sandbox": "workspace-write",
       "approvalPolicy": "never",
       "tokenBudget": 30000,
+      "interruptThresholdTokens": 18000,
       "usesWorktree": true
     },
     "frontend": {
       "sandbox": "workspace-write",
       "approvalPolicy": "never",
       "tokenBudget": 26000,
+      "interruptThresholdTokens": 14000,
       "usesWorktree": true
     },
     "database": {
       "sandbox": "workspace-write",
       "approvalPolicy": "never",
       "tokenBudget": 22000,
+      "interruptThresholdTokens": 12000,
       "usesWorktree": true
     },
     "qa": {
       "sandbox": "read-only",
       "approvalPolicy": "never",
       "tokenBudget": 16000,
+      "interruptThresholdTokens": 8000,
       "usesWorktree": true
     },
     "security": {
       "sandbox": "read-only",
       "approvalPolicy": "never",
       "tokenBudget": 18000,
+      "interruptThresholdTokens": 9000,
       "usesWorktree": true
     },
     "devops": {
       "sandbox": "workspace-write",
       "approvalPolicy": "never",
       "tokenBudget": 22000,
+      "interruptThresholdTokens": 12000,
       "usesWorktree": true
     }
   }

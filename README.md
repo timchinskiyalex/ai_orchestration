@@ -40,7 +40,11 @@ New instances use `autonomy.mode: "autonomous"`. The required config shape is:
 
 `manual` is retained only for emergency debugging. In manual mode the legacy `approve` and `override-budget` commands are available; they are not part of normal delivery.
 
-P50/P90 is telemetry, never an approval gate. The local rolling budget is a scheduler hard cap: it does not start another task and finishes with `blocked_budget`. App Server quota is always a hard stop, reported as `blocked_quota`; the runtime never attempts to bypass account quota.
+P50/P90 is telemetry, never an approval gate. `estimatedTokens` is a forecast, while `tokenBudget` is a start-time reservation. `hardRunTokenLimit` and the rolling weekly limit are scheduler guardrails: a reservation that would exceed either one never starts. Each role also has an `interruptThresholdTokens` watchdog threshold; a usage update at or above it persists the measured usage and asks the App Server to `turn/interrupt` exactly once, then ends the delivery as `blocked_budget` without remediation, publication, PR, or merge.
+
+The generated App Server schema currently exposes `turn/interrupt` with `threadId` and `turnId`, but no server-side `turn/start` maximum-token parameter. Consequently an absolute zero-overshoot cap is unavailable upstream: the persisted budget interruption records the exact threshold and any observed threshold/cap overshoot caused by delayed usage reporting or interrupt latency. The configurable safety margin makes the watchdog fire early.
+
+App Server quota is always a hard stop, reported as `blocked_quota`; the runtime never attempts to bypass account quota. Each active delivery has a PID/session heartbeat lease. SIGINT best-effort interrupts active turns and persists `interrupted`; a new launcher automatically recovers a stale lease as historical `interrupted` state rather than treating old tasks as live.
 
 ## GitHub automation
 
