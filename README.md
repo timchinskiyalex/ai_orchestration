@@ -1,159 +1,72 @@
 # AI Orchestration Template
 
-## Autonomous delivery loop
-
-```powershell
-npm run deliver -- --source 'D:\\path\\to\\requirements'
-npm run status -- --json
-npm run watch
-```
-
-`deliver` imports Markdown requirements, creates an evidence-backed ProjectOverlay, and runs only eligible stages. It never bypasses Bootstrap, Planner, risk, budget, QA, remediation, remote, CI, or product gates, so an approval boundary ends honestly as `awaiting_human`.
-
-Continue a persisted run without manually invoking `run` or `run-to-integration`:
-
-```powershell
-npm run approve -- --task '<task-id>'
-npm run deliver -- --resume
-```
-
-After the final gate, `deliver --resume` runs the eligible DAG, integrates finalized artifacts, and only then attempts candidate publication. `npm run deliver -- --resume --confirm-remote-push` records confirmation in the delivery event/state and is the only resume path that can call `publishCandidate`.
-
-Every finalized writer receives read-only Security review and a controller-validated `SecurityGateReport`, then a controller-validated `QualityGateReport`; plain agent text cannot pass either gate. Remediation starts from the predecessor artifact SHA, is bounded by `delivery.maxRemediationRounds`, and escalates high/critical, blocked, changed-scope, or exhausted cases to a human.
-
-Remote push is disabled by default. `--confirm-remote-push` is required for an allowlisted adapter to push only a verified `swarm/candidate/*` branch. `main`/`master`, force-push, auto-merge, and production actions are refused. Missing CI/PR adapters are reported as human remote handoff, never as success. Local P50/P90 remains distinct from App Server quota windows.
-
-## Live E2E report
-
-Run the quota-spending smoke test only with explicit confirmation:
-
-```powershell
-npm run e2e:live -- --confirm-spend-quota
-```
-
-The launcher writes safe lifecycle metadata and a final summary under `runtime/e2e-runs/<run-id>/`, then updates `runtime/e2e-runs/latest.json`. Do not copy console output: ask Codex to inspect `runtime/e2e-runs/latest.json` instead. Reports never retain agent text, prompts, raw protocol payloads, command output, or secret values.
-
-Універсальний, safety-first шаблон для побудови конкретних систем оркестрації над Codex App Server.
-
-Він не містить документації, секретів, runtime state або правил конкретного продукту. Їх додає instance-репозиторій — наприклад, `ai_orchestration`.
+This is a reusable autonomous delivery runtime. A normal run has no approval, budget-override, push, PR, merge, or resume prompt:
 
 ```text
-ai_orchestration_template     — reusable core і правила
-          ↓ version/tag
-ai_orchestration              — конкретна інсталяція, документи й runtime
+documentation → Bootstrap → Planner → DAG → parallel workers → WorkerArtifacts
+→ Security → QA → bounded remediation → integration candidate → push → PR
+→ remote CI → protected merge → completed_merged
 ```
 
-## Що містить template
+## Start
 
-- Router і JSON-RPC `stdio` client до Codex App Server;
-- SQLite state/event/approval store;
-- ліміти concurrency, delegation depth, retries, budgets і turn timeout;
-- worktree isolation для writer-ролей;
-- базові ролі: Bootstrap, Planner, Coder, QA, Reviewer;
-- документаційний intake та project bootstrap workflow;
-- versioned `ProjectOverlay` із evidence ledger, path policies та declared verification commands;
-- `ProjectOverlay` remains in the controller repository; workers receive only a sanitized execution snapshot in their prompt, never a copied Overlay file;
-- controller-owned `WorkerArtifact` finalization і isolated integration branch/human merge handoff;
-- окремі account quota snapshots, local rolling budget і local P50/P90 telemetry forecast;
-- тестова основа, архітектурний контракт і план e2e-тестів.
-
-## Що не входить
-
-- конкретний код продукту, його вимоги чи secrets;
-- auto-approval, auto-merge, auto-push і неконтрольований spawn;
-- готовий Slack/UI bridge;
-- облікові дані, модельні ліміти конкретної організації.
-
-## Як створити інсталяцію
-
-1. Створіть новий репозиторій із цього template або створіть локальну інсталяцію командою:
+From an instance repository, start the complete lifecycle with one command:
 
 ```powershell
-npm run create-instance -- --target 'D:\Projects\my_orchestrator' --name 'My Orchestrator'
+./START_DEVELOPMENT.cmd
 ```
 
-Instance repo має бути порожнім: дозволені лише його `.git` і стартовий `README.md`.
+It opens a live monitor and exits only with a machine-readable terminal delivery state. The monitor includes task status, actual concurrency, token use, local budget/P50/P90, App Server quota windows, artifacts, candidate SHA, PR, CI checks, and merge SHA.
 
-2. Скопіюйте `config/swarm.config.example.json` у `config/swarm.config.json`.
-3. Вкажіть `project.name`, шлях до конкретного Git-репозиторію й `baseRef`.
-4. Імпортуйте вихідну документацію:
+`npm run develop` runs the same launcher. `npm run deliver -- --source <requirements-dir>` is the non-interactive CLI equivalent. `npm run status -- --json` and `npm run watch` are read-only operational views.
 
-```powershell
-npm run ingest-docs -- --source 'D:\path\to\project-docs'
+## Default configuration
+
+New instances use `autonomy.mode: "autonomous"`. The required config shape is:
+
+```json
+{
+  "autonomy": {
+    "mode": "autonomous",
+    "autoApproveWorkflowGates": true,
+    "autoRemediate": true,
+    "autoPush": true,
+    "autoCreatePullRequest": true,
+    "autoMerge": true,
+    "maxRemediationRounds": 3
+  }
+}
 ```
 
-5. Поставте Bootstrap-задачу і запустіть Router:
+`manual` is retained only for emergency debugging. In manual mode the legacy `approve` and `override-budget` commands are available; they are not part of normal delivery.
 
-```powershell
-npm run enqueue -- --role bootstrap --title 'Project blueprint' --prompt 'Побудуй project blueprint за імпортованою документацією.'
-npm run run
+P50/P90 is telemetry, never an approval gate. The local rolling budget is a scheduler hard cap: it does not start another task and finishes with `blocked_budget`. App Server quota is always a hard stop, reported as `blocked_quota`; the runtime never attempts to bypass account quota.
+
+## GitHub automation
+
+Remote automation uses authenticated local Git and GitHub CLI credentials; credentials are never stored in config or runtime state. It pushes only an exact verified `swarm/candidate/*` SHA, creates or finds the candidate-to-`main` PR idempotently, polls remote CI with a bounded timeout, and merges only after local integration, Security, QA, and required CI pass. It never force-pushes, writes worker branches to `main`, rewrites `main`, bypasses protection, or merges missing/failed CI.
+
+Missing or invalid GitHub credentials ends as `blocked_credentials`. Required CI failure/timed-out checks end as `blocked_ci`. A branch-protection refusal ends as `blocked_branch_protection`. These states retain the candidate, structured remote action data, and recovery instruction.
+
+## Greenfield products
+
+The controller root is not a product root. Configure allowlisted product roots:
+
+```json
+"productRoots": [
+  { "id": "frontend", "path": "frontend", "adapter": "next-node" },
+  { "id": "backend", "path": "backend", "adapter": "dotnet" }
+]
 ```
 
-Bootstrap працює read-only і завершується в `awaiting_human`: людина затверджує scope/ADR/task graph перед запуском будь-якого Coder.
+Greenfield repositories are valid before either root exists. Planner must create `scaffold-product`; every product task directly depends on it. After scaffold, the controller refreshes the ProjectOverlay from the scaffold worktree. Frontend verification runs only declared scripts in `frontend/package.json`; backend verification runs allowlisted `dotnet test` against the discovered solution/project in `backend/`. A scaffolded component without a declared/allowlisted verification command blocks integration rather than passing empty QA.
 
-## Контрольований pilot workflow
-
-Safe/manual mode є стандартним:
-
-```text
-Bootstrap → human approval → Planner → human approval → workers → integrate → human PR/merge
-```
-
-Перед approval Planner `status` показує окремо App Server quota windows, local actual usage, local reservation і local P50/P90 forecast. P90, що виходить за local rolling policy, не розблоковується звичайним approval:
-
-```powershell
-npm run override-budget -- --task '<planner-task-id>' --reason 'Pilot owner accepts the projected local budget exposure.'
-npm run approve -- --task '<planner-task-id>'
-```
-
-Це є audit-recorded human override, а не зміна App Server quota. Router також не починає нові turns, якщо жива quota window досягає `quota.throttleAtUsedPercent`.
-
-Для low-risk DAG після вже виконаних human gates можна використати:
-
-```powershell
-npm run run-to-integration
-```
-
-Команда ніколи не обходить pending human/approval gates; security, permission, schema та destructive changes залишаються на human gate.
-
-`npm run orchestrate` також створює `docs/orchestration-generated/project-overlay.v1.json`. Він отримує факти про Git, stack, scripts, CI, scoped `AGENTS*.md` та sensitive path names без запуску repository scripts і без читання значень секретів.
-
-Після того як усі writer-задачі мають finalized artifact, зберіть лише їхні task id в окремій candidate branch:
-
-```powershell
-npm run integrate -- --tasks '<task-id-1>,<task-id-2>'
-```
-
-Команда не merge-ить і не push-ить: вона створює `IntegrationManifest` із SHA-bound human merge gate.
-`localVerification` у manifest — це лише локально виконані declared commands. `remoteCi` та `pullRequest` чесно позначаються `unavailable`, доки окремий adapter/credentials не буде підключено через `integration.remoteCiExtension` та `integration.pullRequestExtension`.
-
-## Підтримка стеків
-
-У цій версії production-ready verification підтриманий для Node-проєктів із `npm`, `pnpm` або `yarn`. Manager визначається спершу з `package.json#packageManager`, потім зі lockfile. Python, Go та .NET навмисно fail closed: для них потрібні окремі stack adapters, які зададуть discovery та allowlisted verification commands.
-
-## Розвиток instance
-
-Після human review Bootstrap blueprint стає основою для Planner → Coder → QA → Reviewer workflow. Instance фіксує версію template, з якої він створений, наприклад у `docs/orchestration-generated/template-version.json`; зміни template оновлюються свідомо, через diff та eval, а не автоматично.
-
-## Перевірка
+## Verification
 
 ```powershell
 npm test
 npm run test:app-server-schema
+git diff --check
 ```
 
-`npm test` лишається portable і не вимагає локального Codex CLI. `npm run test:app-server-schema` окремо генерує schema встановленого CLI у тимчасову директорію, запускає лише protocol-contract test і гарантовано видаляє schema після перевірки. Виконуйте обидві команди перед контрольованим пілотом.
-
-Реальний disposable App Server E2E навмисно не входить у звичайний запуск, бо витрачає account quota:
-
-```powershell
-npm run e2e:live -- --confirm-spend-quota
-```
-
-За потреби ручної інспекції schema:
-
-```powershell
-codex app-server generate-json-schema --out .\runtime\app-server-schema
-```
-
-Деталі каркасу: [architecture](docs/ARCHITECTURE.md) і [test plan](docs/TEST_PLAN.md).
+The regular test suite is deterministic and quota-free. The real App Server E2E remains opt-in and is never run by the launcher.

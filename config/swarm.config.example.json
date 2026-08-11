@@ -21,6 +21,15 @@
     "turnTimeoutMs": 600000,
     "approvalMode": "deny"
   },
+  "autonomy": {
+    "mode": "autonomous",
+    "autoApproveWorkflowGates": true,
+    "autoRemediate": true,
+    "autoPush": true,
+    "autoCreatePullRequest": true,
+    "autoMerge": true,
+    "maxRemediationRounds": 3
+  },
   "budget": {
     "weeklyTokenLimit": 500000,
     "weeklyWindowDays": 7
@@ -29,19 +38,18 @@
     "throttleAtUsedPercent": 90,
     "throttleWhenUnavailable": false
   },
-  "integration": {
-    "remoteCiExtension": null,
-    "pullRequestExtension": null
-  },
   "delivery": {
-    "maxRemediationRounds": 2
+    "maxRemediationRounds": 3
   },
   "remote": {
-    "enabled": false,
+    "enabled": true,
     "remoteName": "origin",
     "allowedRemotes": ["origin"],
     "candidateBranchPrefix": "swarm/candidate/",
-    "requireCi": false
+    "requireCi": true,
+    "ciTimeoutMs": 900000,
+    "ciPollIntervalMs": 10000,
+    "mergeMethod": "merge"
   },
   "roles": {
     "bootstrap": {

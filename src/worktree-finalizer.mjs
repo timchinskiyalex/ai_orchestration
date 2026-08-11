@@ -14,19 +14,20 @@ async function gitRaw(cwd, args) { return (await exec("git", ["-C", cwd, ...args
 function statusPaths(value) { return value.split("\0").filter(Boolean).map((entry) => toPosix(entry.slice(3))); }
 function nameStatusPaths(value) { const parts = value.split("\0"); const paths = []; for (let i = 0; i < parts.length; i += 1) { const status = parts[i]; if (!status) continue; if ((status.startsWith("R") || status.startsWith("C")) && parts[i + 2] !== undefined) paths.push(toPosix(parts[++i]), toPosix(parts[++i])); else if (parts[i + 1] !== undefined) paths.push(toPosix(parts[++i])); } return paths; }
 function isWithin(path, allowed) { return path === allowed || path.startsWith(`${allowed.replace(/\/$/, "")}/`); }
-function pathAllowed(path, task, overlay) {
+function pathAllowed(path, task, overlay, { autonomous = true } = {}) {
   if (!task.allowedPaths?.length || !task.allowedPaths.some((allowed) => isWithin(path, allowed))) return { allowed: false, reason: "outside TaskEnvelope allowedPaths" };
   const policies = overlay.pathPolicies ?? {};
   if ((policies.denyWrite ?? []).some((item) => isWithin(path, item))) return { allowed: false, reason: "deny_write policy" };
   if ((policies.generatedDoNotEdit ?? []).some((item) => isWithin(path, item))) return { allowed: false, reason: "generated_do_not_edit policy" };
-  if ((policies.approvalRequired ?? []).some((item) => isWithin(path, item)) && !task.humanApproved) return { allowed: false, reason: "approval_required policy needs recorded human approval" };
+  if ((policies.approvalRequired ?? []).some((item) => isWithin(path, item)) && !task.humanApproved && !autonomous) return { allowed: false, reason: "approval_required policy needs recorded human approval in manual mode" };
   return { allowed: true };
 }
 
 export class WorktreeFinalizer {
-  constructor({ repository, generatedDir, runtimeIdentity = { name: "Codex Swarm Runtime", email: "codex-swarm-runtime@localhost" } }) {
+  constructor({ repository, generatedDir, autonomy = {}, runtimeIdentity = { name: "Codex Swarm Runtime", email: "codex-swarm-runtime@localhost" } }) {
     this.repository = repository;
     this.generatedDir = generatedDir;
+    this.autonomous = autonomy.mode !== "manual";
     this.runtimeIdentity = runtimeIdentity;
   }
 
@@ -42,7 +43,7 @@ export class WorktreeFinalizer {
     if (headBefore !== artifactBaseSha) throw new Error("Worker created commits; only the runtime/controller may commit a WorkerArtifact");
     const changedPaths = [...new Set([...nameStatusPaths(names), ...statusPaths(status)])];
     if (!changedPaths.length) throw new Error("Worker produced no diff; refusing to create an empty WorkerArtifact");
-    const violations = changedPaths.map((path) => ({ path, ...pathAllowed(path, task, overlay) })).filter((item) => !item.allowed);
+    const violations = changedPaths.map((path) => ({ path, ...pathAllowed(path, task, overlay, { autonomous: this.autonomous }) })).filter((item) => !item.allowed);
     if (violations.length) throw new Error(`Finalizer policy violation: ${violations.map((item) => `${item.path} (${item.reason})`).join(", ")}`);
     if (!status) throw new Error("Finalizer expected a dirty worktree");
     const verificationResults = [];
