@@ -48,6 +48,24 @@ export function agentResultForTurn(response, turnId) {
   return result;
 }
 
+// The project contract, not an LLM, is authoritative for declared product
+// roots. A planner may omit a root or write `frontend/`; both are safe to
+// canonicalize because this only grants the scaffold task paths explicitly
+// declared in project configuration.
+export function normalizePlannerPlanForProject(value, productRoots = []) {
+  if (!value || typeof value !== "object" || Array.isArray(value) || !Array.isArray(value.tasks) || !productRoots.length) return value;
+  const roots = productRoots.map((item) => item?.path).filter((path) => typeof path === "string" && path.trim()).map((path) => path.replace(/[\\/]+$/, ""));
+  if (!roots.length) return value;
+  return {
+    ...value,
+    tasks: value.tasks.map((task) => {
+      if (!task || task.id !== "scaffold-product" || !Array.isArray(task.allowedPaths) || task.allowedPaths.some((path) => typeof path !== "string")) return task;
+      const allowedPaths = [...new Set([...task.allowedPaths.map((path) => path.replace(/[\\/]+$/, "")), ...roots])];
+      return { ...task, allowedPaths };
+    })
+  };
+}
+
 export class SwarmRouter extends EventEmitter {
   constructor(config, { readOnly = false } = {}) {
     super();
@@ -795,7 +813,7 @@ export class SwarmRouter extends EventEmitter {
   }
 
   #materializePlan(plannerTask, parsedPlan) {
-    const plan = validatePlan(parsedPlan, { maxTasks: this.config.router.maxPlanTasks, productRoots: this.config.project.productRoots });
+    const plan = validatePlan(normalizePlannerPlanForProject(parsedPlan, this.config.project.productRoots), { maxTasks: this.config.router.maxPlanTasks, productRoots: this.config.project.productRoots });
     const orderedPlanIds = new Map();
     const pending = [...plan.tasks];
     const dispatch = [];
