@@ -17,6 +17,7 @@
     "deliver": "node src/index.mjs deliver",
     "watch": "node src/index.mjs watch",
     "start:delivery": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/start-delivery.ps1",
+    "develop": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/start-delivery.ps1",
     "create-instance": "node src/index.mjs create-instance",
     "run": "node src/index.mjs run",
     "test": "node --test",
