@@ -1,0 +1,1 @@
+{"expected":{"valid":true,"domains":["database"]},"plan":{"tasks":[{"id":"migration","title":"Migration","prompt":"Migrate schema","primaryDomain":"database","supportingDomains":[],"riskFlags":["schema_change"],"humanApprovalRequired":true,"estimatedTokens":100,"dependsOn":[],"allowedPaths":["migrations"],"acceptanceChecks":[]}]}}
