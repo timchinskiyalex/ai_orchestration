@@ -14,6 +14,7 @@ import { generateProjectOverlay, loadProjectOverlay, projectOverlayExecutionSnap
 import { WorktreeFinalizer } from "./worktree-finalizer.mjs";
 import { Integrator } from "./integrator.mjs";
 import { remediationScope, requiresHumanQualityGate, validateQualityGateReport } from "./quality-gate.mjs";
+import { validateSecurityGateReport } from "./security-gate.mjs";
 import { RemoteCiAdapter, RemoteGitAdapter } from "./remote-adapters.mjs";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -117,6 +118,7 @@ export class SwarmRouter extends EventEmitter {
     const readiness = this.executionReadiness();
     const tasks = this.list();
     const reports = tasks.filter((task) => task.role === "qa").map((task) => ({ taskId: task.id, ...this.store.qualityReport(task.id) })).filter((item) => item.report);
+    const securityReports = tasks.filter((task) => task.role === "security").map((task) => ({ taskId: task.id, ...this.store.securityReport(task.id) })).filter((item) => item.report);
     return {
       schemaVersion: 1,
       generatedAt: new Date().toISOString(),
@@ -128,6 +130,8 @@ export class SwarmRouter extends EventEmitter {
       appServerQuotaWindows: readiness.accountQuota.quotaWindows ?? [],
       quotaThrottle: readiness.quotaThrottle,
       qualityReports: reports.map(({ taskId, path, report }) => ({ taskId, path, verdict: report.verdict, findings: report.findings.length })),
+      securityReports: securityReports.map(({ taskId, path, report }) => ({ taskId, path, verdict: report.verdict, findings: report.findings.length })),
+      deliveryRun: this.store.currentDeliveryRun(),
       lifecycle: this.store.recentEvents(20)
     };
   }
@@ -218,15 +222,20 @@ export class SwarmRouter extends EventEmitter {
     return { terminalState: "completed_candidate_ready", status: "completed_candidate_ready", candidate: { branch: manifest.branch, sha: manifest.candidateSha }, remotePush: action.payload, remoteCi: ci, humanMergeGate: manifest.humanMergeGate };
   }
 
-  async runToIntegration() {
+  async runToIntegration({ alreadyIdle = false } = {}) {
     const gates = this.store.listTasks().filter((task) => ["awaiting_human", "awaiting_approval"].includes(task.status));
     if (gates.length) throw new Error(`Run-to-integration refuses to bypass human gates: ${gates.map((task) => task.id).join(", ")}`);
-    await this.runUntilIdle();
+    if (!alreadyIdle) await this.runUntilIdle();
     const tasks = this.store.listTasks();
     const unfinished = tasks.filter((task) => ENGINEERING_DOMAINS.has(task.role) && task.status !== "done");
     if (unfinished.length) throw new Error(`Run-to-integration stopped before completion: ${unfinished.map((task) => `${task.id}:${task.status}`).join(", ")}`);
     const writerIds = tasks.filter((task) => this.config.roles[task.role]?.sandbox === "workspace-write" && task.status === "done").map((task) => task.id);
     if (!writerIds.length) throw new Error("Run-to-integration found no finalized writer artifacts");
+    const security = tasks.filter((task) => task.role === "security" && task.sourceWriterTaskId);
+    const quality = tasks.filter((task) => task.role === "qa" && task.sourceWriterTaskId);
+    const missingSecurity = security.filter((task) => this.store.securityReport(task.id)?.report.verdict !== "pass");
+    const missingQuality = quality.filter((task) => this.store.qualityReport(task.id)?.report.verdict !== "pass");
+    if (missingSecurity.length || missingQuality.length) throw new Error(`Run-to-integration requires passed Security and QA reports: ${[...missingSecurity, ...missingQuality].map((task) => task.id).join(", ")}`);
     const result = await this.integrateFinalized(writerIds);
     return { writerArtifacts: writerIds.map((id) => this.store.workerArtifact(id)), integration: result, nextAction: result.manifest.status === "awaiting_human_merge" ? "Review local verification and explicitly create a PR or perform the SHA-bound merge." : "Resolve the blocked integration and retry." };
   }
@@ -403,6 +412,14 @@ export class SwarmRouter extends EventEmitter {
       let resultPath;
       if (task.role === "bootstrap") validateBootstrap(extractOrchestrationJson(resultText));
       if (task.role === "planner") this.#materializePlan(task, extractOrchestrationJson(resultText));
+      if (task.role === "security") {
+        const report = validateSecurityGateReport(extractOrchestrationJson(resultText));
+        resultPath = this.#saveSecurityReport(task, report);
+        this.store.setResultPath(task.id, resultPath);
+        this.store.recordSecurityReport({ securityTaskId: task.id, writerTaskId: task.sourceWriterTaskId, reportPath: resultPath, report });
+        await this.#handleSecurityGate(task, report);
+        return;
+      }
       if (task.role === "qa") {
         const report = validateQualityGateReport(extractOrchestrationJson(resultText));
         const checks = await this.#runDeclaredVerification(worktree, overlayContext.overlay);
@@ -471,6 +488,14 @@ export class SwarmRouter extends EventEmitter {
     return relative(this.config.repository, path).split("\\").join("/");
   }
 
+  #saveSecurityReport(task, report) {
+    const root = join(this.config.repository, this.config.project.generatedDir, "security-reports");
+    mkdirSync(root, { recursive: true });
+    const path = join(root, `${task.id}.v${report.schemaVersion}.json`);
+    writeFileSync(path, `${JSON.stringify(report, null, 2)}\n`, "utf8");
+    return relative(this.config.repository, path).split("\\").join("/");
+  }
+
   async #handleQualityGate(task, report) {
     const writer = this.store.getTask(task.sourceWriterTaskId);
     if (!writer) throw new Error(`Quality task ${task.id} has no source writer`);
@@ -523,10 +548,36 @@ export class SwarmRouter extends EventEmitter {
     this.#lifecycle("remediation queued", { taskId: remediation.id, writerTaskId: writer.id, remediationRound: nextRound });
   }
 
+  async #handleSecurityGate(task, report) {
+    const writer = this.store.getTask(task.sourceWriterTaskId);
+    if (!writer) throw new Error(`Security task ${task.id} has no source writer`);
+    const maxRounds = this.config.delivery?.maxRemediationRounds ?? 2;
+    const nextRound = (writer.remediationRound ?? 0) + 1;
+    if (report.verdict === "pass") {
+      this.store.transition(task.id, "done");
+      this.#lifecycle("security gate passed", { taskId: task.id, writerTaskId: writer.id });
+      return;
+    }
+    if (requiresHumanQualityGate(report, report.verdict === "remediation_required" && nextRound > maxRounds)) {
+      this.store.transition(task.id, "awaiting_human", { error: report.verdict === "blocked" ? "Security gate blocked" : "Security findings require human escalation" });
+      this.#lifecycle("security gate awaiting human", { taskId: task.id, writerTaskId: writer.id, verdict: report.verdict });
+      return;
+    }
+    const predecessor = this.store.workerArtifactRecord(writer.id);
+    if (!predecessor?.artifact) throw new Error(`Security remediation requires finalized artifact for ${writer.id}`);
+    const allowedPaths = remediationScope(report, writer);
+    const remediation = this.enqueue({ role: writer.role, parentTaskId: task.id, title: `Remediate ${writer.title} (security round ${nextRound})`, prompt: `Apply only these validated SecurityGate findings. Do not expand scope or risk: ${JSON.stringify(report.findings.map((finding) => ({ id: finding.id, path: finding.path, requiredFix: finding.requiredFix, verification: finding.verification })))}.`, allowedPaths, acceptanceChecks: report.findings.map((finding) => finding.verification), dependencies: [task.id], estimatedTokens: Math.min(this.config.roles[writer.role].tokenBudget, writer.estimatedTokens), riskFlags: writer.riskFlags, supportingDomains: ["security", "qa"], artifactBaseSha: predecessor.artifact.headSha, artifactDependencies: [writer.id], remediationRound: nextRound });
+    const security = this.enqueue({ role: "security", parentTaskId: remediation.id, title: `Security review: ${remediation.title}`, prompt: `Review the finalized security remediation artifact for '${writer.title}'. Return the required SecurityGateReport only.`, allowedPaths, acceptanceChecks: remediation.acceptanceChecks, dependencies: [remediation.id], estimatedTokens: Math.min(this.config.roles.security.tokenBudget, Math.max(1, Math.ceil(remediation.estimatedTokens * 0.35))), riskFlags: writer.riskFlags, supportingDomains: ["security"], sourceWriterTaskId: remediation.id });
+    this.enqueue({ role: "qa", parentTaskId: security.id, title: `QA: ${remediation.title}`, prompt: `Verify the finalized security remediation artifact for '${writer.title}'. Return the required QualityGateReport only.`, allowedPaths, acceptanceChecks: remediation.acceptanceChecks, dependencies: [security.id], estimatedTokens: Math.min(this.config.roles.qa.tokenBudget, Math.max(1, Math.ceil(remediation.estimatedTokens * 0.4))), riskFlags: writer.riskFlags, supportingDomains: ["qa"], sourceWriterTaskId: remediation.id });
+    this.store.transition(task.id, "done");
+    this.#lifecycle("security remediation queued", { taskId: remediation.id, writerTaskId: writer.id, remediationRound: nextRound });
+  }
+
   #structuredOutputContract(role) {
     if (role === "bootstrap") return `Return only one fenced JSON object with this schema:\n{"summary":"string","assumptions":["string"],"risks":["string"],"humanGates":["string"]}`;
     if (role === "planner") return `Return only one fenced JSON object with this schema:\n{"tasks":[{"id":"safe-kebab-id","title":"string","prompt":"specific implementation instruction","primaryDomain":"backend|frontend|database|qa|security|devops","supportingDomains":["qa|security|..."],"riskFlags":["public_api_change|schema_change|..."],"humanApprovalRequired":false,"estimatedTokens":8000,"dependsOn":["other-task-id"],"allowedPaths":["path"],"acceptanceChecks":["test or check"]}]}. allowedPaths must be explicit. Auth, network, permission, sensitive-data and supply-chain flags require security. Schema/destructive work must use database and humanApprovalRequired=true. Do not create implementation tasks for ambiguity; report it to the human instead.`;
     if (role === "qa") return `Return only one fenced JSON QualityGateReport: {"verdict":"pass|remediation_required|blocked","summary":"string","findings":[{"id":"stable-id","severity":"low|medium|high|critical","path":"relative/path","evidence":"concrete safe evidence","requiredFix":"specific fix","verification":"specific verification"}],"executedChecks":[],"notRunChecks":[]}. Never include secrets or raw command output. A pass requires no findings.`;
+    if (role === "security") return `Return only one fenced JSON SecurityGateReport: {"verdict":"pass|remediation_required|blocked","summary":"string","findings":[{"id":"stable-id","severity":"low|medium|high|critical","path":"relative/path","evidence":"concrete safe evidence","requiredFix":"specific fix","verification":"specific verification"}],"executedChecks":[],"notRunChecks":[]}. Never include secrets or raw command output. A pass requires no findings.`;
     return "Return a concise Markdown report with evidence; do not return orchestration JSON.";
   }
 
@@ -590,7 +641,7 @@ export class SwarmRouter extends EventEmitter {
         const estimate = Math.min(this.config.roles.security?.tokenBudget ?? 0, Math.max(1000, Math.ceil(item.estimatedTokens * 0.35)));
         const security = assertRoute("security", estimate);
         predecessorId = randomUUID();
-        specs.push({ id: predecessorId, role: "security", parentTaskId: primaryId, title: `Security review: ${item.title}`, prompt: `Review finalized writer artifact '${item.title}' for declared risk flags: ${item.riskFlags.join(", ") || "none"}. Report concrete findings and required remediations.`, allowedPaths: item.allowedPaths, acceptanceChecks: item.acceptanceChecks, dependencies: [primaryId], estimatedTokens: estimate, tokenBudget: security.tokenBudget, maxAttempts: 1, humanApprovalRequired: false, riskFlags: item.riskFlags, supportingDomains: ["security"], sourceWriterTaskId: primaryId });
+        specs.push({ id: predecessorId, role: "security", parentTaskId: primaryId, title: `Security review: ${item.title}`, prompt: `Review finalized writer artifact '${item.title}' for declared risk flags: ${item.riskFlags.join(", ") || "none"}. Return the required SecurityGateReport only.`, allowedPaths: item.allowedPaths, acceptanceChecks: item.acceptanceChecks, dependencies: [primaryId], estimatedTokens: estimate, tokenBudget: security.tokenBudget, maxAttempts: 1, humanApprovalRequired: false, riskFlags: item.riskFlags, supportingDomains: ["security"], sourceWriterTaskId: primaryId });
       }
       if ((mandatoryReview || item.supportingDomains.includes("qa")) && item.primaryDomain !== "qa") {
         const estimate = Math.min(this.config.roles.qa?.tokenBudget ?? 0, Math.max(1000, Math.ceil(item.estimatedTokens * 0.4)));

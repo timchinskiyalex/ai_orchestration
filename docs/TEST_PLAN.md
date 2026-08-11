@@ -13,6 +13,8 @@ npm run test:app-server-schema
 
 `npm test` includes fake-App-Server delivery coverage for concurrency/dependencies, mandatory Security and QA, structured QualityGate reports, bounded remediation/escalation, chained artifacts, remote allowlisting and idempotency, restart persistence, and lifecycle history beyond 100 in-memory entries. It never spends quota.
 
+The delivery coordinator tests cover Bootstrap gate → approve → resume Planner → approve → resume workers/Security/QA/integration, plus confirmation-gated idempotent candidate publication. Security uses its own structured `SecurityGateReport`; Markdown is rejected.
+
 Before explicit live E2E or remote handoff run:
 
 ```powershell

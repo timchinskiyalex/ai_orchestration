@@ -95,6 +95,26 @@ export class StateStore {
         report_json TEXT NOT NULL,
         created_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS security_reports (
+        security_task_id TEXT PRIMARY KEY REFERENCES tasks(id),
+        writer_task_id TEXT NOT NULL REFERENCES tasks(id),
+        schema_version INTEGER NOT NULL,
+        report_path TEXT NOT NULL,
+        report_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS delivery_runs (
+        id TEXT PRIMARY KEY,
+        schema_version INTEGER NOT NULL,
+        state TEXT NOT NULL,
+        source TEXT,
+        bootstrap_task_id TEXT REFERENCES tasks(id),
+        integration_path TEXT,
+        publish_json TEXT,
+        confirm_remote_push INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS external_actions (
         idempotency_key TEXT PRIMARY KEY,
         kind TEXT NOT NULL,
@@ -321,6 +341,49 @@ export class StateStore {
     return row ? { path: row.report_path, report: JSON.parse(row.report_json) } : null;
   }
 
+  recordSecurityReport({ securityTaskId, writerTaskId, reportPath, report }) {
+    this.#mutate(securityTaskId, "security/report", { writerTaskId, reportPath, verdict: report.verdict }, () => this.db.prepare(`INSERT OR REPLACE INTO security_reports(security_task_id, writer_task_id, schema_version, report_path, report_json, created_at)
+      VALUES (?, ?, ?, ?, ?, ?)` ).run(securityTaskId, writerTaskId, report.schemaVersion, reportPath, JSON.stringify(report), now()));
+  }
+
+  securityReport(securityTaskId) {
+    const row = this.db.prepare("SELECT report_path, report_json FROM security_reports WHERE security_task_id = ?").get(securityTaskId);
+    return row ? { path: row.report_path, report: JSON.parse(row.report_json) } : null;
+  }
+
+  createDeliveryRun({ id, source = null, bootstrapTaskId = null, confirmRemotePush = false }) {
+    const timestamp = now();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.prepare("INSERT INTO delivery_runs(id, schema_version, state, source, bootstrap_task_id, confirm_remote_push, created_at, updated_at) VALUES (?, 1, 'running', ?, ?, ?, ?, ?)").run(id, source, bootstrapTaskId, confirmRemotePush ? 1 : 0, timestamp, timestamp);
+      this.#insertEvent(bootstrapTaskId, "delivery/created", { deliveryRunId: id, confirmRemotePush: Boolean(confirmRemotePush) });
+      this.db.exec("COMMIT");
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    return this.deliveryRun(id);
+  }
+
+  deliveryRun(id) {
+    const row = this.db.prepare("SELECT * FROM delivery_runs WHERE id = ?").get(id);
+    return row ? this.#mapDeliveryRun(row) : null;
+  }
+
+  currentDeliveryRun() {
+    const row = this.db.prepare("SELECT * FROM delivery_runs ORDER BY created_at DESC LIMIT 1").get();
+    return row ? this.#mapDeliveryRun(row) : null;
+  }
+
+  updateDeliveryRun(id, { state, integrationPath, publish, confirmRemotePush } = {}) {
+    const current = this.deliveryRun(id); if (!current) throw new Error(`Delivery run not found: ${id}`);
+    const next = { state: state ?? current.state, integrationPath: integrationPath ?? current.integrationPath, publish: publish ?? current.publish, confirmRemotePush: confirmRemotePush ?? current.confirmRemotePush };
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.prepare("UPDATE delivery_runs SET state = ?, integration_path = ?, publish_json = ?, confirm_remote_push = ?, updated_at = ? WHERE id = ?").run(next.state, next.integrationPath, next.publish ? JSON.stringify(next.publish) : null, next.confirmRemotePush ? 1 : 0, now(), id);
+      this.#insertEvent(current.bootstrapTaskId, "delivery/state", { deliveryRunId: id, state: next.state, confirmRemotePush: next.confirmRemotePush });
+      this.db.exec("COMMIT");
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    return this.deliveryRun(id);
+  }
+
   recordExternalAction({ idempotencyKey, kind, status, payload = {} }) {
     const existing = this.db.prepare("SELECT payload_json, status FROM external_actions WHERE idempotency_key = ?").get(idempotencyKey);
     if (existing) return { duplicate: true, status: existing.status, payload: JSON.parse(existing.payload_json) };
@@ -358,6 +421,11 @@ export class StateStore {
     } catch (error) { this.db.exec("ROLLBACK"); throw error; }
   }
 
+  integrationManifest(manifestPath) {
+    const row = this.db.prepare("SELECT manifest_json FROM integration_manifests WHERE manifest_path = ?").get(manifestPath);
+    return row ? JSON.parse(row.manifest_json) : null;
+  }
+
   recordBudgetOverride({ taskId, reason, forecast }) {
     this.#mutate(taskId, "budget/override", { reason, forecast }, () => this.db.prepare(`INSERT OR REPLACE INTO budget_overrides(task_id, reason, forecast_json, created_at)
       VALUES (?, ?, ?, ?)`).run(taskId, reason, JSON.stringify(forecast), now()));
@@ -382,6 +450,10 @@ export class StateStore {
       artifactBaseSha: row.artifact_base_sha, artifactDependencies: parse(row.artifact_dependencies_json, []),
       remediationRound: row.remediation_round, sourceWriterTaskId: row.source_writer_task_id
     };
+  }
+
+  #mapDeliveryRun(row) {
+    return { id: row.id, schemaVersion: row.schema_version, state: row.state, source: row.source, bootstrapTaskId: row.bootstrap_task_id, integrationPath: row.integration_path, publish: parse(row.publish_json, null), confirmRemotePush: Boolean(row.confirm_remote_push), createdAt: row.created_at, updatedAt: row.updated_at };
   }
 
   #addColumnIfMissing(table, column, definition) {

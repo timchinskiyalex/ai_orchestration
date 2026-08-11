@@ -31,6 +31,7 @@ function usage() {
   node src/index.mjs integrate --tasks <finalized-task-id,finalized-task-id>
   node src/index.mjs run-to-integration
   node src/index.mjs deliver --source <directory-with-project-docs> [--confirm-remote-push]
+  node src/index.mjs deliver --resume [--confirm-remote-push]
   node src/index.mjs watch [--once] [--interval-ms <ms>]
   node src/index.mjs create-instance --target <empty-instance-repository> --name <project-name>
   node src/index.mjs enqueue --role <bootstrap|planner|backend|frontend|database|qa|security|devops> --title <text> --prompt <text> [--parent <taskId>]
@@ -81,18 +82,17 @@ try {
       if (!Number.isInteger(intervalMs) || intervalMs < 250) throw new Error("--interval-ms must be an integer of at least 250");
       const render = () => {
         const snapshot = router.statusSnapshot();
-        console.log(JSON.stringify({ generatedAt: snapshot.generatedAt, tasks: snapshot.tasks.map((task) => ({ id: task.id, title: task.title, role: task.role, status: task.status, dependencies: task.dependencies, blocker: task.blocker, tokenUsed: task.tokenUsed })), activeTurns: snapshot.activeTurns, realConcurrency: snapshot.realConcurrency, localBudget: snapshot.localBudget, localForecast: snapshot.localForecast, appServerQuotaWindows: snapshot.appServerQuotaWindows, qualityReports: snapshot.qualityReports, requiredHumanAction: snapshot.tasks.filter((task) => ["awaiting_human", "awaiting_approval"].includes(task.status)).map((task) => task.id) }, null, 2));
+        console.log(JSON.stringify({ generatedAt: snapshot.generatedAt, deliveryRun: snapshot.deliveryRun, tasks: snapshot.tasks.map((task) => ({ id: task.id, title: task.title, role: task.role, status: task.status, dependencies: task.dependencies, blocker: task.blocker, tokenUsed: task.tokenUsed, remediationRound: task.remediationRound })), activeTurns: snapshot.activeTurns, realConcurrency: snapshot.realConcurrency, localBudget: snapshot.localBudget, localForecast: snapshot.localForecast, appServerQuotaWindows: snapshot.appServerQuotaWindows, securityReports: snapshot.securityReports, qualityReports: snapshot.qualityReports, requiredHumanAction: snapshot.tasks.filter((task) => ["awaiting_human", "awaiting_approval", "blocked_budget"].includes(task.status)).map((task) => task.id) }, null, 2));
       };
       render();
       if (!hasFlag("--once")) await new Promise((resolve) => { const timer = setInterval(render, intervalMs); process.on("SIGINT", () => { clearInterval(timer); resolve(); }); });
     } else if (command === "deliver") {
-      const result = ingestDocumentation({ source: option("--source"), repository: router.config.repository, destinationRelative: router.config.project.documentationDir });
-      const overlay = await router.ensureProjectOverlay();
-      const bootstrap = router.startProject();
-      await router.runUntilIdle();
-      const snapshot = router.statusSnapshot();
-      const gate = snapshot.tasks.find((task) => ["awaiting_human", "awaiting_approval"].includes(task.status));
-      console.log(JSON.stringify({ terminalState: gate ? "awaiting_human" : "failed", importedDocs: result.files, overlayPath: overlay.path, bootstrapTaskId: bootstrap.id, confirmRemotePushRecorded: hasFlag("--confirm-remote-push"), requiredHumanAction: gate ? { taskId: gate.id, status: gate.status, command: `npm run approve -- --task ${gate.id}` } : "Inspect status; delivery did not reach a valid human gate." }, null, 2));
+      const { DeliveryCoordinator } = await import("./delivery-coordinator.mjs");
+      const coordinator = new DeliveryCoordinator(router);
+      const delivery = hasFlag("--resume")
+        ? await coordinator.resume({ confirmRemotePush: hasFlag("--confirm-remote-push") })
+        : await coordinator.begin({ source: option("--source"), confirmRemotePush: hasFlag("--confirm-remote-push") });
+      console.log(JSON.stringify(delivery, null, 2));
     }
     else if (command === "ingest-docs") {
       const result = ingestDocumentation({ source: option("--source"), repository: router.config.repository, destinationRelative: router.config.project.documentationDir });
@@ -112,10 +112,8 @@ try {
         console.table([result.readiness.localBudget, result.readiness.localForecast]);
         console.table(result.readiness.accountQuota.quotaWindows ?? []);
       }
-      if (result.shouldRun) {
-        console.log(result.next ? `Approved. Running the next orchestration stage from ${result.next.id}...` : "Approved. Running planned engineering tasks...");
-        await router.runUntilIdle();
-      } else console.log("Approved.");
+      if (result.shouldRun) console.log(JSON.stringify({ approvedTaskId: option("--task"), next: result.next?.id ?? null, resumeCommand: "npm run deliver -- --resume" }, null, 2));
+      else console.log("Approved.");
     } else if (command === "override-budget") {
       const result = router.overrideBudgetGate(option("--task"), option("--reason"));
       console.log(`Recorded explicit budget override for ${result.task.id}. Approve the Planner separately to start workers.`);

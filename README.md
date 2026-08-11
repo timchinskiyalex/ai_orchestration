@@ -10,7 +10,16 @@ npm run watch
 
 `deliver` imports Markdown requirements, creates an evidence-backed ProjectOverlay, and runs only eligible stages. It never bypasses Bootstrap, Planner, risk, budget, QA, remediation, remote, CI, or product gates, so an approval boundary ends honestly as `awaiting_human`.
 
-Every finalized writer receives read-only Security review and a controller-validated `QualityGateReport`; plain agent text cannot pass QA. Remediation starts from the predecessor artifact SHA, is bounded by `delivery.maxRemediationRounds`, and escalates high/critical, blocked, changed-scope, or exhausted cases to a human.
+Continue a persisted run without manually invoking `run` or `run-to-integration`:
+
+```powershell
+npm run approve -- --task '<task-id>'
+npm run deliver -- --resume
+```
+
+After the final gate, `deliver --resume` runs the eligible DAG, integrates finalized artifacts, and only then attempts candidate publication. `npm run deliver -- --resume --confirm-remote-push` records confirmation in the delivery event/state and is the only resume path that can call `publishCandidate`.
+
+Every finalized writer receives read-only Security review and a controller-validated `SecurityGateReport`, then a controller-validated `QualityGateReport`; plain agent text cannot pass either gate. Remediation starts from the predecessor artifact SHA, is bounded by `delivery.maxRemediationRounds`, and escalates high/critical, blocked, changed-scope, or exhausted cases to a human.
 
 Remote push is disabled by default. `--confirm-remote-push` is required for an allowlisted adapter to push only a verified `swarm/candidate/*` branch. `main`/`master`, force-push, auto-merge, and production actions are refused. Missing CI/PR adapters are reported as human remote handoff, never as success. Local P50/P90 remains distinct from App Server quota windows.
 
