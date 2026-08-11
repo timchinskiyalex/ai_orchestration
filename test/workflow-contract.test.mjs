@@ -15,6 +15,13 @@ test("plan contract validates a dependency DAG", () => {
   assert.equal(plan.tasks.length, 2);
 });
 
+test("plan contract accepts the documented dependency_supply_chain risk flag", () => {
+  const plan = validatePlan({ tasks: [
+    { id: "scaffold", title: "Scaffold", prompt: "Create roots", primaryDomain: "devops", supportingDomains: ["security"], riskFlags: ["dependency_supply_chain"], humanApprovalRequired: false, estimatedTokens: 2000, dependsOn: [], allowedPaths: ["frontend", "backend"], acceptanceChecks: ["roots exist"] }
+  ] }, { maxTasks: 2 });
+  assert.equal(plan.tasks[0].riskFlags[0], "dependency_supply_chain");
+});
+
 test("plan contract rejects dependency cycles", () => {
   assert.throws(() => validatePlan({ tasks: [
     { id: "one", title: "One", prompt: "Do one", primaryDomain: "backend", supportingDomains: [], riskFlags: [], humanApprovalRequired: false, estimatedTokens: 1000, dependsOn: ["two"], allowedPaths: ["src"], acceptanceChecks: [] },
