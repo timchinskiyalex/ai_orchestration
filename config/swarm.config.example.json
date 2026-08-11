@@ -34,7 +34,8 @@
     "weeklyTokenLimit": 500000,
     "weeklyWindowDays": 7,
     "hardRunTokenLimit": 200000,
-    "interruptSafetyMarginTokens": 12000
+    "interruptSafetyMarginTokens": 12000,
+    "enforceLocalLimits": false
   },
   "quota": {
     "throttleAtUsedPercent": 90,
