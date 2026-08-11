@@ -1,0 +1,1 @@
+{"expected":{"valid":false},"plan":{"tasks":[{"id":"unknown","title":"Make it better","prompt":"Do whatever is needed","primaryDomain":"backend","supportingDomains":[],"riskFlags":[],"humanApprovalRequired":false,"estimatedTokens":100,"dependsOn":[],"allowedPaths":[],"acceptanceChecks":[]}]}}

@@ -1,0 +1,43 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { SwarmRouter } from "../src/router.mjs";
+
+function config(root) {
+  const roles = Object.fromEntries(["bootstrap", "planner", "backend", "frontend", "database", "qa", "security", "devops"].map((role) => [role, {
+    sandbox: "read-only", approvalPolicy: "never", tokenBudget: 100, maxAttempts: 1, usesWorktree: false
+  }]));
+  return {
+    repository: root, runtimeDir: join(root, "runtime"), baseRef: "main", model: "test-model",
+    project: { name: "test", documentationDir: "docs/orchestration-input", generatedDir: "docs/orchestration-generated" },
+    router: { maxConcurrentTasks: 1, maxChildrenPerTask: 20, maxDelegationDepth: 4, maxPlanTasks: 12, defaultParentBudget: 1000, turnTimeoutMs: 1000, approvalMode: "deny" },
+    budget: { weeklyTokenLimit: 5000, weeklyWindowDays: 7 },
+    roles
+  };
+}
+
+test("project workflow starts Bootstrap and approval automatically queues Planner", () => {
+  const root = mkdtempSync(join(tmpdir(), "orchestration-router-"));
+  mkdirSync(join(root, "docs", "orchestration-input"), { recursive: true });
+  writeFileSync(join(root, "docs", "orchestration-input", "inventory.json"), "{}", "utf8");
+  const router = new SwarmRouter(config(root));
+  try {
+    const bootstrap = router.startProject();
+    assert.equal(bootstrap.role, "bootstrap");
+    router.store.transition(bootstrap.id, "preparing");
+    router.store.transition(bootstrap.id, "running");
+    router.store.transition(bootstrap.id, "awaiting_human");
+    const { next, shouldRun } = router.approveHumanGate(bootstrap.id);
+    assert.equal(next.role, "planner");
+    assert.deepEqual(next.dependencies, [bootstrap.id]);
+    assert.equal(shouldRun, true);
+    const budget = router.budgetSummary();
+    assert.equal(budget.plannedTokens, 200);
+    assert.equal(budget.projectedPercent, 4);
+  } finally {
+    router.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});

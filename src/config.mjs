@@ -1,0 +1,72 @@
+import { existsSync, readFileSync } from "node:fs";
+import { dirname, isAbsolute, resolve } from "node:path";
+import { ROLES } from "./domain.mjs";
+
+export function loadConfig(configPath) {
+  if (!existsSync(configPath)) throw new Error(`Missing config: ${configPath}. Copy config/swarm.config.example.json first.`);
+  const config = JSON.parse(readFileSync(configPath, "utf8"));
+  const base = dirname(configPath);
+  config.project ??= {};
+  config.project.name ??= "unnamed-project";
+  config.project.documentationDir ??= "docs/orchestration-input";
+  config.project.generatedDir ??= "docs/orchestration-generated";
+  config.repository = resolve(base, config.repository);
+  config.runtimeDir = resolve(base, config.runtimeDir ?? "./runtime");
+  config.baseRef ??= "main";
+  config.model ??= "gpt-5.6-terra";
+  config.router ??= {};
+  config.router.maxConcurrentTasks ??= 1;
+  config.router.maxChildrenPerTask ??= 20;
+  config.router.maxDelegationDepth ??= 4;
+  config.router.defaultParentBudget ??= 30000;
+  config.router.turnTimeoutMs ??= 600000;
+  config.router.maxPlanTasks ??= 12;
+  config.router.approvalMode ??= "deny";
+  config.budget ??= {};
+  config.budget.weeklyTokenLimit ??= 500000;
+  config.budget.weeklyWindowDays ??= 7;
+  config.quota ??= {};
+  config.quota.throttleAtUsedPercent ??= 90;
+  config.quota.throttleWhenUnavailable ??= false;
+  config.integration ??= {};
+  config.integration.remoteCiExtension ??= null;
+  config.integration.pullRequestExtension ??= null;
+  config.delivery ??= {};
+  config.delivery.maxRemediationRounds ??= 2;
+  config.remote ??= {};
+  config.remote.enabled ??= false;
+  config.remote.remoteName ??= "origin";
+  config.remote.allowedRemotes ??= ["origin"];
+  config.remote.candidateBranchPrefix ??= "swarm/candidate/";
+  config.remote.requireCi ??= false;
+  const safeProjectPath = (name, value) => {
+    if (typeof value !== "string" || !value.trim() || isAbsolute(value) || value.split(/[\\/]/).some((part) => part === "." || part === "..")) throw new Error(`${name} must be a normalized relative path inside the repository`);
+    return value.replace(/\\/g, "/").replace(/\/+$/, "");
+  };
+  config.project.documentationDir = safeProjectPath("project.documentationDir", config.project.documentationDir);
+  config.project.generatedDir = safeProjectPath("project.generatedDir", config.project.generatedDir);
+  if (config.router.approvalMode !== "deny") throw new Error("Only router.approvalMode=deny is implemented in this safety-first MVP");
+  if (!Number.isInteger(config.router.maxConcurrentTasks) || config.router.maxConcurrentTasks < 1) throw new Error("router.maxConcurrentTasks must be a positive integer");
+  if (!Number.isInteger(config.router.turnTimeoutMs) || config.router.turnTimeoutMs < 1000) throw new Error("router.turnTimeoutMs must be an integer of at least 1000");
+  if (!Number.isInteger(config.router.maxPlanTasks) || config.router.maxPlanTasks < 1) throw new Error("router.maxPlanTasks must be a positive integer");
+  if (!Number.isInteger(config.budget.weeklyTokenLimit) || config.budget.weeklyTokenLimit < 1) throw new Error("budget.weeklyTokenLimit must be a positive integer");
+  if (!Number.isInteger(config.budget.weeklyWindowDays) || config.budget.weeklyWindowDays < 1) throw new Error("budget.weeklyWindowDays must be a positive integer");
+  if (!Number.isInteger(config.quota.throttleAtUsedPercent) || config.quota.throttleAtUsedPercent < 1 || config.quota.throttleAtUsedPercent > 100) throw new Error("quota.throttleAtUsedPercent must be an integer from 1 to 100");
+  if (typeof config.quota.throttleWhenUnavailable !== "boolean") throw new Error("quota.throttleWhenUnavailable must be boolean");
+  if (!Number.isInteger(config.delivery.maxRemediationRounds) || config.delivery.maxRemediationRounds < 0 || config.delivery.maxRemediationRounds > 10) throw new Error("delivery.maxRemediationRounds must be an integer from 0 to 10");
+  if (typeof config.remote.enabled !== "boolean" || typeof config.remote.requireCi !== "boolean") throw new Error("remote.enabled and remote.requireCi must be boolean");
+  if (typeof config.remote.remoteName !== "string" || !Array.isArray(config.remote.allowedRemotes) || !config.remote.allowedRemotes.every((item) => typeof item === "string") || !config.remote.allowedRemotes.includes(config.remote.remoteName)) throw new Error("remote.remoteName must be included in remote.allowedRemotes");
+  if (typeof config.remote.candidateBranchPrefix !== "string" || !config.remote.candidateBranchPrefix.startsWith("swarm/candidate/") || config.remote.candidateBranchPrefix.includes("..")) throw new Error("remote.candidateBranchPrefix must remain under swarm/candidate/");
+  if (![null, "string"].includes(config.integration.remoteCiExtension === null ? null : typeof config.integration.remoteCiExtension)) throw new Error("integration.remoteCiExtension must be string or null");
+  if (![null, "string"].includes(config.integration.pullRequestExtension === null ? null : typeof config.integration.pullRequestExtension)) throw new Error("integration.pullRequestExtension must be string or null");
+  for (const role of ROLES) {
+    if (!config.roles?.[role]) throw new Error(`Missing role configuration: ${role}`);
+    const roleConfig = config.roles[role];
+    if (!Number.isInteger(roleConfig.tokenBudget) || roleConfig.tokenBudget < 1) throw new Error(`roles.${role}.tokenBudget must be positive`);
+    if (!["read-only", "workspace-write"].includes(roleConfig.sandbox)) throw new Error(`roles.${role}.sandbox must be read-only or workspace-write`);
+    if (roleConfig.approvalPolicy !== "never") throw new Error(`roles.${role}.approvalPolicy must be never`);
+    if (roleConfig.sandbox === "workspace-write" && roleConfig.usesWorktree !== true) throw new Error(`roles.${role}.workspace-write requires usesWorktree=true`);
+    roleConfig.maxAttempts = 1;
+  }
+  return config;
+}

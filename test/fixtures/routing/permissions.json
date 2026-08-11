@@ -1,0 +1,1 @@
+{"expected":{"valid":true,"domains":["devops","security"]},"plan":{"tasks":[{"id":"ci","title":"CI permissions","prompt":"Change workflow permission","primaryDomain":"devops","supportingDomains":["security"],"riskFlags":["permission_change"],"humanApprovalRequired":false,"estimatedTokens":100,"dependsOn":[],"allowedPaths":[".github/workflows"],"acceptanceChecks":[]}]}}

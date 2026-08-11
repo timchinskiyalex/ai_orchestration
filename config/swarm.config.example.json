@@ -1,0 +1,92 @@
+{
+  "project": {
+    "name": "replace-with-project-name",
+    "documentationDir": "docs/orchestration-input",
+    "generatedDir": "docs/orchestration-generated"
+  },
+  "repository": "D:/path/to/your/git/repository",
+  "baseRef": "main",
+  "runtimeDir": "../runtime",
+  "model": "gpt-5.6-terra",
+  "router": {
+    "maxConcurrentTasks": 10,
+    "maxChildrenPerTask": 20,
+    "maxDelegationDepth": 4,
+    "maxPlanTasks": 12,
+    "defaultParentBudget": 250000,
+    "turnTimeoutMs": 600000,
+    "approvalMode": "deny"
+  },
+  "budget": {
+    "weeklyTokenLimit": 500000,
+    "weeklyWindowDays": 7
+  },
+  "quota": {
+    "throttleAtUsedPercent": 90,
+    "throttleWhenUnavailable": false
+  },
+  "integration": {
+    "remoteCiExtension": null,
+    "pullRequestExtension": null
+  },
+  "delivery": {
+    "maxRemediationRounds": 2
+  },
+  "remote": {
+    "enabled": false,
+    "remoteName": "origin",
+    "allowedRemotes": ["origin"],
+    "candidateBranchPrefix": "swarm/candidate/",
+    "requireCi": false
+  },
+  "roles": {
+    "bootstrap": {
+      "sandbox": "read-only",
+      "approvalPolicy": "never",
+      "tokenBudget": 24000,
+      "usesWorktree": false
+    },
+    "planner": {
+      "sandbox": "read-only",
+      "approvalPolicy": "never",
+      "tokenBudget": 16000,
+      "usesWorktree": false
+    },
+    "backend": {
+      "sandbox": "workspace-write",
+      "approvalPolicy": "never",
+      "tokenBudget": 30000,
+      "usesWorktree": true
+    },
+    "frontend": {
+      "sandbox": "workspace-write",
+      "approvalPolicy": "never",
+      "tokenBudget": 26000,
+      "usesWorktree": true
+    },
+    "database": {
+      "sandbox": "workspace-write",
+      "approvalPolicy": "never",
+      "tokenBudget": 22000,
+      "usesWorktree": true
+    },
+    "qa": {
+      "sandbox": "read-only",
+      "approvalPolicy": "never",
+      "tokenBudget": 16000,
+      "usesWorktree": true
+    },
+    "security": {
+      "sandbox": "read-only",
+      "approvalPolicy": "never",
+      "tokenBudget": 18000,
+      "usesWorktree": true
+    },
+    "devops": {
+      "sandbox": "workspace-write",
+      "approvalPolicy": "never",
+      "tokenBudget": 22000,
+      "usesWorktree": true
+    }
+  }
+}
