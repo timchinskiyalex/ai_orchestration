@@ -16,8 +16,13 @@ $dirty = & git -C $projectRoot status --porcelain
 if ($LASTEXITCODE -ne 0) {
   throw "Cannot inspect Git status for $projectRoot"
 }
-if ($dirty) {
-  throw "Refusing to start: commit or stash the working-tree changes first.`n$dirty"
+$controllerOwnedPrefixes = @('docs/orchestration-input/', 'docs/orchestration-generated/', 'runtime/')
+$blockingDirty = @($dirty | Where-Object {
+  $path = if ($_.Length -gt 3) { $_.Substring(3).Replace('\', '/') } else { $_ }
+  -not ($controllerOwnedPrefixes | Where-Object { $path -eq $_.TrimEnd('/') -or $path.StartsWith($_) })
+})
+if ($blockingDirty) {
+  throw "Refusing to start: commit or stash code/product working-tree changes first.`n$($blockingDirty -join "`n")"
 }
 
 Start-Process -FilePath 'powershell.exe' -WorkingDirectory $projectRoot -ArgumentList @(

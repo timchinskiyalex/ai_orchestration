@@ -3,6 +3,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { join, relative } from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { commandCwd, commandsForPaths } from "./project-overlay.mjs";
 
 const exec = promisify(execFile);
 const ARTIFACT_VERSION = 1;
@@ -45,9 +46,11 @@ export class WorktreeFinalizer {
     if (violations.length) throw new Error(`Finalizer policy violation: ${violations.map((item) => `${item.path} (${item.reason})`).join(", ")}`);
     if (!status) throw new Error("Finalizer expected a dirty worktree");
     const verificationResults = [];
-    for (const command of overlay.verificationCommands ?? []) {
+    const verificationPlan = commandsForPaths(overlay, changedPaths);
+    if (verificationPlan.missing.length) throw new Error("Verification unavailable for a changed scaffolded product component");
+    for (const command of verificationPlan.commands) {
       try {
-        const result = await exec(command.executable, command.args, { cwd: worktree, timeout: command.timeoutMs ?? 120_000, windowsHide: true });
+        const result = await exec(command.executable, command.args, { cwd: commandCwd(worktree, command), timeout: command.timeoutMs ?? 120_000, windowsHide: true });
         verificationResults.push({ id: command.id, source: command.source, status: "passed", stdout: result.stdout.slice(-4000), stderr: result.stderr.slice(-4000) });
       } catch (error) {
         verificationResults.push({ id: command.id, source: command.source, status: "failed", error: error.message, stdout: String(error.stdout ?? "").slice(-4000), stderr: String(error.stderr ?? "").slice(-4000) });
