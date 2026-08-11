@@ -19,6 +19,31 @@ class DeliveryClient extends EventEmitter {
   async waitForTurn(threadId, turnId) { const thread = this.threads.get(threadId); if (/Writer/.test(thread.goal)) writeFileSync(join(thread.cwd, "src", "value.mjs"), "export const value = 2;\n"); return { id: turnId, status: "completed" }; }
   async readThread({ threadId }) { const thread = this.threads.get(threadId); const text = /^Bootstrap/.test(thread.goal) ? "```json\n{\"summary\":\"ok\",\"assumptions\":[],\"risks\":[],\"humanGates\":[]}\n```" : /^Plan /.test(thread.goal) ? "```json\n{\"tasks\":[{\"id\":\"writer\",\"title\":\"Writer\",\"prompt\":\"Writer\",\"primaryDomain\":\"backend\",\"supportingDomains\":[],\"riskFlags\":[],\"humanApprovalRequired\":false,\"estimatedTokens\":20,\"dependsOn\":[],\"allowedPaths\":[\"src/value.mjs\"],\"acceptanceChecks\":[\"npm test\"]}]}\n```" : /^Security review:/.test(thread.goal) ? "```json\n{\"verdict\":\"pass\",\"summary\":\"secure\",\"findings\":[],\"executedChecks\":[],\"notRunChecks\":[]}\n```" : /^QA:/.test(thread.goal) ? "```json\n{\"verdict\":\"pass\",\"summary\":\"quality verified\",\"findings\":[],\"executedChecks\":[],\"notRunChecks\":[]}\n```" : "writer complete"; return { thread: { turns: [{ id: `turn-${threadId}`, items: [{ type: "agentMessage", text }] }] } }; }
 }
+class CorrectingPlannerClient extends DeliveryClient {
+  constructor() { super(); this.plannerReads = 0; }
+  async readThread({ threadId }) {
+    const thread = this.threads.get(threadId);
+    if (/^Plan /.test(thread.goal)) {
+      this.plannerReads += 1;
+      const text = this.plannerReads === 1
+        ? "```json\n{\"tasks\":[{\"id\":\"writer\",\"title\":\"Writer\",\"prompt\":\"Writer\",\"primaryDomain\":\"backend\",\"supportingDomains\":[],\"riskFlags\":[\"invented_flag\"],\"humanApprovalRequired\":false,\"estimatedTokens\":20,\"dependsOn\":[],\"allowedPaths\":[\"src/value.mjs\"],\"acceptanceChecks\":[\"npm test\"]}]}\n```"
+        : "```json\n{\"tasks\":[{\"id\":\"writer\",\"title\":\"Writer\",\"prompt\":\"Writer\",\"primaryDomain\":\"backend\",\"supportingDomains\":[],\"riskFlags\":[],\"humanApprovalRequired\":false,\"estimatedTokens\":20,\"dependsOn\":[],\"allowedPaths\":[\"src/value.mjs\"],\"acceptanceChecks\":[\"npm test\"]}]}\n```";
+      return { thread: { turns: [{ id: `turn-${threadId}`, items: [{ type: "agentMessage", text }] }] } };
+    }
+    return super.readThread({ threadId });
+  }
+}
+class RepairingWriterClient extends DeliveryClient {
+  constructor() { super(); this.writerTurns = 0; }
+  async waitForTurn(threadId, turnId) {
+    const thread = this.threads.get(threadId);
+    if (/^Writer/.test(thread.goal)) {
+      this.writerTurns += 1;
+      writeFileSync(join(thread.cwd, "src", "value.mjs"), `export const value = ${this.writerTurns === 1 ? 1 : 2};\n`);
+    }
+    return { id: turnId, status: "completed" };
+  }
+}
 function setup(remote = true) {
   const root = mkdtempSync(join(tmpdir(), "delivery-coordinator-")); git(root, ["init", "-b", "main"]); mkdirSync(join(root, "src")); mkdirSync(join(root, "test")); const source = join(root, "requirements"); mkdirSync(source); writeFileSync(join(source, "requirements.md"), "# Requirement\nFix value.\n"); writeFileSync(join(root, "package.json"), JSON.stringify({ packageManager: "npm@10", scripts: { test: "node --test" } })); writeFileSync(join(root, "package-lock.json"), "{}"); writeFileSync(join(root, "src", "value.mjs"), "export const value = 1;\n"); writeFileSync(join(root, "test", "value.test.mjs"), "import test from 'node:test'; import assert from 'node:assert/strict'; import { value } from '../src/value.mjs'; test('value',()=>assert.equal(value,2));\n"); git(root, ["add", "."]); git(root, ["-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "base"]);
   const roles = Object.fromEntries(["bootstrap", "planner", "backend", "frontend", "database", "qa", "security", "devops"].map((role) => [role, { sandbox: role === "backend" ? "workspace-write" : "read-only", approvalPolicy: "never", tokenBudget: 200, usesWorktree: role === "backend" }]));
@@ -71,5 +96,29 @@ test("tracking-only delivery keeps worker goals uncapped while bounding planning
     assert.ok(client.goals.length > 2);
     assert.equal(client.goals.filter((goal) => /^(Bootstrap|Plan )/.test(goal.objective)).every((goal) => "tokenBudget" in goal), true);
     assert.equal(client.goals.filter((goal) => !/^(Bootstrap|Plan )/.test(goal.objective)).some((goal) => "tokenBudget" in goal), false);
+  } finally { router.close(); rmSync(fixture.root, { recursive: true, force: true }); }
+});
+
+test("planner validation is repaired in the same delivery run without a new Bootstrap", async () => {
+  const fixture = setup(false); const client = new CorrectingPlannerClient(); fixture.config.appServerClientFactory = () => client;
+  const router = new SwarmRouter(fixture.config); const coordinator = new DeliveryCoordinator(router);
+  try {
+    await coordinator.begin({ source: fixture.source });
+    assert.equal(client.plannerReads, 2);
+    assert.equal(router.list().filter((task) => task.role === "bootstrap").length, 1);
+    assert.equal(router.list().find((task) => task.role === "planner").status, "done");
+  } finally { router.close(); rmSync(fixture.root, { recursive: true, force: true }); }
+});
+
+test("writer verification failure is repaired in the same worker thread before finalization", async () => {
+  const fixture = setup(false); const client = new RepairingWriterClient(); fixture.config.appServerClientFactory = () => client;
+  const router = new SwarmRouter(fixture.config); const coordinator = new DeliveryCoordinator(router);
+  try {
+    await coordinator.begin({ source: fixture.source });
+    const writer = router.list().find((task) => task.title === "Writer");
+    assert.equal(writer.status, "done");
+    assert.equal(client.writerTurns, 2);
+    assert.ok(router.store.workerArtifact(writer.id));
+    assert.equal(router.lifecycleEvents().some((event) => event.type === "writer verification retry"), true);
   } finally { router.close(); rmSync(fixture.root, { recursive: true, force: true }); }
 });

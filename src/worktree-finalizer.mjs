@@ -58,6 +58,10 @@ export class WorktreeFinalizer {
         throw new Error(`Verification failed: ${command.id}: ${String(error.stderr ?? error.stdout ?? error.message).slice(-1000)}`);
       }
     }
+    const afterVerificationStatus = await gitRaw(worktree, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
+    const afterVerificationPaths = [...new Set(statusPaths(afterVerificationStatus))];
+    const newlyCreatedPaths = afterVerificationPaths.filter((path) => !changedPaths.includes(path));
+    if (newlyCreatedPaths.length) throw new Error(`Verification left unstaged files in the worktree: ${newlyCreatedPaths.join(", ")}`);
     await git(worktree, ["add", "--", ...changedPaths]);
     const diff = await git(worktree, ["diff", "--cached", "--binary", "--no-ext-diff", artifactBaseSha, "--"]);
     if (!diff) throw new Error("Finalizer staging produced no diff");

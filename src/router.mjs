@@ -56,12 +56,18 @@ export function normalizePlannerPlanForProject(value, productRoots = []) {
   if (!value || typeof value !== "object" || Array.isArray(value) || !Array.isArray(value.tasks) || !productRoots.length) return value;
   const roots = productRoots.map((item) => item?.path).filter((path) => typeof path === "string" && path.trim()).map((path) => path.replace(/[\\/]+$/, ""));
   if (!roots.length) return value;
+  const hasProductPath = (paths) => Array.isArray(paths) && paths.some((path) => typeof path === "string" && roots.some((root) => path.replace(/[\\/]+$/, "") === root || path.replace(/[\\/]+$/, "").startsWith(`${root}/`)));
   return {
     ...value,
     tasks: value.tasks.map((task) => {
-      if (!task || task.id !== "scaffold-product" || !Array.isArray(task.allowedPaths) || task.allowedPaths.some((path) => typeof path !== "string")) return task;
-      const allowedPaths = [...new Set([...task.allowedPaths.map((path) => path.replace(/[\\/]+$/, "")), ...roots])];
-      return { ...task, allowedPaths };
+      if (!task || typeof task !== "object") return task;
+      if (task.id === "scaffold-product" && Array.isArray(task.allowedPaths) && !task.allowedPaths.some((path) => typeof path !== "string")) {
+        return { ...task, allowedPaths: [...new Set([...task.allowedPaths.map((path) => path.replace(/[\\/]+$/, "")), ...roots])] };
+      }
+      if (task.id !== "scaffold-product" && hasProductPath(task.allowedPaths) && Array.isArray(task.dependsOn) && !task.dependsOn.includes("scaffold-product")) {
+        return { ...task, dependsOn: [...task.dependsOn, "scaffold-product"] };
+      }
+      return task;
     })
   };
 }
@@ -539,10 +545,10 @@ export class SwarmRouter extends EventEmitter {
     const current = this.store.getTask(task.id);
     if (["awaiting_approval", "blocked_budget", "interrupted"].includes(current.status)) return;
     if (turn.status === "completed") {
-      const resultText = await this.#readAgentResult(client, threadId, resolvedTurnId);
+      let resultText = await this.#readAgentResult(client, threadId, resolvedTurnId);
       let resultPath;
       if (task.role === "bootstrap") validateBootstrap(extractOrchestrationJson(resultText));
-      if (task.role === "planner") this.#materializePlan(task, extractOrchestrationJson(resultText));
+      if (task.role === "planner") resultText = await this.#materializePlannerWithRepair(client, task, threadId, resultText);
       if (task.role === "security") {
         const report = validateSecurityGateReport(extractOrchestrationJson(resultText));
         resultPath = this.#saveSecurityReport(task, report);
@@ -570,12 +576,12 @@ export class SwarmRouter extends EventEmitter {
       resultPath = this.#saveAgentResult(task, resultText);
       this.store.setResultPath(task.id, resultPath);
       if (roleConfig.sandbox === "workspace-write") {
-        if (this.#isScaffoldTask(task)) {
-          overlayContext = await this.#refreshProjectOverlayFromWorktree(worktree);
-          const missingRoots = (overlayContext.overlay.components ?? []).filter((component) => component.state !== "scaffolded").map((component) => component.root);
-          if (missingRoots.length) throw new Error(`Scaffold incomplete: required product roots are still unscaffolded: ${missingRoots.join(", ")}`);
-        }
-        const finalized = await this.finalizer.finalize({ task, worktree, branch, overlay: overlayContext.overlay, overlayPath: overlayContext.path });
+        let finalizedArtifact;
+        if (this.#isScaffoldTask(task)) ({ overlayContext, resultText } = await this.#completeScaffoldWithRepair(client, task, threadId, worktree, overlayContext, resultText));
+        resultPath = this.#saveAgentResult(task, resultText);
+        this.store.setResultPath(task.id, resultPath);
+        ({ overlayContext, resultText, finalized: finalizedArtifact } = await this.#finalizeWriterWithRepair(client, task, threadId, worktree, branch, overlayContext, resultText));
+        const finalized = finalizedArtifact;
         this.store.recordWorkerArtifact(task.id, finalized.path, finalized.artifact);
         if (this.#isScaffoldTask(task)) this.#connectScaffoldDependents(task, finalized.artifact);
       }
@@ -649,6 +655,97 @@ export class SwarmRouter extends EventEmitter {
     const runProjected = runUsage.used + runReservedWithoutCurrent + task.tokenBudget;
     if (runProjected > hardRunTokenLimit) return { allowed: false, scope: "run", projected: runProjected, limit: hardRunTokenLimit, used: runUsage.used, reservedWithoutCurrent: runReservedWithoutCurrent };
     return { allowed: true, scope: "run", projected: runProjected, limit: hardRunTokenLimit, used: runUsage.used, reservedWithoutCurrent: runReservedWithoutCurrent, weeklyUsed: usage.used, weeklyProjected };
+  }
+
+  async #materializePlannerWithRepair(client, task, threadId, initialResultText) {
+    let resultText = initialResultText;
+    const maxRepairTurns = 2;
+    for (let attempt = 0; attempt <= maxRepairTurns; attempt += 1) {
+      try {
+        this.#materializePlan(task, extractOrchestrationJson(resultText));
+        return resultText;
+      } catch (error) {
+        if (attempt === maxRepairTurns) throw error;
+        const reason = String(error.message).slice(0, 1000);
+        this.#lifecycle("planner validation retry", { taskId: task.id, threadId, attempt: attempt + 1, reason });
+        const retry = await client.startTurn({
+          threadId,
+          effort: "low",
+          input: [{ type: "text", text: `Your previous execution DAG was rejected by the deterministic controller: ${reason}\nReturn a corrected replacement JSON only. Preserve the requested project scope. The controller will normalize declared frontend/backend scaffold paths and direct scaffold dependencies; do not invent risk-flag names.` }]
+        });
+        const requestedTurnId = retry.turn.id;
+        this.store.setThread(task.id, { threadId, turnId: requestedTurnId });
+        this.activeTurns.set(task.id, { taskId: task.id, threadId, turnId: requestedTurnId });
+        this.#lifecycle("planner repair turn started", { taskId: task.id, threadId, turnId: requestedTurnId, attempt: attempt + 1 });
+        const turn = await client.waitForTurn(threadId, requestedTurnId, this.config.router.turnTimeoutMs);
+        const resolvedTurnId = turn.id ?? requestedTurnId;
+        this.#adoptResolvedTurnId(task.id, threadId, resolvedTurnId);
+        this.activeTurns.delete(task.id);
+        if (turn.status !== "completed") throw new Error(`Planner corrective turn did not complete: ${turn.error?.message ?? turn.status}`);
+        resultText = await this.#readAgentResult(client, threadId, resolvedTurnId);
+      }
+    }
+    throw new Error("Planner validation retry loop terminated unexpectedly");
+  }
+
+  async #completeScaffoldWithRepair(client, task, threadId, worktree, initialOverlayContext, initialResultText) {
+    let overlayContext = initialOverlayContext;
+    let resultText = initialResultText;
+    const maxRepairTurns = 2;
+    for (let attempt = 0; attempt <= maxRepairTurns; attempt += 1) {
+      overlayContext = await this.#refreshProjectOverlayFromWorktree(worktree);
+      const missingRoots = (overlayContext.overlay.components ?? []).filter((component) => component.state !== "scaffolded").map((component) => component.root);
+      if (!missingRoots.length) return { overlayContext, resultText };
+      if (attempt === maxRepairTurns) throw new Error(`Scaffold incomplete after ${maxRepairTurns} corrective turns: required product roots are still unscaffolded: ${missingRoots.join(", ")}`);
+      this.#lifecycle("scaffold completion retry", { taskId: task.id, threadId, attempt: attempt + 1, missingRoots });
+      const retry = await client.startTurn({
+        threadId,
+        input: [{ type: "text", text: `The controller verified that this scaffold is incomplete. Missing declared product roots: ${missingRoots.join(", ")}. Work now in the existing worktree and create only the missing runnable roots with their required build/test configuration. Do not return an analysis; verify the files exist, then finish.` }]
+      });
+      const requestedTurnId = retry.turn.id;
+      this.store.setThread(task.id, { threadId, turnId: requestedTurnId });
+      this.activeTurns.set(task.id, { taskId: task.id, threadId, turnId: requestedTurnId });
+      this.#lifecycle("scaffold repair turn started", { taskId: task.id, threadId, turnId: requestedTurnId, attempt: attempt + 1, missingRoots });
+      const turn = await client.waitForTurn(threadId, requestedTurnId, this.config.router.turnTimeoutMs);
+      const resolvedTurnId = turn.id ?? requestedTurnId;
+      this.#adoptResolvedTurnId(task.id, threadId, resolvedTurnId);
+      this.activeTurns.delete(task.id);
+      if (turn.status !== "completed") throw new Error(`Scaffold corrective turn did not complete: ${turn.error?.message ?? turn.status}`);
+      resultText = await this.#readAgentResult(client, threadId, resolvedTurnId);
+    }
+    throw new Error("Scaffold completion retry loop terminated unexpectedly");
+  }
+
+  async #finalizeWriterWithRepair(client, task, threadId, worktree, branch, initialOverlayContext, initialResultText) {
+    let overlayContext = initialOverlayContext;
+    let resultText = initialResultText;
+    const maxRepairTurns = 2;
+    for (let attempt = 0; attempt <= maxRepairTurns; attempt += 1) {
+      try {
+        const finalized = await this.finalizer.finalize({ task, worktree, branch, overlay: overlayContext.overlay, overlayPath: overlayContext.path });
+        return { overlayContext, resultText, finalized };
+      } catch (error) {
+        if (attempt === maxRepairTurns) throw error;
+        const reason = String(error.message).slice(0, 1600);
+        this.#lifecycle("writer verification retry", { taskId: task.id, threadId, attempt: attempt + 1, reason });
+        const retry = await client.startTurn({
+          threadId,
+          input: [{ type: "text", text: `The controller could not finalize your work because deterministic validation failed: ${reason}\nFix this failure now inside the existing worktree. Keep all edits within the assigned allowed paths. Run the required checks. Do not explain or plan; make the correction and finish.` }]
+        });
+        const requestedTurnId = retry.turn.id;
+        this.store.setThread(task.id, { threadId, turnId: requestedTurnId });
+        this.activeTurns.set(task.id, { taskId: task.id, threadId, turnId: requestedTurnId });
+        this.#lifecycle("writer repair turn started", { taskId: task.id, threadId, turnId: requestedTurnId, attempt: attempt + 1 });
+        const turn = await client.waitForTurn(threadId, requestedTurnId, this.config.router.turnTimeoutMs);
+        const resolvedTurnId = turn.id ?? requestedTurnId;
+        this.#adoptResolvedTurnId(task.id, threadId, resolvedTurnId);
+        this.activeTurns.delete(task.id);
+        if (turn.status !== "completed") throw new Error(`Writer corrective turn did not complete: ${turn.error?.message ?? turn.status}`);
+        resultText = await this.#readAgentResult(client, threadId, resolvedTurnId);
+        if (this.#isScaffoldTask(task)) ({ overlayContext, resultText } = await this.#completeScaffoldWithRepair(client, task, threadId, worktree, overlayContext, resultText));
+      }
+    }
+    throw new Error("Writer verification retry loop terminated unexpectedly");
   }
 
   #enforcesLocalBudget() { return this.config.budget?.enforceLocalLimits === true; }
