@@ -16,10 +16,8 @@ import { Integrator } from "./integrator.mjs";
 import { remediationScope, validateQualityGateReport } from "./quality-gate.mjs";
 import { validateSecurityGateReport } from "./security-gate.mjs";
 import { GitHubCiAdapter, GitHubMergeAdapter, GitHubPullRequestAdapter, RemoteAdapterError, RemoteCiAdapter, RemoteGitAdapter } from "./remote-adapters.mjs";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
-
-const exec = promisify(execFile);
+import { runManagedProcess } from "./managed-process-runner.mjs";
+import { provisionDeterministicScaffold } from "./deterministic-scaffold.mjs";
 
 export function formatTaskPrompt({ task, worktree, project, overlaySnapshot = null, documentationAvailable = true }) {
   const lines = [
@@ -81,7 +79,8 @@ export class SwarmRouter extends EventEmitter {
     this.worktrees = new WorktreeManager(config);
     this.threadTasks = new Map();
     this.account = new BudgetAccountAdapter(this.store);
-    this.finalizer = new WorktreeFinalizer({ repository: config.repository, generatedDir: config.project.generatedDir, autonomy: config.autonomy });
+    this.processRunner = config.processRunner ?? runManagedProcess;
+    this.finalizer = new WorktreeFinalizer({ repository: config.repository, generatedDir: config.project.generatedDir, autonomy: config.autonomy, processRunner: this.processRunner });
     this.lifecycleTrace = [];
     this.lastAppServerDiagnostics = null;
     this.lifecyclePath = join(config.runtimeDir, "lifecycle.jsonl");
@@ -90,6 +89,7 @@ export class SwarmRouter extends EventEmitter {
     this.stopRequested = false;
     this.expectedClientShutdown = false;
     this.budgetInterruptedTasks = new Set();
+    this.pendingBudgetWatchdogs = new Set();
     this.activeTurns = new Map();
     this.closed = false;
   }
@@ -118,10 +118,7 @@ export class SwarmRouter extends EventEmitter {
     const active = [...this.activeTurns.values()];
     this.#lifecycle("controller shutdown requested", { reason, activeTurns: active.map(({ taskId, threadId, turnId }) => ({ taskId, threadId, turnId })) });
     if (client) {
-      await Promise.race([
-        Promise.allSettled(active.map(({ threadId, turnId }) => client.interruptTurn({ threadId, turnId }))),
-        new Promise((resolve) => setTimeout(resolve, this.config.delivery?.shutdownGraceMs ?? 3_000))
-      ]);
+      await Promise.allSettled(active.map((turn) => this.#interruptAndAwaitTurn(client, turn, reason, { timeoutMs: this.config.delivery?.shutdownGraceMs ?? 3_000 })));
     }
     this.#markInterrupted(reason, { activeTurns: active.map(({ taskId, threadId, turnId }) => ({ taskId, threadId, turnId })) });
     client?.shutdown();
@@ -271,7 +268,7 @@ export class SwarmRouter extends EventEmitter {
       return artifact;
     });
     const { overlay } = loadProjectOverlay(this.config.repository, this.config.project.generatedDir);
-    const result = await new Integrator(this.config).integrate({ artifacts, overlay });
+    const result = await new Integrator({ ...this.config, processRunner: this.processRunner }).integrate({ artifacts, overlay });
     this.store.recordIntegrationManifest(result.path, result.manifest);
     return result;
   }
@@ -404,6 +401,7 @@ export class SwarmRouter extends EventEmitter {
     this.stopRequested = false;
     this.expectedClientShutdown = false;
     this.budgetInterruptedTasks.clear();
+    this.pendingBudgetWatchdogs.clear();
     this.activeTurns.clear();
     this.activeDeliverySessionId = deliveryRunId ? randomUUID() : null;
     if (deliveryRunId) this.store.claimDeliveryLease(deliveryRunId, { ownerPid: process.pid, ownerSessionId: this.activeDeliverySessionId });
@@ -428,6 +426,9 @@ export class SwarmRouter extends EventEmitter {
       const scheduler = { active: 0, blockedQuota: false, blockedBudget: false, failed: false };
       const workers = Array.from({ length: this.config.router.maxConcurrentTasks }, () => this.#worker(client, scheduler));
       await Promise.all(workers);
+      // Notification handlers are intentionally non-blocking, but a terminal
+      // scheduler result must not race a just-started budget interrupt.
+      await Promise.allSettled([...this.pendingBudgetWatchdogs]);
       return { blockedQuota: scheduler.blockedQuota, blockedBudget: scheduler.blockedBudget || this.budgetInterruptedTasks.size > 0, failed: scheduler.failed, interrupted: this.stopRequested, quota: this.quotaThrottleStatus() };
     } finally {
       if (heartbeat) clearInterval(heartbeat);
@@ -466,7 +467,7 @@ export class SwarmRouter extends EventEmitter {
           this.store.transition(task.id, "failed", { error: detail });
           await this.#failFastAfterTaskFailure(client, scheduler, task.id, detail);
         }
-      } finally { scheduler.active -= 1; }
+      } finally { this.#forgetTaskTurn(task.id); scheduler.active -= 1; }
     }
   }
 
@@ -508,6 +509,11 @@ export class SwarmRouter extends EventEmitter {
     this.store.transition(task.id, "running", { worktree, branch });
     this.store.setRuntimeBudget(task.id, runtimeBudget);
 
+    if (this.#isScaffoldTask(task)) {
+      await this.#runDeterministicScaffold(task, { worktree, branch, overlayContext });
+      return;
+    }
+
     const sourceDir = fileURLToPath(new URL(".", import.meta.url));
     const developerInstructions = this.#developerInstructions(sourceDir, task.role);
     const threadResult = await client.startThread({
@@ -536,17 +542,17 @@ export class SwarmRouter extends EventEmitter {
     const turnResult = await client.startTurn(turnOptions);
     const turnId = turnResult.turn.id;
     this.store.setThread(task.id, { threadId, turnId });
-    this.activeTurns.set(task.id, { taskId: task.id, threadId, turnId });
+    const completion = client.waitForTurn(threadId, turnId, this.config.router.turnTimeoutMs);
+    this.activeTurns.set(task.id, { taskId: task.id, threadId, turnId, completion });
     this.#lifecycle("turn started", { taskId: task.id, threadId, turnId });
-    const watched = this.#isScaffoldTask(task)
-      ? await this.#waitForScaffoldTurn(client, task, threadId, turnId, worktree)
-      : { turn: await client.waitForTurn(threadId, turnId, this.config.router.turnTimeoutMs) };
+    const watched = { turn: await completion };
     const turn = watched.turn;
     const resolvedTurnId = turn.id ?? turnId;
     this.#adoptResolvedTurnId(task.id, threadId, resolvedTurnId);
     this.activeTurns.delete(task.id);
     const current = this.store.getTask(task.id);
-    if (["awaiting_approval", "blocked_budget", "interrupted"].includes(current.status)) return;
+    if (this.budgetInterruptedTasks.has(task.id) && current.status === "running") this.store.transition(task.id, "blocked_budget", { error: "budget_interrupt confirmed before result processing" });
+    if (["awaiting_approval", "blocked_budget", "interrupted"].includes(this.store.getTask(task.id).status)) return;
     if (turn.status === "completed") {
       let resultText = watched.resultText ?? await this.#readAgentResult(client, threadId, resolvedTurnId);
       if (watched.overlayContext) overlayContext = watched.overlayContext;
@@ -581,13 +587,11 @@ export class SwarmRouter extends EventEmitter {
       this.store.setResultPath(task.id, resultPath);
       if (roleConfig.sandbox === "workspace-write") {
         let finalizedArtifact;
-        if (this.#isScaffoldTask(task)) ({ overlayContext, resultText } = await this.#completeScaffoldWithRepair(client, task, threadId, worktree, overlayContext, resultText));
         resultPath = this.#saveAgentResult(task, resultText);
         this.store.setResultPath(task.id, resultPath);
         ({ overlayContext, resultText, finalized: finalizedArtifact } = await this.#finalizeWriterWithRepair(client, task, threadId, worktree, branch, overlayContext, resultText));
         const finalized = finalizedArtifact;
         this.store.recordWorkerArtifact(task.id, finalized.path, finalized.artifact);
-        if (this.#isScaffoldTask(task)) this.#connectScaffoldDependents(task, finalized.artifact);
       }
       this.store.transition(task.id, finalStatusForRole(task.role, { autonomous: this.isAutonomous() }));
       if (task.role === "bootstrap" && this.isAutonomous()) this.#enqueuePlanner(task);
@@ -596,11 +600,59 @@ export class SwarmRouter extends EventEmitter {
     else this.store.transition(task.id, "failed", { error: turn.error?.message ?? "Turn failed" });
   }
 
+  async #interruptAndAwaitTurn(client, { taskId, threadId, turnId }, reason, { timeoutMs = 3_000 } = {}) {
+    if (!client || typeof threadId !== "string" || !threadId || typeof turnId !== "string" || !turnId) {
+      this.#lifecycle("turn interrupt forced client shutdown", { taskId, threadId: threadId ?? null, turnId: turnId ?? null, reason: `${reason}: missing turn identity` });
+      client?.shutdown?.();
+      return { terminal: null, forced: true };
+    }
+    this.#lifecycle("turn interrupt requested", { taskId, threadId, turnId, reason, tokenUsed: this.store.getTask(taskId)?.tokenUsed ?? null });
+    try { await client.interruptTurn({ threadId, turnId }); }
+    catch (error) { this.#lifecycle("turn interrupt request failed", { taskId, threadId, turnId, reason, error: String(error.message).slice(0, 300) }); }
+    let terminal = null;
+    try {
+      const active = taskId ? this.activeTurns.get(taskId) : null;
+      terminal = await Promise.race([
+        active?.completion ?? client.waitForTurn(threadId, turnId, timeoutMs),
+        new Promise((resolve) => setTimeout(() => resolve(null), timeoutMs))
+      ]);
+    } catch { terminal = null; }
+    if (terminal && ["completed", "failed", "interrupted", "cancelled"].includes(terminal.status)) {
+      this.#lifecycle("turn interrupt terminal confirmed", { taskId, threadId, turnId: terminal.id ?? turnId, reason, terminalStatus: terminal.status, tokenUsed: this.store.getTask(taskId)?.tokenUsed ?? null });
+      return { terminal, forced: false };
+    }
+    this.#lifecycle("turn interrupt forced client shutdown", { taskId, threadId, turnId, reason, tokenUsed: this.store.getTask(taskId)?.tokenUsed ?? null });
+    const task = this.store.getTask(taskId);
+    if (task?.status === "running") this.store.transition(taskId, "interrupted", { error: `${reason}: terminal confirmation timed out` });
+    client.shutdown();
+    return { terminal: null, forced: true };
+  }
+
+  #forgetTaskTurn(taskId) {
+    this.activeTurns.delete(taskId);
+    for (const [threadId, mappedTaskId] of this.threadTasks.entries()) if (mappedTaskId === taskId) this.threadTasks.delete(threadId);
+  }
+
+  async #runDeterministicScaffold(task, { worktree, branch, overlayContext }) {
+    if (!worktree || !branch) throw new Error("Deterministic scaffold requires an isolated workspace-write worktree");
+    this.#lifecycle("deterministic scaffold started", { taskId: task.id, worktree });
+    const provision = provisionDeterministicScaffold({ worktree, productRoots: this.config.project.productRoots });
+    const refreshed = await this.#refreshProjectOverlayFromWorktree(worktree);
+    const incomplete = (refreshed.overlay.components ?? []).filter((component) => component.state !== "scaffolded").map((component) => component.root);
+    if (incomplete.length) throw new Error(`Deterministic scaffold did not produce declared component roots: ${incomplete.join(", ")}`);
+    const resultText = `Controller-owned deterministic scaffold completed for ${provision.provisioned.map((item) => `${item.id}:${item.root}`).join(", ")}. No App Server turn was started.`;
+    const resultPath = this.#saveAgentResult(task, resultText);
+    this.store.setResultPath(task.id, resultPath);
+    const finalized = await this.finalizer.finalize({ task, worktree, branch, overlay: refreshed.overlay, overlayPath: refreshed.path });
+    this.store.recordWorkerArtifact(task.id, finalized.path, finalized.artifact);
+    this.#connectScaffoldDependents(task, finalized.artifact);
+    this.store.transition(task.id, finalStatusForRole(task.role, { autonomous: this.isAutonomous() }));
+    this.#lifecycle("deterministic scaffold completed", { taskId: task.id, artifactPath: finalized.path, components: provision.provisioned.map((item) => item.root) });
+  }
+
   #taskPrompt(task, worktree, overlaySnapshot) {
-    const scaffoldRequirement = this.#isScaffoldTask(task) ? "MANDATORY PRODUCT SCAFFOLD: execute the scaffold now in this worktree; do not return an analysis or plan. Create every declared product root: a runnable Next.js frontend with package.json, lockfile, build/test scripts; and an ASP.NET Core Web API solution plus xUnit test project. Verify files exist with git status/diff before finishing. Returning with no changed files is a task failure." : null;
     return [
       formatTaskPrompt({ task, worktree, project: this.config.project, overlaySnapshot, documentationAvailable: existsSync(join(this.config.repository, this.config.project.documentationDir, "inventory.json")) }),
-      scaffoldRequirement,
       this.#structuredOutputContract(task.role),
       "Bounded execution: do only the required scoped work, do not create child agents, avoid long explanations, and return the required structured result. Do not merge, push, modify Router configuration, or bypass approval/sandbox policy."
     ].join("\n");
@@ -623,10 +675,10 @@ export class SwarmRouter extends EventEmitter {
     for (const missing of plan.missing) failed.push({ id: `${missing.component}:declared-verification`, source: "controller", status: "failed", error: missing.reason });
     for (const command of plan.commands) {
       try {
-        await exec(command.executable, command.args, { cwd: commandCwd(worktree, command), timeout: command.timeoutMs ?? 120_000, windowsHide: true });
-        passed.push({ id: command.id, source: "controller", status: "passed" });
+        const result = await runManagedProcess({ executable: command.executable, args: command.args, cwd: commandCwd(worktree, command), timeoutMs: command.timeoutMs ?? 120_000 });
+        passed.push({ id: command.id, source: "controller", status: "passed", pid: result.pid, stdout: result.stdout.slice(-4000), stderr: result.stderr.slice(-4000) });
       } catch (error) {
-        failed.push({ id: command.id, source: "controller", status: "failed", error: String(error.message).slice(0, 500) });
+        failed.push({ id: command.id, source: "controller", status: "failed", error: String(error.message).slice(0, 500), pid: error.pid ?? null, stdout: String(error.stdout ?? "").slice(-4000), stderr: String(error.stderr ?? "").slice(-4000), timedOut: Boolean(error.timedOut) });
       }
     }
     if (!plan.commands.length && !plan.missing.length) notRun.push({ id: "declared-verification", reason: "No changed scaffolded product component requires verification" });
@@ -679,9 +731,10 @@ export class SwarmRouter extends EventEmitter {
         });
         const requestedTurnId = retry.turn.id;
         this.store.setThread(task.id, { threadId, turnId: requestedTurnId });
-        this.activeTurns.set(task.id, { taskId: task.id, threadId, turnId: requestedTurnId });
+        const completion = client.waitForTurn(threadId, requestedTurnId, this.config.router.turnTimeoutMs);
+        this.activeTurns.set(task.id, { taskId: task.id, threadId, turnId: requestedTurnId, completion });
         this.#lifecycle("planner repair turn started", { taskId: task.id, threadId, turnId: requestedTurnId, attempt: attempt + 1 });
-        const turn = await client.waitForTurn(threadId, requestedTurnId, this.config.router.turnTimeoutMs);
+        const turn = await completion;
         const resolvedTurnId = turn.id ?? requestedTurnId;
         this.#adoptResolvedTurnId(task.id, threadId, resolvedTurnId);
         this.activeTurns.delete(task.id);
@@ -690,122 +743,6 @@ export class SwarmRouter extends EventEmitter {
       }
     }
     throw new Error("Planner validation retry loop terminated unexpectedly");
-  }
-
-  async #completeScaffoldWithRepair(client, task, threadId, worktree, initialOverlayContext, initialResultText) {
-    let overlayContext = initialOverlayContext;
-    let resultText = initialResultText;
-    const maxRepairTurns = 2;
-    for (let attempt = 0; attempt <= maxRepairTurns; attempt += 1) {
-      overlayContext = await this.#refreshProjectOverlayFromWorktree(worktree);
-      const missingRoots = (overlayContext.overlay.components ?? []).filter((component) => component.state !== "scaffolded").map((component) => component.root);
-      if (!missingRoots.length) return { overlayContext, resultText };
-      if (attempt === maxRepairTurns) {
-        this.#lifecycle("deterministic scaffold fallback started", { taskId: task.id, missingRoots });
-        await this.#provisionMissingScaffoldRoots(worktree, missingRoots);
-        overlayContext = await this.#refreshProjectOverlayFromWorktree(worktree);
-        const remainingRoots = (overlayContext.overlay.components ?? []).filter((component) => component.state !== "scaffolded").map((component) => component.root);
-        if (!remainingRoots.length) {
-          this.#lifecycle("deterministic scaffold fallback completed", { taskId: task.id, roots: missingRoots });
-          return { overlayContext, resultText: "Controller provisioned the remaining declared product roots with allowlisted stack adapters." };
-        }
-        throw new Error(`Scaffold incomplete after ${maxRepairTurns} corrective turns and deterministic fallback: ${remainingRoots.join(", ")}`);
-      }
-      this.#lifecycle("scaffold completion retry", { taskId: task.id, threadId, attempt: attempt + 1, missingRoots });
-      const retry = await client.startTurn({
-        threadId,
-        input: [{ type: "text", text: `The controller verified that this scaffold is incomplete. Missing declared product roots: ${missingRoots.join(", ")}. Work now in the existing worktree and create only the missing runnable roots with their required build/test configuration. Do not return an analysis; verify the files exist, then finish.` }]
-      });
-      const requestedTurnId = retry.turn.id;
-      this.store.setThread(task.id, { threadId, turnId: requestedTurnId });
-      this.activeTurns.set(task.id, { taskId: task.id, threadId, turnId: requestedTurnId });
-      this.#lifecycle("scaffold repair turn started", { taskId: task.id, threadId, turnId: requestedTurnId, attempt: attempt + 1, missingRoots });
-      const watched = await this.#waitForScaffoldTurn(client, task, threadId, requestedTurnId, worktree);
-      const turn = watched.turn;
-      const resolvedTurnId = turn.id ?? requestedTurnId;
-      this.#adoptResolvedTurnId(task.id, threadId, resolvedTurnId);
-      this.activeTurns.delete(task.id);
-      if (turn.status !== "completed") throw new Error(`Scaffold corrective turn did not complete: ${turn.error?.message ?? turn.status}`);
-      resultText = watched.resultText ?? await this.#readAgentResult(client, threadId, resolvedTurnId);
-      if (watched.overlayContext) overlayContext = watched.overlayContext;
-    }
-    throw new Error("Scaffold completion retry loop terminated unexpectedly");
-  }
-
-  async #provisionMissingScaffoldRoots(worktree, missingRoots) {
-    const configured = new Map((this.config.project.productRoots ?? []).map((component) => [component.path, component]));
-    for (const root of missingRoots) {
-      const component = configured.get(root);
-      if (!component) throw new Error(`No allowlisted scaffold adapter is configured for '${root}'`);
-      if (component.adapter === "next-node") {
-        const packagePath = join(worktree, root, "package.json");
-        if (!/^[A-Za-z0-9_./-]+$/.test(root)) throw new Error(`Unsafe configured Node scaffold path '${root}'`);
-        const runNodePackageCommand = async (cwd, command, timeout) => process.platform === "win32"
-          ? exec(process.env.ComSpec ?? "cmd.exe", ["/d", "/s", "/c", command], { cwd, timeout, windowsHide: true })
-          : exec(command.split(" ")[0], command.split(" ").slice(1), { cwd, timeout, windowsHide: true });
-        if (!existsSync(packagePath)) await runNodePackageCommand(worktree, `npx create-next-app@latest ${root} --ts --eslint --app --src-dir --use-npm --yes`, 300_000);
-        else await runNodePackageCommand(join(worktree, root), "npm install --package-lock-only --ignore-scripts", 180_000);
-        const packageJson = JSON.parse(readFileSync(packagePath, "utf8"));
-        packageJson.scripts ??= {};
-        packageJson.scripts.test ??= "node --test";
-        writeFileSync(packagePath, `${JSON.stringify(packageJson, null, 2)}\n`, "utf8");
-      } else if (component.adapter === "dotnet") {
-        const projectName = String(component.id ?? "Product").replace(/[^A-Za-z0-9]/g, "") || "Product";
-        const solutionPath = join(root, `${projectName}.sln`);
-        const apiPath = join(root, "src", `${projectName}.Api`);
-        const testPath = join(root, "tests", `${projectName}.Api.Tests`);
-        await exec("dotnet", ["new", "sln", "--name", projectName, "--output", root], { cwd: worktree, timeout: 120_000, windowsHide: true });
-        await exec("dotnet", ["new", "webapi", "--name", `${projectName}.Api`, "--output", apiPath, "--no-https"], { cwd: worktree, timeout: 180_000, windowsHide: true });
-        await exec("dotnet", ["new", "xunit", "--name", `${projectName}.Api.Tests`, "--output", testPath], { cwd: worktree, timeout: 180_000, windowsHide: true });
-        await exec("dotnet", ["sln", solutionPath, "add", join(apiPath, `${projectName}.Api.csproj`), join(testPath, `${projectName}.Api.Tests.csproj`)], { cwd: worktree, timeout: 120_000, windowsHide: true });
-        await exec("dotnet", ["add", join(testPath, `${projectName}.Api.Tests.csproj`), "reference", join(apiPath, `${projectName}.Api.csproj`)], { cwd: worktree, timeout: 120_000, windowsHide: true });
-      } else throw new Error(`No production scaffold adapter for '${component.adapter}' at '${root}'`);
-    }
-  }
-
-  async #waitForScaffoldTurn(client, task, threadId, turnId, worktree) {
-    const completion = client.waitForTurn(threadId, turnId, this.config.router.turnTimeoutMs)
-      .then((turn) => ({ type: "turn", turn }), (error) => ({ type: "error", error }));
-    const pollMs = Math.max(250, Number(this.config.router.scaffoldCompletionPollMs ?? 2_000));
-    const partialGraceMs = Math.max(pollMs, Number(this.config.router.scaffoldPartialGraceMs ?? 30_000));
-    const noProgressGraceMs = Math.max(pollMs, Number(this.config.router.scaffoldNoProgressGraceMs ?? 45_000));
-    const startedAt = Date.now();
-    let partialObservedAt = null;
-    let timer;
-    const ready = new Promise((resolve) => {
-      const inspect = async () => {
-        try {
-          const overlayContext = await this.#refreshProjectOverlayFromWorktree(worktree);
-          const components = overlayContext.overlay.components ?? [];
-          if (components.length && components.every((component) => component.state === "scaffolded")) resolve({ type: "ready", overlayContext });
-          const missingRoots = components.filter((component) => component.state !== "scaffolded").map((component) => component.root);
-          if (components.length && missingRoots.length && missingRoots.length < components.length) {
-            partialObservedAt ??= Date.now();
-            if (Date.now() - partialObservedAt >= partialGraceMs) resolve({ type: "partial", overlayContext, missingRoots });
-          } else if (components.length && missingRoots.length === components.length && Date.now() - startedAt >= noProgressGraceMs) {
-            resolve({ type: "no-progress", overlayContext, missingRoots });
-          } else partialObservedAt = null;
-        } catch {
-          // Partial scaffolds are normal while the worker is writing files.
-        }
-      };
-      timer = setInterval(inspect, pollMs);
-      inspect();
-    });
-    const outcome = await Promise.race([completion, ready]);
-    clearInterval(timer);
-    if (outcome.type === "error") throw outcome.error;
-    if (outcome.type === "turn") return { turn: outcome.turn };
-    if (outcome.type === "ready") this.#lifecycle("scaffold accepted from worktree", { taskId: task.id, threadId, turnId, components: outcome.overlayContext.overlay.components.map((component) => component.root) });
-    else this.#lifecycle(outcome.type === "partial" ? "scaffold partial progress interrupted" : "scaffold no-progress interrupted", { taskId: task.id, threadId, turnId, missingRoots: outcome.missingRoots });
-    await client.interruptTurn({ threadId, turnId }).catch(() => {});
-    return {
-      turn: { id: turnId, status: "completed" },
-      resultText: outcome.type === "ready"
-        ? "Scaffold accepted by the controller after all declared product roots were verified in the isolated worktree."
-        : `Scaffold was stopped because declared roots are still missing: ${outcome.missingRoots.join(", ")}. The controller must now create only those roots.`,
-      overlayContext: outcome.overlayContext
-    };
   }
 
   async #finalizeWriterWithRepair(client, task, threadId, worktree, branch, initialOverlayContext, initialResultText) {
@@ -826,15 +763,15 @@ export class SwarmRouter extends EventEmitter {
         });
         const requestedTurnId = retry.turn.id;
         this.store.setThread(task.id, { threadId, turnId: requestedTurnId });
-        this.activeTurns.set(task.id, { taskId: task.id, threadId, turnId: requestedTurnId });
+        const completion = client.waitForTurn(threadId, requestedTurnId, this.config.router.turnTimeoutMs);
+        this.activeTurns.set(task.id, { taskId: task.id, threadId, turnId: requestedTurnId, completion });
         this.#lifecycle("writer repair turn started", { taskId: task.id, threadId, turnId: requestedTurnId, attempt: attempt + 1 });
-        const turn = await client.waitForTurn(threadId, requestedTurnId, this.config.router.turnTimeoutMs);
+        const turn = await completion;
         const resolvedTurnId = turn.id ?? requestedTurnId;
         this.#adoptResolvedTurnId(task.id, threadId, resolvedTurnId);
         this.activeTurns.delete(task.id);
         if (turn.status !== "completed") throw new Error(`Writer corrective turn did not complete: ${turn.error?.message ?? turn.status}`);
         resultText = await this.#readAgentResult(client, threadId, resolvedTurnId);
-        if (this.#isScaffoldTask(task)) ({ overlayContext, resultText } = await this.#completeScaffoldWithRepair(client, task, threadId, worktree, overlayContext, resultText));
       }
     }
     throw new Error("Writer verification retry loop terminated unexpectedly");
@@ -1070,7 +1007,7 @@ export class SwarmRouter extends EventEmitter {
     scheduler.failed = true;
     const active = [...this.activeTurns.values()].filter((item) => item.taskId !== failedTaskId);
     this.#lifecycle("delivery fail-fast", { taskId: failedTaskId, error: String(error).slice(0, 300), interruptedTasks: active.map((item) => item.taskId) });
-    await Promise.allSettled(active.map(({ threadId, turnId }) => client.interruptTurn({ threadId, turnId })));
+    await Promise.allSettled(active.map((turn) => this.#interruptAndAwaitTurn(client, turn, "delivery_fail_fast", { timeoutMs: this.config.delivery?.shutdownGraceMs ?? 3_000 })));
   }
 
   #connectScaffoldDependents(scaffoldTask, artifact) {
@@ -1100,14 +1037,18 @@ export class SwarmRouter extends EventEmitter {
     if (message.method !== "thread/tokenUsage/updated") return;
     const taskId = this.threadTasks.get(message.params.threadId);
     if (!taskId) return;
+    if (this.store.getTask(taskId)?.status !== "running") return;
     // App Server may acknowledge turn/start with a client-facing ID and later
     // emit lifecycle events for its canonical turn ID. Budget interruption must
     // target the canonical ID, otherwise the upstream turn keeps running.
     this.#adoptResolvedTurnId(taskId, message.params.threadId, message.params.turnId);
     const reportedTokenUsed = this.governor.normalizeUsage(message.params);
-    this.store.setTokenUsage(taskId, reportedTokenUsed);
+    this.store.setTokenUsage(taskId, reportedTokenUsed, { source: "turn_last" });
     const tokenUsed = this.store.getTask(taskId)?.tokenUsed ?? reportedTokenUsed;
-    this.#enforceUsageBudget(taskId, tokenUsed).catch((error) => this.#lifecycle("budget watchdog failed", { taskId, error: String(error.message).slice(0, 300) }));
+    const watchdog = this.#enforceUsageBudget(taskId, tokenUsed)
+      .catch((error) => this.#lifecycle("budget watchdog failed", { taskId, error: String(error.message).slice(0, 300) }))
+      .finally(() => this.pendingBudgetWatchdogs.delete(watchdog));
+    this.pendingBudgetWatchdogs.add(watchdog);
   }
 
   #adoptResolvedTurnId(taskId, threadId, resolvedTurnId) {
@@ -1116,7 +1057,10 @@ export class SwarmRouter extends EventEmitter {
     if (!task || task.threadId !== threadId || task.turnId === resolvedTurnId) return task;
     const requestedTurnId = task.turnId;
     this.store.setThread(taskId, { threadId, turnId: resolvedTurnId });
-    if (this.activeTurns.has(taskId)) this.activeTurns.set(taskId, { taskId, threadId, turnId: resolvedTurnId });
+    if (this.activeTurns.has(taskId)) {
+      const active = this.activeTurns.get(taskId);
+      this.activeTurns.set(taskId, { ...active, taskId, threadId, turnId: resolvedTurnId });
+    }
     this.#lifecycle("turn id alias resolved", { taskId, threadId, requestedTurnId, resolvedTurnId });
     return this.store.getTask(taskId);
   }
@@ -1135,11 +1079,9 @@ export class SwarmRouter extends EventEmitter {
       reason: "budget_interrupt"
     });
     this.#lifecycle("budget interrupt requested", { taskId, threadId: task.threadId, turnId: task.turnId, actualTokens, threshold, configuredCap: task.configuredBudgetCap ?? task.tokenBudget, overshoot: interruption.capOvershootTokens });
-    // Persist terminal state before requesting the best-effort upstream interrupt;
-    // late token notifications can therefore only enrich the recorded overshoot.
-    this.store.transition(taskId, "blocked_budget", { error: `budget_interrupt: actual ${actualTokens}, threshold ${threshold}, configured cap ${task.configuredBudgetCap ?? task.tokenBudget}` });
+    const confirmation = await this.#interruptAndAwaitTurn(this.activeClient, { taskId, threadId: task.threadId, turnId: task.turnId }, "budget_interrupt", { timeoutMs: this.config.delivery?.shutdownGraceMs ?? 3_000 });
+    if (this.store.getTask(taskId)?.status === "running") this.store.transition(taskId, "blocked_budget", { error: `budget_interrupt: actual ${actualTokens}, threshold ${threshold}, configured cap ${task.configuredBudgetCap ?? task.tokenBudget}${confirmation.forced ? "; forced client shutdown" : ""}` });
     if (task.deliveryRunId) this.store.updateDeliveryRun(task.deliveryRunId, { state: "blocked_budget", publish: { reason: "budget_interrupt", taskId, interruption, recovery: { action: "Inspect persisted budget interruption and begin a fresh delivery run after increasing limits or reducing scope." } } });
-    await this.activeClient?.interruptTurn({ threadId: task.threadId, turnId: task.turnId });
   }
 
   #onProtocolEvent(event) {
@@ -1179,7 +1121,7 @@ export class SwarmRouter extends EventEmitter {
   #onServerRequest(client, message) {
     const taskId = this.threadTasks.get(message.params?.threadId);
     if (!taskId) {
-      if (message.params?.threadId && message.params?.turnId) client.interruptTurn({ threadId: message.params.threadId, turnId: message.params.turnId }).catch(() => {});
+      if (message.params?.threadId && message.params?.turnId) this.#interruptAndAwaitTurn(client, { taskId: null, threadId: message.params.threadId, turnId: message.params.turnId }, "unexpected_unowned_turn", { timeoutMs: this.config.delivery?.shutdownGraceMs ?? 3_000 }).catch(() => {});
       return;
     }
     this.store.recordApproval({ requestId: message.id, taskId, method: message.method, payload: message.params, decision: "deny" });
@@ -1191,7 +1133,7 @@ export class SwarmRouter extends EventEmitter {
     } else if (message.method === "item/permissions/requestApproval") {
       client.respond(message.id, { permissions: {}, scope: "turn" });
     } else {
-      client.interruptTurn({ threadId: message.params?.threadId, turnId: message.params?.turnId }).catch(() => {});
+      this.#interruptAndAwaitTurn(client, { taskId, threadId: message.params?.threadId, turnId: message.params?.turnId }, "unexpected_approval", { timeoutMs: this.config.delivery?.shutdownGraceMs ?? 3_000 }).catch(() => {});
     }
   }
 

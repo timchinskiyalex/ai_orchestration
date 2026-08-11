@@ -2,155 +2,78 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DeliveryCoordinator } from "../src/delivery-coordinator.mjs";
 import { SwarmRouter } from "../src/router.mjs";
 
 const git = (cwd, args) => execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8" }).trim();
-const packageJson = () => JSON.stringify({ packageManager: "npm@10", scripts: { build: "node -e \"\"", test: "node -e \"\"" } });
+const productRoots = [{ id: "frontend", path: "frontend", adapter: "next-node" }, { id: "backend", path: "backend", adapter: "dotnet" }];
+const fakeProcessRunner = async ({ executable, args }) => ({ pid: 4242, executable, args, stdout: "deterministic verification passed", stderr: "", code: 0, signal: null });
 
-class ScaffoldRepairClient extends EventEmitter {
-  constructor() { super(); this.next = 0; this.threads = new Map(); this.scaffoldTurns = 0; }
-  async connect() {} shutdown() {} diagnostics() { return { protocolEvents: [], stderrTail: "", process: {} }; }
+class DeterministicLifecycleClient extends EventEmitter {
+  constructor() { super(); this.next = 0; this.threads = new Map(); this.scaffoldTurnStarts = 0; this.activeWriters = 0; this.maxActiveWriters = 0; this.writerBarrier = []; }
+  async connect() {}
+  shutdown() {}
+  diagnostics() { return { protocolEvents: [], stderrTail: "", process: {} }; }
   async request(method) { return method === "account/read" ? { account: {} } : method === "account/usage/read" ? { dailyUsageBuckets: [] } : { rateLimits: null }; }
   async startThread({ cwd }) { const id = `thread-${++this.next}`; this.threads.set(id, { cwd, goal: "", turns: 0 }); return { thread: { id } }; }
   async setGoal({ threadId, objective }) { this.threads.get(threadId).goal = objective; }
-  async startTurn({ threadId }) { const thread = this.threads.get(threadId); thread.turns += 1; return { turn: { id: `${threadId}-turn-${thread.turns}` } }; }
+  async startTurn({ threadId }) { const thread = this.threads.get(threadId); thread.turns += 1; if (/^Scaffold product roots\n\n/.test(thread.goal)) this.scaffoldTurnStarts += 1; return { turn: { id: `${threadId}-turn-${thread.turns}` } }; }
   async waitForTurn(threadId, turnId) {
     const thread = this.threads.get(threadId);
-    if (/^Scaffold product roots/.test(thread.goal)) {
-      this.scaffoldTurns += 1;
-      const root = this.scaffoldTurns === 1 ? "frontend" : "admin";
-      mkdirSync(join(thread.cwd, root), { recursive: true });
-      writeFileSync(join(thread.cwd, root, "package.json"), packageJson());
-      writeFileSync(join(thread.cwd, root, "package-lock.json"), "{}");
+    const writer = /^Build (frontend|backend) feature/.test(thread.goal);
+    if (writer) {
+      this.activeWriters += 1; this.maxActiveWriters = Math.max(this.maxActiveWriters, this.activeWriters);
+      if (this.activeWriters >= 2) { for (const release of this.writerBarrier.splice(0)) release(); }
+      else await Promise.race([new Promise((resolve) => this.writerBarrier.push(resolve)), new Promise((resolve) => setTimeout(resolve, 2_000))]);
+      if (/frontend/.test(thread.goal)) writeFileSync(join(thread.cwd, "frontend", "app", "feature.tsx"), "export const feature = true;\n");
+      else writeFileSync(join(thread.cwd, "backend", "src", "Backend.Api", "Feature.cs"), "namespace Backend.Api; public static class Feature { public const bool Enabled = true; }\n");
+      this.activeWriters -= 1;
     }
     return { id: turnId, status: "completed" };
   }
   async readThread({ threadId }) {
-    const thread = this.threads.get(threadId);
-    const text = /^Bootstrap/.test(thread.goal)
+    const goal = this.threads.get(threadId).goal;
+    const text = /^Bootstrap/.test(goal)
       ? "```json\n{\"summary\":\"ok\",\"assumptions\":[],\"risks\":[],\"humanGates\":[]}\n```"
-      : /^Plan /.test(thread.goal)
-        ? "```json\n{\"tasks\":[{\"id\":\"scaffold-product\",\"title\":\"Scaffold product roots\",\"prompt\":\"Create every root\",\"primaryDomain\":\"devops\",\"supportingDomains\":[\"security\"],\"riskFlags\":[\"dependency_supply_chain\"],\"humanApprovalRequired\":false,\"estimatedTokens\":20,\"dependsOn\":[],\"allowedPaths\":[\"frontend\"],\"acceptanceChecks\":[\"roots exist\"]}]}\n```"
-        : /^Security review:/.test(thread.goal)
+      : /^Plan /.test(goal)
+        ? "```json\n{\"tasks\":[{\"id\":\"scaffold-product\",\"title\":\"Scaffold product roots\",\"prompt\":\"Create every declared product root\",\"primaryDomain\":\"devops\",\"supportingDomains\":[],\"riskFlags\":[],\"humanApprovalRequired\":false,\"estimatedTokens\":20,\"dependsOn\":[],\"allowedPaths\":[\"frontend\",\"backend\"],\"acceptanceChecks\":[\"roots exist\"]},{\"id\":\"frontend-feature\",\"title\":\"Build frontend feature\",\"prompt\":\"Create frontend feature\",\"primaryDomain\":\"frontend\",\"supportingDomains\":[],\"riskFlags\":[],\"humanApprovalRequired\":false,\"estimatedTokens\":20,\"dependsOn\":[\"scaffold-product\"],\"allowedPaths\":[\"frontend\"],\"acceptanceChecks\":[\"feature exists\"]},{\"id\":\"backend-feature\",\"title\":\"Build backend feature\",\"prompt\":\"Create backend feature\",\"primaryDomain\":\"backend\",\"supportingDomains\":[],\"riskFlags\":[],\"humanApprovalRequired\":false,\"estimatedTokens\":20,\"dependsOn\":[\"scaffold-product\"],\"allowedPaths\":[\"backend\"],\"acceptanceChecks\":[\"feature exists\"]}]}\n```"
+        : /^Security review:/.test(goal) || /^QA:/.test(goal)
           ? "```json\n{\"verdict\":\"pass\",\"summary\":\"ok\",\"findings\":[],\"executedChecks\":[],\"notRunChecks\":[]}\n```"
-          : /^QA:/.test(thread.goal)
-            ? "```json\n{\"verdict\":\"pass\",\"summary\":\"ok\",\"findings\":[],\"executedChecks\":[],\"notRunChecks\":[]}\n```"
-            : "scaffold complete";
+          : "writer complete";
+    const thread = this.threads.get(threadId);
     return { thread: { turns: [{ id: `${threadId}-turn-${thread.turns}`, items: [{ type: "agentMessage", text }] }] } };
   }
 }
 
-class HangingCompleteScaffoldClient extends ScaffoldRepairClient {
-  constructor() { super(); this.interrupts = 0; }
-  async waitForTurn(threadId, turnId) {
-    const thread = this.threads.get(threadId);
-    if (/^Scaffold product roots/.test(thread.goal)) {
-      for (const root of ["frontend", "admin"]) {
-        mkdirSync(join(thread.cwd, root), { recursive: true });
-        writeFileSync(join(thread.cwd, root, "package.json"), packageJson());
-        writeFileSync(join(thread.cwd, root, "package-lock.json"), "{}");
-      }
-      return new Promise(() => {});
-    }
-    return { id: turnId, status: "completed" };
-  }
-  async interruptTurn() { this.interrupts += 1; return {}; }
+function configuration(root, client) {
+  const roles = Object.fromEntries(["bootstrap", "planner", "backend", "frontend", "database", "qa", "security", "devops"].map((role) => [role, { sandbox: ["backend", "frontend", "devops"].includes(role) ? "workspace-write" : "read-only", approvalPolicy: "never", tokenBudget: 100, interruptThresholdTokens: 80, usesWorktree: ["backend", "frontend", "devops"].includes(role) }]));
+  return { repository: root, runtimeDir: join(root, "runtime"), baseRef: "main", model: "fake", processRunner: fakeProcessRunner, project: { name: "deterministic-greenfield", documentationDir: "docs/orchestration-input", generatedDir: "docs/orchestration-generated", productRoots }, router: { maxConcurrentTasks: 3, maxChildrenPerTask: 20, maxDelegationDepth: 5, maxPlanTasks: 8, defaultParentBudget: 1000, turnTimeoutMs: 1000, approvalMode: "deny" }, autonomy: { mode: "autonomous", autoApproveWorkflowGates: true, autoRemediate: true, autoPush: true, autoCreatePullRequest: true, autoMerge: true, maxRemediationRounds: 2 }, budget: { weeklyTokenLimit: 10000, weeklyWindowDays: 7, hardRunTokenLimit: 5000, interruptSafetyMarginTokens: 20, enforceLocalLimits: true }, quota: { throttleAtUsedPercent: 90, throttleWhenUnavailable: false }, delivery: { maxRemediationRounds: 2, leaseHeartbeatMs: 250, staleLeaseMs: 250, shutdownGraceMs: 250 }, remote: { enabled: true, remoteName: "origin", allowedRemotes: ["origin"], candidateBranchPrefix: "swarm/candidate/", requireCi: true, mergeMethod: "merge" }, roles, appServerClientFactory: () => client };
 }
 
-class HangingPartialScaffoldClient extends ScaffoldRepairClient {
-  constructor() { super(); this.interrupts = 0; }
-  async waitForTurn(threadId, turnId) {
-    const thread = this.threads.get(threadId);
-    if (/^Scaffold product roots/.test(thread.goal)) {
-      const root = thread.turns === 1 ? "frontend" : "admin";
-      mkdirSync(join(thread.cwd, root), { recursive: true });
-      writeFileSync(join(thread.cwd, root, "package.json"), packageJson());
-      writeFileSync(join(thread.cwd, root, "package-lock.json"), "{}");
-      if (thread.turns === 1) return new Promise(() => {});
-    }
-    return { id: turnId, status: "completed" };
-  }
-  async interruptTurn() { this.interrupts += 1; return {}; }
-}
-
-class HangingNoProgressScaffoldClient extends ScaffoldRepairClient {
-  constructor() { super(); this.interrupts = 0; }
-  async waitForTurn(threadId, turnId) {
-    const thread = this.threads.get(threadId);
-    if (/^Scaffold product roots/.test(thread.goal)) {
-      if (thread.turns === 1) return new Promise(() => {});
-      for (const root of ["frontend", "admin"]) {
-        mkdirSync(join(thread.cwd, root), { recursive: true });
-        writeFileSync(join(thread.cwd, root, "package.json"), packageJson());
-        writeFileSync(join(thread.cwd, root, "package-lock.json"), "{}");
-      }
-    }
-    return { id: turnId, status: "completed" };
-  }
-  async interruptTurn() { this.interrupts += 1; return {}; }
-}
-
-test("incomplete scaffold is repaired in its existing worker thread and finalizes one artifact", async () => {
-  const root = mkdtempSync(join(tmpdir(), "scaffold-repair-")); const source = join(root, "requirements"); const client = new ScaffoldRepairClient(); let router;
+test("deterministic scaffold creates a WorkerArtifact before two dependent writers run in parallel", async () => {
+  const root = mkdtempSync(join(tmpdir(), "deterministic-scaffold-")); const source = join(root, "requirements"); const client = new DeterministicLifecycleClient(); let router;
   try {
-    git(root, ["init", "-b", "main"]); mkdirSync(source); writeFileSync(join(source, "spec.md"), "# Product\nScaffold both roots."); writeFileSync(join(root, "package.json"), packageJson()); writeFileSync(join(root, "package-lock.json"), "{}"); git(root, ["add", "."]); git(root, ["-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "base"]);
-    const roles = Object.fromEntries(["bootstrap", "planner", "backend", "frontend", "database", "qa", "security", "devops"].map((role) => [role, { sandbox: role === "devops" ? "workspace-write" : "read-only", approvalPolicy: "never", tokenBudget: 100, usesWorktree: role === "devops" }]));
-    router = new SwarmRouter({ repository: root, runtimeDir: join(root, "runtime"), baseRef: "main", model: "fake", project: { name: "repair", documentationDir: "docs/orchestration-input", generatedDir: "docs/orchestration-generated", productRoots: [{ id: "frontend", path: "frontend", adapter: "next-node" }, { id: "admin", path: "admin", adapter: "next-node" }] }, router: { maxConcurrentTasks: 2, maxChildrenPerTask: 20, maxDelegationDepth: 5, maxPlanTasks: 5, defaultParentBudget: 1000, turnTimeoutMs: 1000, approvalMode: "deny" }, autonomy: { mode: "autonomous", autoApproveWorkflowGates: true, autoRemediate: true, autoPush: false, autoCreatePullRequest: false, autoMerge: false, maxRemediationRounds: 2 }, budget: { weeklyTokenLimit: 10000, weeklyWindowDays: 7, enforceLocalLimits: false }, quota: { throttleAtUsedPercent: 90, throttleWhenUnavailable: false }, delivery: { maxRemediationRounds: 2 }, remote: { enabled: false, remoteName: "origin", allowedRemotes: ["origin"], candidateBranchPrefix: "swarm/candidate/", requireCi: false, mergeMethod: "merge" }, roles, appServerClientFactory: () => client });
-    await new DeliveryCoordinator(router).begin({ source });
+    git(root, ["init", "-b", "main"]); mkdirSync(source); writeFileSync(join(source, "spec.md"), "# Product\nCreate frontend and backend."); writeFileSync(join(root, "package.json"), JSON.stringify({ name: "controller-only" })); git(root, ["add", "."]); git(root, ["-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "base"]);
+    router = new SwarmRouter(configuration(root, client));
+    const run = await new DeliveryCoordinator(router).begin({ source,
+      remoteGitAdapter: { async pushCandidate() { return { status: "pushed" }; } },
+      pullRequestAdapter: { async ensurePullRequest() { return { status: "open", number: 1, url: "https://example.test/pr/1" }; } },
+      remoteCiAdapter: { async waitForChecks() { return { status: "passed", checkRuns: [] }; } },
+      mergeAdapter: { async merge() { return { status: "merged", mainSha: "a".repeat(40), mergeSha: "a".repeat(40) }; } }
+    });
     const scaffold = router.list().find((task) => task.title === "Scaffold product roots");
-    assert.equal(scaffold.status, "done");
-    assert.match(scaffold.prompt, /Controller-owned scaffold contract/);
-    assert.doesNotMatch(scaffold.prompt, /Create every root/);
-    assert.equal(client.scaffoldTurns, 2);
+    assert.equal(run.state, "completed_merged");
+    assert.equal(client.scaffoldTurnStarts, 0, "the App Server never receives a scaffold turn");
     assert.ok(router.store.workerArtifact(scaffold.id));
-    assert.equal(router.lifecycleEvents().some((event) => event.type === "scaffold completion retry"), true);
-  } finally { router?.close(); rmSync(root, { recursive: true, force: true }); }
-});
-
-test("controller finalizes a verified scaffold even when the App Server worker never completes its turn", async () => {
-  const root = mkdtempSync(join(tmpdir(), "scaffold-watchdog-")); const source = join(root, "requirements"); const client = new HangingCompleteScaffoldClient(); let router;
-  try {
-    git(root, ["init", "-b", "main"]); mkdirSync(source); writeFileSync(join(source, "spec.md"), "# Product\nScaffold both roots."); writeFileSync(join(root, "package.json"), packageJson()); writeFileSync(join(root, "package-lock.json"), "{}"); git(root, ["add", "."]); git(root, ["-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "base"]);
-    const roles = Object.fromEntries(["bootstrap", "planner", "backend", "frontend", "database", "qa", "security", "devops"].map((role) => [role, { sandbox: role === "devops" ? "workspace-write" : "read-only", approvalPolicy: "never", tokenBudget: 100, usesWorktree: role === "devops" }]));
-    router = new SwarmRouter({ repository: root, runtimeDir: join(root, "runtime"), baseRef: "main", model: "fake", project: { name: "watchdog", documentationDir: "docs/orchestration-input", generatedDir: "docs/orchestration-generated", productRoots: [{ id: "frontend", path: "frontend", adapter: "next-node" }, { id: "admin", path: "admin", adapter: "next-node" }] }, router: { maxConcurrentTasks: 2, maxChildrenPerTask: 20, maxDelegationDepth: 5, maxPlanTasks: 5, defaultParentBudget: 1000, turnTimeoutMs: 5000, scaffoldCompletionPollMs: 250, approvalMode: "deny" }, autonomy: { mode: "autonomous", autoApproveWorkflowGates: true, autoRemediate: true, autoPush: false, autoCreatePullRequest: false, autoMerge: false, maxRemediationRounds: 2 }, budget: { weeklyTokenLimit: 10000, weeklyWindowDays: 7, enforceLocalLimits: false }, quota: { throttleAtUsedPercent: 90, throttleWhenUnavailable: false }, delivery: { maxRemediationRounds: 2 }, remote: { enabled: false, remoteName: "origin", allowedRemotes: ["origin"], candidateBranchPrefix: "swarm/candidate/", requireCi: false, mergeMethod: "merge" }, roles, appServerClientFactory: () => client });
-    await new DeliveryCoordinator(router).begin({ source });
-    const scaffold = router.list().find((task) => task.title === "Scaffold product roots");
-    assert.equal(scaffold.status, "done");
-    assert.equal(client.interrupts, 1);
-    assert.ok(router.store.workerArtifact(scaffold.id));
-    assert.equal(router.lifecycleEvents().some((event) => event.type === "scaffold accepted from worktree"), true);
-  } finally { router?.close(); rmSync(root, { recursive: true, force: true }); }
-});
-
-test("controller interrupts partial scaffold progress and corrects only the missing root in the same thread", async () => {
-  const root = mkdtempSync(join(tmpdir(), "scaffold-partial-watchdog-")); const source = join(root, "requirements"); const client = new HangingPartialScaffoldClient(); let router;
-  try {
-    git(root, ["init", "-b", "main"]); mkdirSync(source); writeFileSync(join(source, "spec.md"), "# Product\nScaffold both roots."); writeFileSync(join(root, "package.json"), packageJson()); writeFileSync(join(root, "package-lock.json"), "{}"); git(root, ["add", "."]); git(root, ["-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "base"]);
-    const roles = Object.fromEntries(["bootstrap", "planner", "backend", "frontend", "database", "qa", "security", "devops"].map((role) => [role, { sandbox: role === "devops" ? "workspace-write" : "read-only", approvalPolicy: "never", tokenBudget: 100, usesWorktree: role === "devops" }]));
-    router = new SwarmRouter({ repository: root, runtimeDir: join(root, "runtime"), baseRef: "main", model: "fake", project: { name: "partial-watchdog", documentationDir: "docs/orchestration-input", generatedDir: "docs/orchestration-generated", productRoots: [{ id: "frontend", path: "frontend", adapter: "next-node" }, { id: "admin", path: "admin", adapter: "next-node" }] }, router: { maxConcurrentTasks: 2, maxChildrenPerTask: 20, maxDelegationDepth: 5, maxPlanTasks: 5, defaultParentBudget: 1000, turnTimeoutMs: 5000, scaffoldCompletionPollMs: 250, scaffoldPartialGraceMs: 250, approvalMode: "deny" }, autonomy: { mode: "autonomous", autoApproveWorkflowGates: true, autoRemediate: true, autoPush: false, autoCreatePullRequest: false, autoMerge: false, maxRemediationRounds: 2 }, budget: { weeklyTokenLimit: 10000, weeklyWindowDays: 7, enforceLocalLimits: false }, quota: { throttleAtUsedPercent: 90, throttleWhenUnavailable: false }, delivery: { maxRemediationRounds: 2 }, remote: { enabled: false, remoteName: "origin", allowedRemotes: ["origin"], candidateBranchPrefix: "swarm/candidate/", requireCi: false, mergeMethod: "merge" }, roles, appServerClientFactory: () => client });
-    await new DeliveryCoordinator(router).begin({ source });
-    const scaffold = router.list().find((task) => task.title === "Scaffold product roots");
-    assert.equal(scaffold.status, "done");
-    assert.equal(client.interrupts, 1);
-    assert.equal(client.scaffoldTurns, 0);
-    assert.equal(router.lifecycleEvents().some((event) => event.type === "scaffold partial progress interrupted"), true);
-  } finally { router?.close(); rmSync(root, { recursive: true, force: true }); }
-});
-
-test("controller interrupts a no-progress scaffold turn and retries in the same thread", async () => {
-  const root = mkdtempSync(join(tmpdir(), "scaffold-no-progress-watchdog-")); const source = join(root, "requirements"); const client = new HangingNoProgressScaffoldClient(); let router;
-  try {
-    git(root, ["init", "-b", "main"]); mkdirSync(source); writeFileSync(join(source, "spec.md"), "# Product\nScaffold both roots."); writeFileSync(join(root, "package.json"), packageJson()); writeFileSync(join(root, "package-lock.json"), "{}"); git(root, ["add", "."]); git(root, ["-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "base"]);
-    const roles = Object.fromEntries(["bootstrap", "planner", "backend", "frontend", "database", "qa", "security", "devops"].map((role) => [role, { sandbox: role === "devops" ? "workspace-write" : "read-only", approvalPolicy: "never", tokenBudget: 100, usesWorktree: role === "devops" }]));
-    router = new SwarmRouter({ repository: root, runtimeDir: join(root, "runtime"), baseRef: "main", model: "fake", project: { name: "no-progress-watchdog", documentationDir: "docs/orchestration-input", generatedDir: "docs/orchestration-generated", productRoots: [{ id: "frontend", path: "frontend", adapter: "next-node" }, { id: "admin", path: "admin", adapter: "next-node" }] }, router: { maxConcurrentTasks: 2, maxChildrenPerTask: 20, maxDelegationDepth: 5, maxPlanTasks: 5, defaultParentBudget: 1000, turnTimeoutMs: 5000, scaffoldCompletionPollMs: 250, scaffoldNoProgressGraceMs: 250, approvalMode: "deny" }, autonomy: { mode: "autonomous", autoApproveWorkflowGates: true, autoRemediate: true, autoPush: false, autoCreatePullRequest: false, autoMerge: false, maxRemediationRounds: 2 }, budget: { weeklyTokenLimit: 10000, weeklyWindowDays: 7, enforceLocalLimits: false }, quota: { throttleAtUsedPercent: 90, throttleWhenUnavailable: false }, delivery: { maxRemediationRounds: 2 }, remote: { enabled: false, remoteName: "origin", allowedRemotes: ["origin"], candidateBranchPrefix: "swarm/candidate/", requireCi: false, mergeMethod: "merge" }, roles, appServerClientFactory: () => client });
-    await new DeliveryCoordinator(router).begin({ source });
-    const scaffold = router.list().find((task) => task.title === "Scaffold product roots");
-    assert.equal(scaffold.status, "done");
-    assert.equal(client.interrupts, 1);
-    assert.equal(router.lifecycleEvents().some((event) => event.type === "scaffold no-progress interrupted"), true);
+    assert.equal(existsSync(join(scaffold.worktree, "frontend", "package.json")), true);
+    assert.equal(existsSync(join(scaffold.worktree, "backend", "Backend.sln")), true);
+    assert.equal(existsSync(join(scaffold.worktree, "backend", "src", "Backend.Api", "Backend.Api.csproj")), true);
+    assert.ok(client.maxActiveWriters >= 2, "independent writers overlap after the artifact is finalized");
+    const writers = router.list().filter((task) => ["Build frontend feature", "Build backend feature"].includes(task.title));
+    assert.equal(writers.every((task) => task.dependencies.includes(scaffold.id) && task.status === "done" && router.store.workerArtifact(task.id)), true);
+    assert.ok(router.lifecycleEvents().some((event) => event.type === "deterministic scaffold completed"));
   } finally { router?.close(); rmSync(root, { recursive: true, force: true }); }
 });

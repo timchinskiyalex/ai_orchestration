@@ -14,7 +14,9 @@ test("generated App Server schema contains the protocol methods used by the clie
   for (const field of ["threadId", "turn", "includeTurns", "turns"]) assert.equal(schema.includes(field), true, `missing lifecycle schema field ${field}`);
   const startParams = readFileSync(join(schemaPath, "v2", "TurnStartParams.json"), "utf8");
   const interruptParams = readFileSync(join(schemaPath, "v2", "TurnInterruptParams.json"), "utf8");
+  const tokenUsage = readFileSync(join(schemaPath, "v2", "ThreadTokenUsageUpdatedNotification.json"), "utf8");
   assert.equal(startParams.includes('"maxTokens"'), false, "turn/start must not use an invented server-side max-token field");
   assert.equal(startParams.includes('"max_tokens"'), false, "turn/start must not use an invented server-side max-token field");
   for (const field of ["threadId", "turnId"]) assert.equal(interruptParams.includes(`"${field}"`), true, `turn/interrupt missing ${field}`);
+  for (const field of ["last", "total", "totalTokens"]) assert.equal(tokenUsage.includes(`"${field}"`), true, `thread/tokenUsage payload missing ${field}`);
 });

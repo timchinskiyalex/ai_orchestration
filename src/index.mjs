@@ -98,6 +98,10 @@ try {
         const stage = {
           "thread started": "task started",
           "turn started": "turn started",
+          "deterministic scaffold started": "scaffold started",
+          "deterministic scaffold completed": "scaffold completed",
+          "planner repair turn started": "planner remediation started",
+          "writer repair turn started": "writer remediation started",
           "turn completed": "turn completed",
           "token usage updated": "usage update",
           "budget interrupt requested": "budget interrupt",

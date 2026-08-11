@@ -6,6 +6,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { validateWorkerArtifact } from "./worktree-finalizer.mjs";
 import { commandCwd, commandsForPaths } from "./project-overlay.mjs";
+import { runManagedProcess } from "./managed-process-runner.mjs";
 
 const exec = promisify(execFile);
 const toPosix = (value) => value.replace(/\\/g, "/");
@@ -17,7 +18,7 @@ const sensitiveArea = (path) => /(^|\/)(migrations?|infra|terraform|k8s|helm|\.g
 const checksum = (value) => createHash("sha256").update(value).digest("hex");
 
 export class Integrator {
-  constructor({ repository, runtimeDir, generatedDir, project = {}, integration = {} }) {
+  constructor({ repository, runtimeDir, generatedDir, project = {}, integration = {}, processRunner = runManagedProcess }) {
     this.repository = repository;
     this.runtimeDir = runtimeDir;
     // Router owns generatedDir under the project contract, while direct callers
@@ -26,6 +27,7 @@ export class Integrator {
     this.generatedDir = generatedDir ?? project.generatedDir;
     if (!this.generatedDir) throw new Error("Integrator requires project.generatedDir");
     this.integration = integration;
+    this.processRunner = processRunner;
   }
 
   async integrate({ artifacts, overlay }) {
@@ -83,8 +85,8 @@ export class Integrator {
       const verificationPlan = commandsForPaths(overlay, (overlay.components ?? []).filter((component) => component.state === "scaffolded").map((component) => component.root));
       if (verificationPlan.missing.length) return this.#blocked(overlay, sorted, "CONFLICT_BLOCKED: integration verification unavailable for a scaffolded component", { id, branch, worktree, applied, verificationResults });
       for (const command of verificationPlan.commands) {
-        try { const result = await exec(command.executable, command.args, { cwd: commandCwd(worktree, command), timeout: command.timeoutMs ?? 120_000, windowsHide: true }); verificationResults.push({ id: command.id, status: "passed", stdout: result.stdout.slice(-4000), stderr: result.stderr.slice(-4000) }); }
-        catch (error) { verificationResults.push({ id: command.id, status: "failed", error: error.message }); return this.#blocked(overlay, sorted, `CONFLICT_BLOCKED: integration verification failed (${command.id})`, { id, branch, worktree, applied, verificationResults }); }
+        try { const result = await this.processRunner({ executable: command.executable, args: command.args, cwd: commandCwd(worktree, command), timeoutMs: command.timeoutMs ?? 120_000 }); verificationResults.push({ id: command.id, status: "passed", pid: result.pid, stdout: result.stdout.slice(-4000), stderr: result.stderr.slice(-4000) }); }
+        catch (error) { verificationResults.push({ id: command.id, status: "failed", error: error.message, pid: error.pid ?? null, timedOut: Boolean(error.timedOut), stdout: String(error.stdout ?? "").slice(-4000), stderr: String(error.stderr ?? "").slice(-4000) }); return this.#blocked(overlay, sorted, `CONFLICT_BLOCKED: integration verification failed (${command.id})`, { id, branch, worktree, applied, verificationResults }); }
       }
       const [headSha, clean] = await Promise.all([git(worktree, ["rev-parse", "HEAD"]), gitRaw(worktree, ["status", "--porcelain=v1", "-z", "--untracked-files=all"])]);
       if (clean) throw new Error("Integration worktree is not clean");

@@ -36,9 +36,9 @@ export function loadConfig(configPath) {
   config.budget.weeklyWindowDays ??= 7;
   config.budget.hardRunTokenLimit ??= 200000;
   config.budget.interruptSafetyMarginTokens ??= 12000;
-  // Local numbers are accounting by default. Enabling this is an explicit
-  // emergency policy, not a prerequisite for autonomous delivery.
-  config.budget.enforceLocalLimits ??= false;
+  // Autonomous delivery uses local caps as scheduler guardrails. Account
+  // quota remains an independent upstream hard stop.
+  config.budget.enforceLocalLimits ??= true;
   config.quota ??= {};
   config.quota.throttleAtUsedPercent ??= 90;
   config.quota.throttleWhenUnavailable ??= false;

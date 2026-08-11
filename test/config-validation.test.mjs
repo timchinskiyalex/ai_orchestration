@@ -22,7 +22,7 @@ test("new config defaults to fully autonomous delivery and retains explicit manu
   assert.equal(autonomous.autonomy.mode, "autonomous");
   assert.equal(autonomous.autonomy.autoMerge, true);
   assert.equal(autonomous.delivery.maxRemediationRounds, 3);
-  assert.equal(autonomous.budget.enforceLocalLimits, false);
+  assert.equal(autonomous.budget.enforceLocalLimits, true);
   const manual = load(config({ autonomy: { mode: "manual", autoApproveWorkflowGates: false, autoRemediate: false, autoPush: false, autoCreatePullRequest: false, autoMerge: false, maxRemediationRounds: 1 }, delivery: { maxRemediationRounds: 1 } }));
   assert.equal(manual.autonomy.mode, "manual");
   assert.throws(() => load(config({ autonomy: { mode: "autonomous", autoApproveWorkflowGates: false } })), /requires all autonomy/);

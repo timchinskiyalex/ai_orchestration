@@ -80,6 +80,8 @@ export class DeliveryCoordinator {
       const terminal = terminalForTask(terminalTask);
       return this.router.store.updateDeliveryRun(run.id, { state: terminal.state, publish: { taskId: terminalTask.id, reason: terminal.reason, recovery: { action: "Inspect the task result/report and preserved worktree, correct the source condition, then start a fresh delivery run." } } });
     }
+    const unfinishedTask = tasks.find((task) => task.status !== "done");
+    if (unfinishedTask) return this.router.store.updateDeliveryRun(run.id, { state: "failed", publish: { taskId: unfinishedTask.id, reason: `Delivery cannot complete while task ${unfinishedTask.id} remains ${unfinishedTask.status}`, recovery: { action: "The scheduler retained the task state; start a fresh delivery only after its recorded terminal condition is resolved." } } });
     const engineering = tasks.filter((task) => ENGINEERING_DOMAINS.has(task.role));
     if (!engineering.length || engineering.some((task) => task.status !== "done")) return this.router.store.updateDeliveryRun(run.id, { state: "failed", publish: { reason: "Delivery stopped without a completed engineering DAG", recovery: { action: "Inspect the persisted scheduler state and task dependencies." } } });
     let integration;

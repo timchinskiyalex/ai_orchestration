@@ -122,3 +122,22 @@ test("writer verification failure is repaired in the same worker thread before f
     assert.equal(router.lifecycleEvents().some((event) => event.type === "writer verification retry"), true);
   } finally { router.close(); rmSync(fixture.root, { recursive: true, force: true }); }
 });
+
+test("delivery coordinator refuses completion while any task remains running", async () => {
+  const run = { id: "run-active", state: "running" };
+  let integrationAttempted = false;
+  const router = {
+    recoverStaleDeliveries() { return []; }, activateDeliveryRun() {}, isAutonomous() { return true; },
+    list() { return [{ id: "still-running", role: "bootstrap", status: "running", deliveryRunId: run.id }]; },
+    async runUntilIdle() { return { blockedQuota: false, blockedBudget: false, interrupted: false, failed: false }; },
+    async runToIntegration() { integrationAttempted = true; throw new Error("must not integrate"); },
+    store: {
+      currentDeliveryRun() { return run; }, deliveryRun() { return run; },
+      updateDeliveryRun(id, update) { return { ...run, id, ...update }; }
+    }
+  };
+  const terminal = await new DeliveryCoordinator(router).resume();
+  assert.equal(terminal.state, "failed");
+  assert.match(terminal.publish.reason, /still-running remains running/);
+  assert.equal(integrationAttempted, false);
+});

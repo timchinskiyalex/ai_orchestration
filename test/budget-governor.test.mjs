@@ -10,7 +10,8 @@ test("budget governor reserves future task budget before start", () => {
   assert.equal(blocked.allowed, false);
 });
 
-test("budget governor reads total token usage from App Server event", () => {
+test("budget governor uses the App Server last-turn usage rather than aggregate thread usage", () => {
   const governor = new BudgetGovernor({ defaultParentBudget: 1 });
-  assert.equal(governor.normalizeUsage({ tokenUsage: { total: { totalTokens: 1234 } } }), 1234);
+  assert.equal(governor.normalizeUsage({ tokenUsage: { last: { totalTokens: 1234 }, total: { totalTokens: 9_999_999 } } }), 1234);
+  assert.equal(governor.normalizeUsage({ tokenUsage: { total: { totalTokens: 1234 } } }), 1234, "old fake/compat payloads remain supported");
 });
