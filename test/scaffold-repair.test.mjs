@@ -61,6 +61,22 @@ class HangingCompleteScaffoldClient extends ScaffoldRepairClient {
   async interruptTurn() { this.interrupts += 1; return {}; }
 }
 
+class HangingPartialScaffoldClient extends ScaffoldRepairClient {
+  constructor() { super(); this.interrupts = 0; }
+  async waitForTurn(threadId, turnId) {
+    const thread = this.threads.get(threadId);
+    if (/^Scaffold product roots/.test(thread.goal)) {
+      const root = thread.turns === 1 ? "frontend" : "admin";
+      mkdirSync(join(thread.cwd, root), { recursive: true });
+      writeFileSync(join(thread.cwd, root, "package.json"), packageJson());
+      writeFileSync(join(thread.cwd, root, "package-lock.json"), "{}");
+      if (thread.turns === 1) return new Promise(() => {});
+    }
+    return { id: turnId, status: "completed" };
+  }
+  async interruptTurn() { this.interrupts += 1; return {}; }
+}
+
 test("incomplete scaffold is repaired in its existing worker thread and finalizes one artifact", async () => {
   const root = mkdtempSync(join(tmpdir(), "scaffold-repair-")); const source = join(root, "requirements"); const client = new ScaffoldRepairClient(); let router;
   try {
@@ -88,5 +104,20 @@ test("controller finalizes a verified scaffold even when the App Server worker n
     assert.equal(client.interrupts, 1);
     assert.ok(router.store.workerArtifact(scaffold.id));
     assert.equal(router.lifecycleEvents().some((event) => event.type === "scaffold accepted from worktree"), true);
+  } finally { router?.close(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test("controller interrupts partial scaffold progress and corrects only the missing root in the same thread", async () => {
+  const root = mkdtempSync(join(tmpdir(), "scaffold-partial-watchdog-")); const source = join(root, "requirements"); const client = new HangingPartialScaffoldClient(); let router;
+  try {
+    git(root, ["init", "-b", "main"]); mkdirSync(source); writeFileSync(join(source, "spec.md"), "# Product\nScaffold both roots."); writeFileSync(join(root, "package.json"), packageJson()); writeFileSync(join(root, "package-lock.json"), "{}"); git(root, ["add", "."]); git(root, ["-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "base"]);
+    const roles = Object.fromEntries(["bootstrap", "planner", "backend", "frontend", "database", "qa", "security", "devops"].map((role) => [role, { sandbox: role === "devops" ? "workspace-write" : "read-only", approvalPolicy: "never", tokenBudget: 100, usesWorktree: role === "devops" }]));
+    router = new SwarmRouter({ repository: root, runtimeDir: join(root, "runtime"), baseRef: "main", model: "fake", project: { name: "partial-watchdog", documentationDir: "docs/orchestration-input", generatedDir: "docs/orchestration-generated", productRoots: [{ id: "frontend", path: "frontend", adapter: "next-node" }, { id: "admin", path: "admin", adapter: "next-node" }] }, router: { maxConcurrentTasks: 2, maxChildrenPerTask: 20, maxDelegationDepth: 5, maxPlanTasks: 5, defaultParentBudget: 1000, turnTimeoutMs: 5000, scaffoldCompletionPollMs: 250, scaffoldPartialGraceMs: 250, approvalMode: "deny" }, autonomy: { mode: "autonomous", autoApproveWorkflowGates: true, autoRemediate: true, autoPush: false, autoCreatePullRequest: false, autoMerge: false, maxRemediationRounds: 2 }, budget: { weeklyTokenLimit: 10000, weeklyWindowDays: 7, enforceLocalLimits: false }, quota: { throttleAtUsedPercent: 90, throttleWhenUnavailable: false }, delivery: { maxRemediationRounds: 2 }, remote: { enabled: false, remoteName: "origin", allowedRemotes: ["origin"], candidateBranchPrefix: "swarm/candidate/", requireCi: false, mergeMethod: "merge" }, roles, appServerClientFactory: () => client });
+    await new DeliveryCoordinator(router).begin({ source });
+    const scaffold = router.list().find((task) => task.title === "Scaffold product roots");
+    assert.equal(scaffold.status, "done");
+    assert.equal(client.interrupts, 1);
+    assert.equal(client.scaffoldTurns, 0);
+    assert.equal(router.lifecycleEvents().some((event) => event.type === "scaffold partial progress interrupted"), true);
   } finally { router?.close(); rmSync(root, { recursive: true, force: true }); }
 });

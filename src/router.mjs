@@ -724,6 +724,8 @@ export class SwarmRouter extends EventEmitter {
     const completion = client.waitForTurn(threadId, turnId, this.config.router.turnTimeoutMs)
       .then((turn) => ({ type: "turn", turn }), (error) => ({ type: "error", error }));
     const pollMs = Math.max(250, Number(this.config.router.scaffoldCompletionPollMs ?? 2_000));
+    const partialGraceMs = Math.max(pollMs, Number(this.config.router.scaffoldPartialGraceMs ?? 30_000));
+    let partialObservedAt = null;
     let timer;
     const ready = new Promise((resolve) => {
       const inspect = async () => {
@@ -731,6 +733,11 @@ export class SwarmRouter extends EventEmitter {
           const overlayContext = await this.#refreshProjectOverlayFromWorktree(worktree);
           const components = overlayContext.overlay.components ?? [];
           if (components.length && components.every((component) => component.state === "scaffolded")) resolve({ type: "ready", overlayContext });
+          const missingRoots = components.filter((component) => component.state !== "scaffolded").map((component) => component.root);
+          if (components.length && missingRoots.length && missingRoots.length < components.length) {
+            partialObservedAt ??= Date.now();
+            if (Date.now() - partialObservedAt >= partialGraceMs) resolve({ type: "partial", overlayContext, missingRoots });
+          } else partialObservedAt = null;
         } catch {
           // Partial scaffolds are normal while the worker is writing files.
         }
@@ -742,11 +749,14 @@ export class SwarmRouter extends EventEmitter {
     clearInterval(timer);
     if (outcome.type === "error") throw outcome.error;
     if (outcome.type === "turn") return { turn: outcome.turn };
-    this.#lifecycle("scaffold accepted from worktree", { taskId: task.id, threadId, turnId, components: outcome.overlayContext.overlay.components.map((component) => component.root) });
+    if (outcome.type === "ready") this.#lifecycle("scaffold accepted from worktree", { taskId: task.id, threadId, turnId, components: outcome.overlayContext.overlay.components.map((component) => component.root) });
+    else this.#lifecycle("scaffold partial progress interrupted", { taskId: task.id, threadId, turnId, missingRoots: outcome.missingRoots });
     await client.interruptTurn({ threadId, turnId }).catch(() => {});
     return {
       turn: { id: turnId, status: "completed" },
-      resultText: "Scaffold accepted by the controller after all declared product roots were verified in the isolated worktree.",
+      resultText: outcome.type === "ready"
+        ? "Scaffold accepted by the controller after all declared product roots were verified in the isolated worktree."
+        : `Scaffold was stopped after verified partial progress. The controller must now create the missing declared roots: ${outcome.missingRoots.join(", ")}.`,
       overlayContext: outcome.overlayContext
     };
   }
