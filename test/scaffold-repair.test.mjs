@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DeliveryCoordinator } from "../src/delivery-coordinator.mjs";
 import { SwarmRouter } from "../src/router.mjs";
+import { fakeBlueprint } from "./product-blueprint-fixture.mjs";
 
 const git = (cwd, args) => execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8" }).trim();
 const productRoots = [{ id: "frontend", path: "frontend", adapter: "next-node" }, { id: "backend", path: "backend", adapter: "dotnet" }];
@@ -37,9 +38,9 @@ class DeterministicLifecycleClient extends EventEmitter {
   async readThread({ threadId }) {
     const goal = this.threads.get(threadId).goal;
     const text = /^Bootstrap/.test(goal)
-      ? "```json\n{\"summary\":\"ok\",\"assumptions\":[],\"risks\":[],\"humanGates\":[]}\n```"
+      ? `\`\`\`json\n${JSON.stringify(fakeBlueprint(this.threads.get(threadId).cwd))}\n\`\`\``
       : /^Plan /.test(goal)
-        ? "```json\n{\"tasks\":[{\"id\":\"scaffold-product\",\"title\":\"Scaffold product roots\",\"prompt\":\"Create every declared product root\",\"primaryDomain\":\"devops\",\"supportingDomains\":[],\"riskFlags\":[],\"humanApprovalRequired\":false,\"estimatedTokens\":20,\"dependsOn\":[],\"allowedPaths\":[\"frontend\",\"backend\"],\"acceptanceChecks\":[\"roots exist\"]},{\"id\":\"frontend-feature\",\"title\":\"Build frontend feature\",\"prompt\":\"Create frontend feature\",\"primaryDomain\":\"frontend\",\"supportingDomains\":[],\"riskFlags\":[],\"humanApprovalRequired\":false,\"estimatedTokens\":20,\"dependsOn\":[\"scaffold-product\"],\"allowedPaths\":[\"frontend\"],\"acceptanceChecks\":[\"feature exists\"]},{\"id\":\"backend-feature\",\"title\":\"Build backend feature\",\"prompt\":\"Create backend feature\",\"primaryDomain\":\"backend\",\"supportingDomains\":[],\"riskFlags\":[],\"humanApprovalRequired\":false,\"estimatedTokens\":20,\"dependsOn\":[\"scaffold-product\"],\"allowedPaths\":[\"backend\"],\"acceptanceChecks\":[\"feature exists\"]}]}\n```"
+        ? "```json\n{\"blueprintId\":\"pb-test\",\"tasks\":[{\"id\":\"scaffold-product\",\"title\":\"Scaffold product roots\",\"prompt\":\"Create every declared product root\",\"primaryDomain\":\"devops\",\"supportingDomains\":[],\"riskFlags\":[],\"humanApprovalRequired\":false,\"estimatedTokens\":20,\"dependsOn\":[],\"allowedPaths\":[\"frontend\",\"backend\"],\"acceptanceChecks\":[\"roots exist\"],\"requirementIds\":[\"fix-value\"]},{\"id\":\"frontend-feature\",\"title\":\"Build frontend feature\",\"prompt\":\"Create frontend feature\",\"primaryDomain\":\"frontend\",\"supportingDomains\":[],\"riskFlags\":[],\"humanApprovalRequired\":false,\"estimatedTokens\":20,\"dependsOn\":[\"scaffold-product\"],\"allowedPaths\":[\"frontend\"],\"acceptanceChecks\":[\"feature exists\"],\"requirementIds\":[\"fix-value\"]},{\"id\":\"backend-feature\",\"title\":\"Build backend feature\",\"prompt\":\"Create backend feature\",\"primaryDomain\":\"backend\",\"supportingDomains\":[],\"riskFlags\":[],\"humanApprovalRequired\":false,\"estimatedTokens\":20,\"dependsOn\":[\"scaffold-product\"],\"allowedPaths\":[\"backend\"],\"acceptanceChecks\":[\"feature exists\"],\"requirementIds\":[\"fix-value\"]}]}\n```"
         : /^Security review:/.test(goal) || /^QA:/.test(goal)
           ? "```json\n{\"verdict\":\"pass\",\"summary\":\"ok\",\"findings\":[],\"executedChecks\":[],\"notRunChecks\":[]}\n```"
           : "writer complete";

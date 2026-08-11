@@ -1,5 +1,9 @@
-import { copyFileSync, existsSync, lstatSync, mkdirSync, readdirSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { relative, resolve, sep, join } from "node:path";
+import { documentIdForPath, documentSetDigest } from "./product-blueprint.mjs";
+
+const digest = (value) => createHash("sha256").update(value).digest("hex");
 
 function isInside(root, candidate) {
   const relation = relative(root, candidate);
@@ -39,8 +43,12 @@ export function ingestDocumentation({ source, repository, destinationRelative })
   const inventory = {
     generatedAt: new Date().toISOString(),
     source: "imported-local-documentation",
-    files: files.map((file) => ({ path: relative(sourceRoot, file).split("\\").join("/") }))
+    files: files.map((file) => {
+      const path = relative(sourceRoot, file).split("\\").join("/");
+      return { documentId: documentIdForPath(path), path, sha256: digest(readFileSync(file)) };
+    })
   };
+  inventory.documentSetDigest = documentSetDigest(inventory.files);
   const inventoryPath = join(destination, "inventory.json");
   writeFileSync(inventoryPath, `${JSON.stringify(inventory, null, 2)}\n`, "utf8");
   return { files: files.length, destination, inventoryPath };

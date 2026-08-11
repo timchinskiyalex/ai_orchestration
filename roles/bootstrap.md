@@ -11,3 +11,7 @@
 6. dependency graph верхнього рівня: етапи, deliverables, acceptance checks і порядок виконання.
 
 Не генеруй код і не оголошуй план затвердженим. Blueprint завжди потребує human review.
+
+## ProductBlueprint v1 intake contract
+
+Return the exact ProductBlueprint v1 JSON requested by the controller. Preserve every source-backed requirement with source document references, locators, and excerpt digests. Do not turn missing mandatory facts or contradictions into human approval gates. Only use `policyDefault` when that default is explicitly declared by the imported source or policy; otherwise leave the question unresolved.

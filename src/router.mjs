@@ -1,6 +1,6 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, relative } from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { EventEmitter } from "node:events";
 import { AppServerClient } from "./app-server-client.mjs";
@@ -18,6 +18,7 @@ import { validateSecurityGateReport } from "./security-gate.mjs";
 import { GitHubCiAdapter, GitHubMergeAdapter, GitHubPullRequestAdapter, RemoteAdapterError, RemoteCiAdapter, RemoteGitAdapter } from "./remote-adapters.mjs";
 import { runManagedProcess } from "./managed-process-runner.mjs";
 import { provisionDeterministicScaffold } from "./deterministic-scaffold.mjs";
+import { specificationBlockers } from "./product-blueprint.mjs";
 
 export function formatTaskPrompt({ task, worktree, project, overlaySnapshot = null, documentationAvailable = true }) {
   const lines = [
@@ -133,7 +134,7 @@ export class SwarmRouter extends EventEmitter {
       return null;
     }
     const run = this.store.deliveryRun(this.activeDeliveryRunId);
-    if (run && !["interrupted", "completed_merged", "failed", "blocked_budget", "blocked_quota", "blocked_credentials", "blocked_ci", "blocked_branch_protection", "conflict_blocked"].includes(run.state)) return this.store.interruptDeliveryRun(run.id, { reason, recovery });
+    if (run && !["interrupted", "completed_merged", "failed", "blocked_budget", "blocked_specification", "blocked_quota", "blocked_credentials", "blocked_ci", "blocked_branch_protection", "conflict_blocked"].includes(run.state)) return this.store.interruptDeliveryRun(run.id, { reason, recovery });
     return run;
   }
 
@@ -189,7 +190,7 @@ export class SwarmRouter extends EventEmitter {
     return { task, threadRead, ...this.appServerDiagnostics() };
   }
 
-  enqueue({ role, title, prompt, parentTaskId = null, allowedPaths = [], acceptanceChecks = [], dependencies = [], estimatedTokens = null, humanApprovalRequired = false, riskFlags = [], supportingDomains = [], artifactBaseSha = null, artifactDependencies = [], remediationRound = 0, sourceWriterTaskId = null, deliveryRunId = this.activeDeliveryRunId }) {
+  enqueue({ role, title, prompt, parentTaskId = null, allowedPaths = [], acceptanceChecks = [], dependencies = [], estimatedTokens = null, humanApprovalRequired = false, riskFlags = [], supportingDomains = [], artifactBaseSha = null, artifactDependencies = [], remediationRound = 0, sourceWriterTaskId = null, blueprintId = null, requirementIds = [], deliveryRunId = this.activeDeliveryRunId }) {
     assertRole(role);
     if (!title?.trim() || !prompt?.trim()) throw new Error("title and prompt are required");
     const roleConfig = this.config.roles[role];
@@ -200,7 +201,7 @@ export class SwarmRouter extends EventEmitter {
     return this.store.createTask({
       id: randomUUID(), parentTaskId, role, title: title.trim(), prompt: prompt.trim(),
       allowedPaths, acceptanceChecks, dependencies, humanApprovalRequired, estimatedTokens: estimate, tokenBudget: roleConfig.tokenBudget, maxAttempts: 1,
-      riskFlags, supportingDomains, artifactBaseSha, artifactDependencies, remediationRound, sourceWriterTaskId, deliveryRunId
+      riskFlags, supportingDomains, artifactBaseSha, artifactDependencies, remediationRound, sourceWriterTaskId, blueprintId, requirementIds, deliveryRunId
     });
   }
 
@@ -317,6 +318,7 @@ export class SwarmRouter extends EventEmitter {
       this.store.updateDeliveryRun(run.id, { state: "running", integrationPath: integration.path ?? run.integrationPath, candidate, publicationCheckpoint: { stage, candidate, updatedAt: new Date().toISOString(), ...extra } });
     };
     const failure = (error, stage, extra = {}) => {
+
       const code = error instanceof RemoteAdapterError ? error.code : "remote_failed";
       const terminalState = code === "credentials" ? "blocked_credentials" : code === "branch_protection" ? "blocked_branch_protection" : stage === "ci" ? "blocked_ci" : "failed";
       return { terminalState, status: terminalState, stage, reason: String(error.message ?? error).slice(0, 500), candidate, recovery: { action: "Inspect the persisted remote action and resolve the stated remote condition; rerun the launcher to resume idempotently." }, ...extra };
@@ -386,9 +388,9 @@ export class SwarmRouter extends EventEmitter {
   startProject() {
     const inventory = join(this.config.repository, this.config.project.documentationDir, "inventory.json");
     if (!existsSync(inventory)) throw new Error(`Project documentation has not been imported: ${inventory}`);
-    const existingBootstrap = this.store.listTasks().find((task) => task.role === "bootstrap" && !task.parentTaskId && !["done", "failed", "cancelled", "blocked_budget", "interrupted"].includes(task.status));
+    const existingBootstrap = this.store.listTasks().find((task) => task.role === "bootstrap" && !task.parentTaskId && !["done", "failed", "cancelled", "blocked_budget", "blocked_specification", "interrupted"].includes(task.status));
     if (existingBootstrap) return existingBootstrap;
-    const activeTasks = this.store.listTasks().filter((task) => !["done", "failed", "cancelled", "blocked_budget", "interrupted"].includes(task.status));
+    const activeTasks = this.store.listTasks().filter((task) => !["done", "failed", "cancelled", "blocked_budget", "blocked_specification", "interrupted"].includes(task.status));
     if (activeTasks.length) throw new Error("This instance already has active orchestration tasks; recover or wait for the active delivery before starting another run");
     return this.enqueue({
       role: "bootstrap",
@@ -477,6 +479,7 @@ export class SwarmRouter extends EventEmitter {
       process.removeListener("SIGINT", onSigint);
       this.lastAppServerDiagnostics = client.diagnostics();
       this.expectedClientShutdown = true;
+
       await client.shutdown();
       this.lastAppServerDiagnostics = client.diagnostics();
       if (this.activeClient === client) this.activeClient = null;
@@ -600,7 +603,28 @@ export class SwarmRouter extends EventEmitter {
       let resultText = watched.resultText ?? await this.#readAgentResult(client, threadId, resolvedTurnId);
       if (watched.overlayContext) overlayContext = watched.overlayContext;
       let resultPath;
-      if (task.role === "bootstrap") validateBootstrap(extractOrchestrationJson(resultText));
+      if (task.role === "bootstrap") {
+        // Direct, non-project bootstrap tasks are retained for scheduler
+        // diagnostics; Product intake always comes through startProject(),
+        // which requires the source inventory below.
+        if (!existsSync(join(this.config.repository, this.config.project.documentationDir, "inventory.json"))) {
+          resultPath = this.#saveAgentResult(task, resultText);
+          this.store.setResultPath(task.id, resultPath);
+        } else {
+        const blueprint = validateBootstrap(extractOrchestrationJson(resultText), { sourceDocuments: this.#importedSourceDocuments() });
+        const persisted = this.#persistBlueprint(task, blueprint);
+        this.store.setResultPath(task.id, persisted.artifactPath);
+        if (task.deliveryRunId) this.store.linkBlueprintToDelivery(task.deliveryRunId, blueprint.blueprintId);
+        const blockers = specificationBlockers(blueprint);
+        if (blockers.length) {
+          const reason = `blocked_specification: ${blockers.join(", ")}`;
+          this.store.transition(task.id, "blocked_specification", { error: reason });
+          if (task.deliveryRunId) this.store.updateDeliveryRun(task.deliveryRunId, { state: "blocked_specification", publish: { reason, recovery: { action: "Resolve the source-document contradiction or missing mandatory fact, then start a fresh delivery." } } });
+          this.#lifecycle("specification blocked", { taskId: task.id, blueprintId: blueprint.blueprintId, blockers });
+          return;
+        }
+        }
+      }
       if (task.role === "planner") resultText = await this.#materializePlannerWithRepair(client, task, threadId, resultText);
       if (task.role === "security") {
         const report = validateSecurityGateReport(extractOrchestrationJson(resultText));
@@ -616,6 +640,7 @@ export class SwarmRouter extends EventEmitter {
         const checks = await this.#runDeclaredVerification(worktree, overlayContext.overlay, artifact?.changedPaths ?? []);
         report.executedChecks = [...report.executedChecks, ...checks.passed];
         report.notRunChecks = [...report.notRunChecks, ...checks.notRun];
+
         if (checks.failed.length) {
           report.verdict = "blocked";
           report.summary = "Controller verification failed; autonomous remediation cannot safely continue without valid scoped findings.";
@@ -638,7 +663,7 @@ export class SwarmRouter extends EventEmitter {
         this.#connectArtifactDependents(task, finalized.artifact);
       }
       this.store.transition(task.id, finalStatusForRole(task.role, { autonomous: this.isAutonomous() }));
-      if (task.role === "bootstrap" && this.isAutonomous()) this.#enqueuePlanner(task);
+      if (task.role === "bootstrap" && this.isAutonomous() && this.store.productBlueprintForBootstrap(task.id)) this.#enqueuePlanner(task);
     }
     else if (turn.status === "interrupted") this.store.transition(task.id, "interrupted", { error: "Turn interrupted" });
     else this.store.transition(task.id, "failed", { error: turn.error?.message ?? "Turn failed" });
@@ -732,12 +757,15 @@ export class SwarmRouter extends EventEmitter {
   #enqueuePlanner(bootstrapTask) {
     const existing = this.store.listTasks().find((task) => task.role === "planner" && task.parentTaskId === bootstrapTask.id);
     if (existing) return existing;
+    const stored = this.store.productBlueprintForBootstrap(bootstrapTask.id);
+    if (!stored) throw new Error(`Bootstrap task ${bootstrapTask.id} has no persisted ProductBlueprint`);
     return this.enqueue({
       role: "planner",
       parentTaskId: bootstrapTask.id,
       title: `Plan ${this.config.project.name}`,
-      prompt: `Use the Bootstrap blueprint at ${bootstrapTask.resultPath}. Produce the required JSON execution DAG. For this greenfield multi-stack contract, include a devops writer task with id scaffold-product that creates every declared product root before any task writing under frontend/ or backend/.`,
+      prompt: `Use the immutable ProductBlueprint '${stored.blueprint.blueprintId}' at ${stored.artifactPath}. Produce the required JSON execution DAG with blueprintId '${stored.blueprint.blueprintId}' and non-empty requirementIds on every implementation task. For this greenfield multi-stack contract, include a devops writer task with id scaffold-product that creates every declared product root before any task writing under frontend/ or backend/.`,
       dependencies: [bootstrapTask.id], estimatedTokens: this.config.roles.planner.tokenBudget,
+      blueprintId: stored.blueprint.blueprintId,
     });
   }
 
@@ -773,6 +801,7 @@ export class SwarmRouter extends EventEmitter {
           effort: "low",
           input: [{ type: "text", text: `Your previous execution DAG was rejected by the deterministic controller: ${reason}\nReturn a corrected replacement JSON only. Preserve the requested project scope. The controller will normalize declared frontend/backend scaffold paths and direct scaffold dependencies; do not invent risk-flag names.` }]
         });
+
         const requestedTurnId = retry.turn.id;
         this.store.setThread(task.id, { threadId, turnId: requestedTurnId });
         const completion = client.waitForTurn(threadId, requestedTurnId, this.config.router.turnTimeoutMs);
@@ -906,21 +935,24 @@ export class SwarmRouter extends EventEmitter {
       artifactBaseSha: predecessor.artifact.headSha,
       artifactDependencies: [writer.id],
       remediationRound: nextRound,
-      sourceWriterTaskId: null
+      sourceWriterTaskId: null,
+      blueprintId: writer.blueprintId,
+      requirementIds: writer.requirementIds,
+      deliveryRunId: writer.deliveryRunId
     });
     const security = this.enqueue({
       role: "security", parentTaskId: remediation.id, title: `Security review: ${remediation.title}`,
       prompt: `Review the finalized remediation artifact for '${writer.title}'. Do not expand scope; report only concrete security findings.`,
       allowedPaths, acceptanceChecks: report.findings.map((finding) => finding.verification), dependencies: [remediation.id],
       estimatedTokens: Math.min(this.config.roles.security.tokenBudget, Math.max(1, Math.ceil(remediation.estimatedTokens * 0.35))),
-      riskFlags: writer.riskFlags, supportingDomains: ["security"], sourceWriterTaskId: remediation.id
+      riskFlags: writer.riskFlags, supportingDomains: ["security"], sourceWriterTaskId: remediation.id, blueprintId: writer.blueprintId, requirementIds: writer.requirementIds, deliveryRunId: writer.deliveryRunId
     });
     this.enqueue({
       role: "qa", parentTaskId: security.id, title: `QA: ${remediation.title}`,
       prompt: `Verify the finalized remediation artifact for '${writer.title}'. Return the required QualityGateReport only.`,
       allowedPaths, acceptanceChecks: report.findings.map((finding) => finding.verification), dependencies: [security.id],
       estimatedTokens: Math.min(this.config.roles.qa.tokenBudget, Math.max(1, Math.ceil(remediation.estimatedTokens * 0.4))),
-      riskFlags: writer.riskFlags, supportingDomains: ["qa"], sourceWriterTaskId: remediation.id
+      riskFlags: writer.riskFlags, supportingDomains: ["qa"], sourceWriterTaskId: remediation.id, blueprintId: writer.blueprintId, requirementIds: writer.requirementIds, deliveryRunId: writer.deliveryRunId
     });
     this.store.transition(task.id, "done");
     this.#lifecycle("remediation queued", { taskId: remediation.id, writerTaskId: writer.id, remediationRound: nextRound });
@@ -930,6 +962,7 @@ export class SwarmRouter extends EventEmitter {
     const writer = this.store.getTask(task.sourceWriterTaskId);
     if (!writer) throw new Error(`Security task ${task.id} has no source writer`);
     const maxRounds = this.config.delivery?.maxRemediationRounds ?? 2;
+
     const nextRound = (writer.remediationRound ?? 0) + 1;
     if (report.verdict === "pass") {
       this.store.transition(task.id, "done");
@@ -950,16 +983,16 @@ export class SwarmRouter extends EventEmitter {
     const predecessor = this.store.workerArtifactRecord(writer.id);
     if (!predecessor?.artifact) throw new Error(`Security remediation requires finalized artifact for ${writer.id}`);
     const allowedPaths = remediationScope(report, writer);
-    const remediation = this.enqueue({ role: writer.role, parentTaskId: task.id, title: `Remediate ${writer.title} (security round ${nextRound})`, prompt: `Apply only these validated SecurityGate findings. Do not expand scope or risk: ${JSON.stringify(report.findings.map((finding) => ({ id: finding.id, path: finding.path, requiredFix: finding.requiredFix, verification: finding.verification })))}.`, allowedPaths, acceptanceChecks: report.findings.map((finding) => finding.verification), dependencies: [task.id], estimatedTokens: Math.min(this.config.roles[writer.role].tokenBudget, writer.estimatedTokens), riskFlags: writer.riskFlags, supportingDomains: ["security", "qa"], artifactBaseSha: predecessor.artifact.headSha, artifactDependencies: [writer.id], remediationRound: nextRound });
-    const security = this.enqueue({ role: "security", parentTaskId: remediation.id, title: `Security review: ${remediation.title}`, prompt: `Review the finalized security remediation artifact for '${writer.title}'. Return the required SecurityGateReport only.`, allowedPaths, acceptanceChecks: remediation.acceptanceChecks, dependencies: [remediation.id], estimatedTokens: Math.min(this.config.roles.security.tokenBudget, Math.max(1, Math.ceil(remediation.estimatedTokens * 0.35))), riskFlags: writer.riskFlags, supportingDomains: ["security"], sourceWriterTaskId: remediation.id });
-    this.enqueue({ role: "qa", parentTaskId: security.id, title: `QA: ${remediation.title}`, prompt: `Verify the finalized security remediation artifact for '${writer.title}'. Return the required QualityGateReport only.`, allowedPaths, acceptanceChecks: remediation.acceptanceChecks, dependencies: [security.id], estimatedTokens: Math.min(this.config.roles.qa.tokenBudget, Math.max(1, Math.ceil(remediation.estimatedTokens * 0.4))), riskFlags: writer.riskFlags, supportingDomains: ["qa"], sourceWriterTaskId: remediation.id });
+    const remediation = this.enqueue({ role: writer.role, parentTaskId: task.id, title: `Remediate ${writer.title} (security round ${nextRound})`, prompt: `Apply only these validated SecurityGate findings. Do not expand scope or risk: ${JSON.stringify(report.findings.map((finding) => ({ id: finding.id, path: finding.path, requiredFix: finding.requiredFix, verification: finding.verification })))}.`, allowedPaths, acceptanceChecks: report.findings.map((finding) => finding.verification), dependencies: [task.id], estimatedTokens: Math.min(this.config.roles[writer.role].tokenBudget, writer.estimatedTokens), riskFlags: writer.riskFlags, supportingDomains: ["security", "qa"], artifactBaseSha: predecessor.artifact.headSha, artifactDependencies: [writer.id], remediationRound: nextRound, blueprintId: writer.blueprintId, requirementIds: writer.requirementIds, deliveryRunId: writer.deliveryRunId });
+    const security = this.enqueue({ role: "security", parentTaskId: remediation.id, title: `Security review: ${remediation.title}`, prompt: `Review the finalized security remediation artifact for '${writer.title}'. Return the required SecurityGateReport only.`, allowedPaths, acceptanceChecks: remediation.acceptanceChecks, dependencies: [remediation.id], estimatedTokens: Math.min(this.config.roles.security.tokenBudget, Math.max(1, Math.ceil(remediation.estimatedTokens * 0.35))), riskFlags: writer.riskFlags, supportingDomains: ["security"], sourceWriterTaskId: remediation.id, blueprintId: writer.blueprintId, requirementIds: writer.requirementIds, deliveryRunId: writer.deliveryRunId });
+    this.enqueue({ role: "qa", parentTaskId: security.id, title: `QA: ${remediation.title}`, prompt: `Verify the finalized security remediation artifact for '${writer.title}'. Return the required QualityGateReport only.`, allowedPaths, acceptanceChecks: remediation.acceptanceChecks, dependencies: [security.id], estimatedTokens: Math.min(this.config.roles.qa.tokenBudget, Math.max(1, Math.ceil(remediation.estimatedTokens * 0.4))), riskFlags: writer.riskFlags, supportingDomains: ["qa"], sourceWriterTaskId: remediation.id, blueprintId: writer.blueprintId, requirementIds: writer.requirementIds, deliveryRunId: writer.deliveryRunId });
     this.store.transition(task.id, "done");
     this.#lifecycle("security remediation queued", { taskId: remediation.id, writerTaskId: writer.id, remediationRound: nextRound });
   }
 
   #structuredOutputContract(role) {
-    if (role === "bootstrap") return `Return only one fenced JSON object with this schema:\n{"summary":"string","assumptions":["string"],"risks":["string"],"humanGates":["string"]}`;
-    if (role === "planner") return `Return only one fenced JSON object with this schema:\n{"tasks":[{"id":"safe-kebab-id","title":"string","prompt":"specific implementation instruction","primaryDomain":"backend|frontend|database|qa|security|devops","supportingDomains":["qa","security"],"riskFlags":["public_api_change"],"humanApprovalRequired":false,"estimatedTokens":8000,"dependsOn":["other-task-id"],"allowedPaths":["path"],"acceptanceChecks":["test or check"]}]}. Return the JSON as your first and only deliverable: do not use web search, do not install packages, do not run tests, and do not explore source code beyond the imported Markdown inventory. allowedPaths must be explicit. riskFlags may contain only: public_api_change, auth_or_authorization, secret_handling, sensitive_data, destructive_data_change, schema_change, production_write, network_exposure, permission_change, dependency_supply_chain, irreversible_operation, high_blast_radius. Use exactly dependency_supply_chain for supply-chain risk. Auth, network, permission, sensitive-data and supply-chain flags require security. Schema/destructive work must use database and humanApprovalRequired=true. Do not create implementation tasks for ambiguity; report it to the human instead.`;
+    if (role === "bootstrap") return `Return only one fenced JSON ProductBlueprint v1. Required exact top-level fields: {"schemaVersion":1,"kind":"ProductBlueprint","blueprintId":"stable-kebab-id","createdAt":"ISO-8601","documentSetDigest":"sha256","sourceDocuments":[{"documentId":"doc-id","path":"path","sha256":"sha256"}],"requirements":[{"requirementId":"stable-kebab-id","type":"functional|nfr|data|integration|constraint","priority":"must|should|could","mandatory":true,"description":"string","sourceRefs":[{"documentId":"doc-id","locator":"line/heading locator","excerptDigest":"sha256"}],"acceptanceCriteria":[{"criterionId":"stable-kebab-id","description":"string","verificationHint":"optional"}],"constraints":[]}],"nfrs":[],"modules":[],"integrations":[],"dataModel":{},"constraints":[],"assumptions":[],"decisions":[{"adrId":"stable-kebab-id","decision":"string","rationale":"string","sourceRefs":[]}],"unresolvedQuestions":[{"questionId":"stable-kebab-id","description":"string","requiredForRequirementIds":["requirement-id"],"policyDefault":"only an explicitly declared source-policy default","status":"resolved_by_policy|unresolved"}],"contradictions":[{"contradictionId":"stable-kebab-id","requirementIds":["requirement-id"],"sourceRefs":[],"description":"string","status":"resolved|unresolved","resolution":"required when resolved"}]}. sourceDocuments must exactly match inventory.json. Do not invent resolutions: a missing mandatory fact or unresolved contradiction stays unresolved.`;
+    if (role === "planner") return `Return only one fenced JSON PlanBatch with this schema:\n{"blueprintId":"persisted-blueprint-id","tasks":[{"id":"safe-kebab-id","title":"string","prompt":"specific implementation instruction","primaryDomain":"backend|frontend|database|qa|security|devops","supportingDomains":["qa","security"],"riskFlags":["public_api_change"],"humanApprovalRequired":false,"estimatedTokens":8000,"dependsOn":["other-task-id"],"allowedPaths":["path"],"acceptanceChecks":["test or check"],"requirementIds":["ProductBlueprint requirement id"]}]}. Every implementation task must have non-empty requirementIds from the immutable ProductBlueprint; every mandatory requirement must be covered. Return the JSON as your first and only deliverable: do not use web search, do not install packages, do not run tests, and do not explore source code beyond the imported Markdown inventory. allowedPaths must be explicit. Do not create implementation tasks for ambiguity or silently resolve contradictions.`;
     if (role === "qa") return `Return only one fenced JSON QualityGateReport: {"verdict":"pass|remediation_required|blocked","summary":"string","findings":[{"id":"stable-id","severity":"low|medium|high|critical","path":"relative/path","evidence":"concrete safe evidence","requiredFix":"specific fix","verification":"specific verification"}],"executedChecks":[],"notRunChecks":[]}. Never include secrets or raw command output. A pass requires no findings.`;
     if (role === "security") return `Return only one fenced JSON SecurityGateReport: {"verdict":"pass|remediation_required|blocked","summary":"string","findings":[{"id":"stable-id","severity":"low|medium|high|critical","path":"relative/path","evidence":"concrete safe evidence","requiredFix":"specific fix","verification":"specific verification"}],"executedChecks":[],"notRunChecks":[]}. Never include secrets or raw command output. A pass requires no findings.`;
     return "Return a concise Markdown report with evidence; do not return orchestration JSON.";
@@ -984,8 +1017,28 @@ export class SwarmRouter extends EventEmitter {
     return relative(this.config.repository, absolutePath).split("\\").join("/");
   }
 
+  #importedSourceDocuments() {
+    const inventory = JSON.parse(readFileSync(join(this.config.repository, this.config.project.documentationDir, "inventory.json"), "utf8"));
+    if (!Array.isArray(inventory.files) || inventory.files.some((file) => !file.documentId || !file.sha256)) throw new Error("Documentation inventory is missing ProductBlueprint source hashes; re-import documentation before Bootstrap.");
+    return inventory.files.map(({ documentId, path, sha256 }) => ({ documentId, path, sha256 }));
+  }
+
+  #persistBlueprint(task, blueprint) {
+    const root = join(this.config.repository, this.config.project.generatedDir, "blueprints");
+    mkdirSync(root, { recursive: true });
+    const artifactPath = join(this.config.project.generatedDir, "blueprints", `${blueprint.blueprintId}.v1.json`).split("\\").join("/");
+    const absolutePath = join(this.config.repository, artifactPath);
+    const serialized = `${JSON.stringify(blueprint, null, 2)}\n`;
+    const digest = createHash("sha256").update(serialized).digest("hex");
+    if (existsSync(absolutePath)) throw new Error(`ProductBlueprint artifact already exists and is immutable: ${artifactPath}`);
+    writeFileSync(absolutePath, serialized, { encoding: "utf8", flag: "wx" });
+    return this.store.recordProductBlueprint({ blueprint, artifactPath, digest, bootstrapTaskId: task.id, deliveryRunId: task.deliveryRunId ?? null });
+  }
+
   #materializePlan(plannerTask, parsedPlan) {
-    const plan = validatePlan(normalizePlannerPlanForProject(parsedPlan, this.config.project.productRoots), { maxTasks: this.config.router.maxPlanTasks, productRoots: this.config.project.productRoots });
+    const stored = this.store.productBlueprint(plannerTask.blueprintId);
+    if (!stored) throw new Error(`Planner task ${plannerTask.id} has no persisted ProductBlueprint`);
+    const plan = validatePlan(normalizePlannerPlanForProject(parsedPlan, this.config.project.productRoots), { maxTasks: this.config.router.maxPlanTasks, productRoots: this.config.project.productRoots, blueprint: stored.blueprint });
     const orderedPlanIds = new Map();
     const pending = [...plan.tasks];
     const dispatch = [];
@@ -1031,19 +1084,19 @@ export class SwarmRouter extends EventEmitter {
       const prompt = item.id === "scaffold-product"
         ? "[[product-scaffold]]\nController-owned scaffold contract: create every declared product root now. frontend/ must be a runnable Next.js application with package.json, npm lockfile, build and test scripts. backend/ must be an ASP.NET Core Web API solution with an xUnit test project. Do not create placeholders, plans, or a partial root. Run the declared checks after files are written."
         : item.prompt;
-      specs.push({ id: primaryId, role: item.primaryDomain, parentTaskId: plannerTask.id, title: item.title, prompt, allowedPaths: item.allowedPaths, acceptanceChecks: item.acceptanceChecks, dependencies, estimatedTokens: item.estimatedTokens, tokenBudget: primary.tokenBudget, maxAttempts: 1, humanApprovalRequired: elevatedGate, riskFlags: item.riskFlags, supportingDomains: item.supportingDomains, artifactDependencies: writerPredecessors, deliveryRunId: plannerTask.deliveryRunId ?? this.activeDeliveryRunId });
+      specs.push({ id: primaryId, role: item.primaryDomain, parentTaskId: plannerTask.id, title: item.title, prompt, allowedPaths: item.allowedPaths, acceptanceChecks: item.acceptanceChecks, dependencies, estimatedTokens: item.estimatedTokens, tokenBudget: primary.tokenBudget, maxAttempts: 1, humanApprovalRequired: elevatedGate, riskFlags: item.riskFlags, supportingDomains: item.supportingDomains, artifactDependencies: writerPredecessors, blueprintId: stored.blueprint.blueprintId, requirementIds: item.requirementIds, deliveryRunId: plannerTask.deliveryRunId ?? this.activeDeliveryRunId });
       let predecessorId = primaryId;
       const mandatoryReview = primary.sandbox === "workspace-write";
       if ((mandatoryReview || securityRequired) && item.primaryDomain !== "security") {
         const estimate = Math.min(this.config.roles.security?.tokenBudget ?? 0, Math.max(1000, Math.ceil(item.estimatedTokens * 0.35)));
         const security = assertRoute("security", estimate);
         predecessorId = randomUUID();
-        specs.push({ id: predecessorId, role: "security", parentTaskId: primaryId, title: `Security review: ${item.title}`, prompt: `Review finalized writer artifact '${item.title}' for declared risk flags: ${item.riskFlags.join(", ") || "none"}. Return the required SecurityGateReport only.`, allowedPaths: item.allowedPaths, acceptanceChecks: item.acceptanceChecks, dependencies: [primaryId], estimatedTokens: estimate, tokenBudget: security.tokenBudget, maxAttempts: 1, humanApprovalRequired: false, riskFlags: item.riskFlags, supportingDomains: ["security"], sourceWriterTaskId: primaryId, deliveryRunId: plannerTask.deliveryRunId ?? this.activeDeliveryRunId });
+        specs.push({ id: predecessorId, role: "security", parentTaskId: primaryId, title: `Security review: ${item.title}`, prompt: `Review finalized writer artifact '${item.title}' for declared risk flags: ${item.riskFlags.join(", ") || "none"}. Return the required SecurityGateReport only.`, allowedPaths: item.allowedPaths, acceptanceChecks: item.acceptanceChecks, dependencies: [primaryId], estimatedTokens: estimate, tokenBudget: security.tokenBudget, maxAttempts: 1, humanApprovalRequired: false, riskFlags: item.riskFlags, supportingDomains: ["security"], sourceWriterTaskId: primaryId, blueprintId: stored.blueprint.blueprintId, requirementIds: item.requirementIds, deliveryRunId: plannerTask.deliveryRunId ?? this.activeDeliveryRunId });
       }
       if ((mandatoryReview || item.supportingDomains.includes("qa")) && item.primaryDomain !== "qa") {
         const estimate = Math.min(this.config.roles.qa?.tokenBudget ?? 0, Math.max(1000, Math.ceil(item.estimatedTokens * 0.4)));
         const qa = assertRoute("qa", estimate);
-        specs.push({ id: randomUUID(), role: "qa", parentTaskId: predecessorId, title: `QA: ${item.title}`, prompt: `Verify finalized writer artifact '${item.title}' against acceptance checks. Return the required QualityGateReport only.`, allowedPaths: item.allowedPaths, acceptanceChecks: item.acceptanceChecks, dependencies: [predecessorId], estimatedTokens: estimate, tokenBudget: qa.tokenBudget, maxAttempts: 1, humanApprovalRequired: false, riskFlags: item.riskFlags, supportingDomains: ["qa"], sourceWriterTaskId: primaryId, deliveryRunId: plannerTask.deliveryRunId ?? this.activeDeliveryRunId });
+        specs.push({ id: randomUUID(), role: "qa", parentTaskId: predecessorId, title: `QA: ${item.title}`, prompt: `Verify finalized writer artifact '${item.title}' against acceptance checks. Return the required QualityGateReport only.`, allowedPaths: item.allowedPaths, acceptanceChecks: item.acceptanceChecks, dependencies: [predecessorId], estimatedTokens: estimate, tokenBudget: qa.tokenBudget, maxAttempts: 1, humanApprovalRequired: false, riskFlags: item.riskFlags, supportingDomains: ["qa"], sourceWriterTaskId: primaryId, blueprintId: stored.blueprint.blueprintId, requirementIds: item.requirementIds, deliveryRunId: plannerTask.deliveryRunId ?? this.activeDeliveryRunId });
       }
     }
     this.store.createTasks(specs);
@@ -1070,6 +1123,7 @@ export class SwarmRouter extends EventEmitter {
       if (writerPredecessors.length > 1) throw new Error(`Writer task ${task.id} has multiple writer artifact predecessors; controller-owned fan-in artifacts are not supported`);
       if (writerPredecessors.length === 1) this.store.setArtifactLineage(task.id, { artifactBaseSha: artifact.headSha, artifactDependencies: writerPredecessors });
     }
+
   }
   _assertWriterArtifactLineage(task) {
     const writerPredecessors = task.dependencies.filter((dependency) => this.config.roles[this.store.getTask(dependency)?.role]?.sandbox === "workspace-write");

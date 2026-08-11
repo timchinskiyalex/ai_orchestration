@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 import { DeliveryCoordinator } from "../src/delivery-coordinator.mjs";
 import { SwarmRouter } from "../src/router.mjs";
+import { fakeBlueprint, fakePlan } from "./product-blueprint-fixture.mjs";
 
 const git = (cwd, args) => execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8" }).trim();
 class DeliveryClient extends EventEmitter {
@@ -17,7 +18,7 @@ class DeliveryClient extends EventEmitter {
   async setGoal(goal) { this.goals.push(goal); this.threads.get(goal.threadId).goal = goal.objective; }
   async startTurn({ threadId }) { return { turn: { id: `turn-${threadId}` } }; }
   async waitForTurn(threadId, turnId) { const thread = this.threads.get(threadId); if (/Writer/.test(thread.goal)) writeFileSync(join(thread.cwd, "src", "value.mjs"), "export const value = 2;\n"); return { id: turnId, status: "completed" }; }
-  async readThread({ threadId }) { const thread = this.threads.get(threadId); const text = /^Bootstrap/.test(thread.goal) ? "```json\n{\"summary\":\"ok\",\"assumptions\":[],\"risks\":[],\"humanGates\":[]}\n```" : /^Plan /.test(thread.goal) ? "```json\n{\"tasks\":[{\"id\":\"writer\",\"title\":\"Writer\",\"prompt\":\"Writer\",\"primaryDomain\":\"backend\",\"supportingDomains\":[],\"riskFlags\":[],\"humanApprovalRequired\":false,\"estimatedTokens\":20,\"dependsOn\":[],\"allowedPaths\":[\"src/value.mjs\"],\"acceptanceChecks\":[\"npm test\"]}]}\n```" : /^Security review:/.test(thread.goal) ? "```json\n{\"verdict\":\"pass\",\"summary\":\"secure\",\"findings\":[],\"executedChecks\":[],\"notRunChecks\":[]}\n```" : /^QA:/.test(thread.goal) ? "```json\n{\"verdict\":\"pass\",\"summary\":\"quality verified\",\"findings\":[],\"executedChecks\":[],\"notRunChecks\":[]}\n```" : "writer complete"; return { thread: { turns: [{ id: `turn-${threadId}`, items: [{ type: "agentMessage", text }] }] } }; }
+  async readThread({ threadId }) { const thread = this.threads.get(threadId); const text = /^Bootstrap/.test(thread.goal) ? `\`\`\`json\n${JSON.stringify(fakeBlueprint(thread.cwd))}\n\`\`\`` : /^Plan /.test(thread.goal) ? `\`\`\`json\n${JSON.stringify(fakePlan())}\n\`\`\`` : /^Security review:/.test(thread.goal) ? "```json\n{\"verdict\":\"pass\",\"summary\":\"secure\",\"findings\":[],\"executedChecks\":[],\"notRunChecks\":[]}\n```" : /^QA:/.test(thread.goal) ? "```json\n{\"verdict\":\"pass\",\"summary\":\"quality verified\",\"findings\":[],\"executedChecks\":[],\"notRunChecks\":[]}\n```" : "writer complete"; return { thread: { turns: [{ id: `turn-${threadId}`, items: [{ type: "agentMessage", text }] }] } }; }
 }
 class CorrectingPlannerClient extends DeliveryClient {
   constructor() { super(); this.plannerReads = 0; }
@@ -27,7 +28,7 @@ class CorrectingPlannerClient extends DeliveryClient {
       this.plannerReads += 1;
       const text = this.plannerReads === 1
         ? "```json\n{\"tasks\":[{\"id\":\"writer\",\"title\":\"Writer\",\"prompt\":\"Writer\",\"primaryDomain\":\"backend\",\"supportingDomains\":[],\"riskFlags\":[\"invented_flag\"],\"humanApprovalRequired\":false,\"estimatedTokens\":20,\"dependsOn\":[],\"allowedPaths\":[\"src/value.mjs\"],\"acceptanceChecks\":[\"npm test\"]}]}\n```"
-        : "```json\n{\"tasks\":[{\"id\":\"writer\",\"title\":\"Writer\",\"prompt\":\"Writer\",\"primaryDomain\":\"backend\",\"supportingDomains\":[],\"riskFlags\":[],\"humanApprovalRequired\":false,\"estimatedTokens\":20,\"dependsOn\":[],\"allowedPaths\":[\"src/value.mjs\"],\"acceptanceChecks\":[\"npm test\"]}]}\n```";
+        : `\`\`\`json\n${JSON.stringify(fakePlan())}\n\`\`\``;
       return { thread: { turns: [{ id: `turn-${threadId}`, items: [{ type: "agentMessage", text }] }] } };
     }
     return super.readThread({ threadId });
@@ -67,7 +68,6 @@ test("autonomous Bootstrap, Planner, DAG, gates, candidate publication, and merg
     assert.equal(final.state, "completed_merged"); assert.ok(final.integrationPath); assert.equal(router.statusSnapshot().securityReports[0].verdict, "pass"); assert.equal(router.statusSnapshot().qualityReports[0].verdict, "pass"); assert.deepEqual(calls, { push: 1, pr: 1, ci: 1, merge: 1 });
   } finally { router.close(); rmSync(fixture.root, { recursive: true, force: true }); }
 });
-
 test("completed autonomous delivery is restart-idempotent", async () => {
   const fixture = setup(true); const router = new SwarmRouter(fixture.config); const coordinator = new DeliveryCoordinator(router); const calls = { push: 0, pr: 0, ci: 0, merge: 0 };
   try {
@@ -77,14 +77,18 @@ test("completed autonomous delivery is restart-idempotent", async () => {
 });
 
 test("persisted candidate resumes CI blockers and interruptions without a new intake, Bootstrap, or DAG", async () => {
-  const fixture = setup(true); const client = new DeliveryClient(); fixture.config.appServerClientFactory = () => client; const router = new SwarmRouter(fixture.config); const coordinator = new DeliveryCoordinator(router); const calls = { push: 0, pr: 0, ci: 0, merge: 0 };
+  const fixture = setup(true); const client = new DeliveryClient(); fixture.config.appServerClientFactory = () => client;
+  const router = new SwarmRouter(fixture.config); const coordinator = new DeliveryCoordinator(router); const calls = { push: 0, pr: 0, ci: 0, merge: 0 };
   try {
     const blockedAdapters = { ...fakeRemote(calls), remoteCiAdapter: { async waitForChecks() { calls.ci += 1; return { status: "timed_out", reason: "required build pending" }; } } };
     const blocked = await coordinator.begin({ source: fixture.source, ...blockedAdapters });
-    assert.equal(blocked.state, "blocked_ci"); assert.ok(blocked.integrationPath); assert.equal(blocked.candidate.sha.length, 40); assert.equal(router.store.deliveryRun(blocked.id).publicationCheckpoint.stage, "ci");
-    const beforeResumeGoals = client.goals.length; const resumed = await coordinator.resume(fakeRemote(calls));
+    assert.equal(blocked.state, "blocked_ci"); assert.ok(blocked.integrationPath); assert.equal(blocked.candidate.sha.length, 40);
+    assert.equal(router.store.deliveryRun(blocked.id).publicationCheckpoint.stage, "ci");
+    const beforeResumeGoals = client.goals.length;
+    const resumed = await coordinator.resume(fakeRemote(calls));
     assert.equal(resumed.state, "completed_merged"); assert.equal(client.goals.length, beforeResumeGoals); assert.equal(router.list().filter((task) => task.role === "bootstrap").length, 1);
-    router.store.interruptDeliveryRun(resumed.id, { reason: "test restart after merge side effect" }); const afterInterrupt = await coordinator.resume(fakeRemote(calls));
+    router.store.interruptDeliveryRun(resumed.id, { reason: "test restart after merge side effect" });
+    const afterInterrupt = await coordinator.resume(fakeRemote(calls));
     assert.equal(afterInterrupt.state, "completed_merged"); assert.equal(router.list().filter((task) => task.role === "bootstrap").length, 1); assert.equal(calls.merge, 1);
   } finally { router.close(); rmSync(fixture.root, { recursive: true, force: true }); }
 });
@@ -153,4 +157,5 @@ test("delivery coordinator refuses completion while any task remains running", a
   assert.equal(terminal.state, "failed");
   assert.match(terminal.publish.reason, /still-running remains running/);
   assert.equal(integrationAttempted, false);
+
 });
