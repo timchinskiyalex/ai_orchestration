@@ -26,7 +26,7 @@ class UsageFakeAppServer extends EventEmitter {
     this.turnAliases.set(resolvedTurnId, turnId);
     setTimeout(() => {
       if (this.exit) { this.emit("exit", { code: 1, signal: null }); this.waiters.get(`${threadId}:${turnId}`)?.reject(new Error("fake App Server exited")); return; }
-      if (this.usage !== null) this.emit("notification", { method: "thread/tokenUsage/updated", params: { threadId, turnId: resolvedTurnId, tokenUsage: { total: { totalTokens: this.usage } } } });
+      if (this.usage !== null) this.emit("notification", { method: "thread/tokenUsage/updated", params: { threadId, turnId: resolvedTurnId, tokenUsage: { last: { totalTokens: this.usage }, total: { totalTokens: 9_999_999 } } } });
       if (this.usage !== null && (this.usage < 20 || this.completeAfterUsage)) this.waiters.get(`${threadId}:${turnId}`)?.resolve({ id: turnId, status: "completed" });
     }, 0);
     return { turn: { id: turnId } };
@@ -77,6 +77,9 @@ test("usage below threshold does not interrupt, while threshold usage interrupts
     const persisted = threshold.router.store.budgetInterruption(task.id);
     assert.equal(result.blockedBudget, true); assert.deepEqual(threshold.client.interrupts, [{ threadId: "thread-1", turnId: "turn-thread-1" }]);
     assert.equal(threshold.router.store.getTask(task.id).status, "blocked_budget"); assert.equal(persisted.actualTokens, 35); assert.equal(persisted.interruptThresholdTokens, 20); assert.equal(persisted.configuredBudgetCap, 100); assert.equal(persisted.thresholdOvershootTokens, 15); assert.equal(persisted.capOvershootTokens, 0); assert.equal(threshold.router.store.deliveryRun(run.id).state, "blocked_budget");
+    threshold.client.emit("notification", { method: "thread/tokenUsage/updated", params: { threadId: "thread-1", turnId: "turn-thread-1", tokenUsage: { last: { totalTokens: 999 }, total: { totalTokens: 9_999_999 } } } });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(threshold.router.store.getTask(task.id).tokenUsed, 35, "late telemetry cannot revive or mutate a terminal turn");
     assert.ok(threshold.router.lifecycleEvents().some((event) => event.type === "turn started")); assert.ok(threshold.router.lifecycleEvents().some((event) => event.type === "budget interrupt requested"));
   } finally { threshold.dispose(); }
 });

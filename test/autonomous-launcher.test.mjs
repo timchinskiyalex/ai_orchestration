@@ -12,7 +12,11 @@ test("autonomous launcher has no interactive prompt and starts the complete deli
   assert.match(script, /src\/index\.mjs recover/);
   assert.match(script, /NODE_NO_WARNINGS/);
   assert.match(script, /Main window will print stage and budget progress/);
+  assert.match(script, /Checking stale delivery leases before starting/);
   assert.match(script, /src\/index\.mjs', 'deliver/);
   assert.match(script, /completed_merged/);
   assert.match(script, /docs\/orchestration-generated/);
+  const index = readFileSync(join(root, "src", "index.mjs"), "utf8");
+  assert.match(index, /"deterministic scaffold started": "scaffold started"/);
+  assert.match(index, /"budget interrupt requested": "budget interrupt"/);
 });

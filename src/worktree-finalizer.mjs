@@ -4,6 +4,7 @@ import { join, relative } from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { commandCwd, commandsForPaths } from "./project-overlay.mjs";
+import { runManagedProcess } from "./managed-process-runner.mjs";
 
 const exec = promisify(execFile);
 const ARTIFACT_VERSION = 1;
@@ -24,11 +25,12 @@ function pathAllowed(path, task, overlay, { autonomous = true } = {}) {
 }
 
 export class WorktreeFinalizer {
-  constructor({ repository, generatedDir, autonomy = {}, runtimeIdentity = { name: "Codex Swarm Runtime", email: "codex-swarm-runtime@localhost" } }) {
+  constructor({ repository, generatedDir, autonomy = {}, runtimeIdentity = { name: "Codex Swarm Runtime", email: "codex-swarm-runtime@localhost" }, processRunner = runManagedProcess }) {
     this.repository = repository;
     this.generatedDir = generatedDir;
     this.autonomous = autonomy.mode !== "manual";
     this.runtimeIdentity = runtimeIdentity;
+    this.processRunner = processRunner;
   }
 
   async finalize({ task, worktree, branch, overlay, overlayPath }) {
@@ -51,14 +53,23 @@ export class WorktreeFinalizer {
     if (verificationPlan.missing.length) throw new Error("Verification unavailable for a changed scaffolded product component");
     for (const command of verificationPlan.commands) {
       try {
-        const result = await exec(command.executable, command.args, { cwd: commandCwd(worktree, command), timeout: command.timeoutMs ?? 120_000, windowsHide: true });
-        verificationResults.push({ id: command.id, source: command.source, status: "passed", stdout: result.stdout.slice(-4000), stderr: result.stderr.slice(-4000) });
+        const result = await this.processRunner({ executable: command.executable, args: command.args, cwd: commandCwd(worktree, command), timeoutMs: command.timeoutMs ?? 120_000 });
+        verificationResults.push({ id: command.id, source: command.source, status: "passed", pid: result.pid, stdout: result.stdout.slice(-4000), stderr: result.stderr.slice(-4000) });
       } catch (error) {
-        verificationResults.push({ id: command.id, source: command.source, status: "failed", error: error.message, stdout: String(error.stdout ?? "").slice(-4000), stderr: String(error.stderr ?? "").slice(-4000) });
+        verificationResults.push({ id: command.id, source: command.source, status: "failed", error: error.message, pid: error.pid ?? null, timedOut: Boolean(error.timedOut), stdout: String(error.stdout ?? "").slice(-4000), stderr: String(error.stderr ?? "").slice(-4000) });
         throw new Error(`Verification failed: ${command.id}: ${String(error.stderr ?? error.stdout ?? error.message).slice(-1000)}`);
       }
     }
+    const afterVerificationStatus = await gitRaw(worktree, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
+    const afterVerificationPaths = [...new Set(statusPaths(afterVerificationStatus))];
+    const newlyCreatedPaths = afterVerificationPaths.filter((path) => !changedPaths.includes(path));
+    if (newlyCreatedPaths.length) throw new Error(`Verification left unstaged files in the worktree: ${newlyCreatedPaths.join(", ")}`);
     await git(worktree, ["add", "--", ...changedPaths]);
+    // Git's staged name list is canonical on case-insensitive filesystems.
+    // Status porcelain can retain the spelling an agent used for a path even
+    // when that path resolves to an existing directory with different case.
+    const stagedPaths = [...new Set((await gitRaw(worktree, ["diff", "--cached", "--name-only", "-z", "--"])).split("\0").filter(Boolean).map(toPosix))];
+    if (!stagedPaths.length) throw new Error("Finalizer staging produced no changed paths");
     const diff = await git(worktree, ["diff", "--cached", "--binary", "--no-ext-diff", artifactBaseSha, "--"]);
     if (!diff) throw new Error("Finalizer staging produced no diff");
     await exec("git", ["-C", worktree, "-c", `user.name=${this.runtimeIdentity.name}`, "-c", `user.email=${this.runtimeIdentity.email}`, "commit", "-m", `swarm: finalize ${task.id}`]);
@@ -69,7 +80,7 @@ export class WorktreeFinalizer {
     const artifact = {
       schemaVersion: ARTIFACT_VERSION, kind: "WorkerArtifact", taskId: task.id, workUnitId: task.workUnitId ?? task.id, workerId: task.role,
       baseSha: artifactBaseSha, branch, headSha, treeSha, commitRange: `${headBefore}..${headSha}`,
-      diffChecksum: digest(diff), changedPaths, verificationResults, policyResult: { status: "passed", violations: [] },
+      diffChecksum: digest(diff), changedPaths: stagedPaths, verificationResults, policyResult: { status: "passed", violations: [] },
       overlay: { schemaVersion: overlay.schemaVersion, path: overlayPath }, dependencies: task.artifactDependencies ?? task.dependencies ?? [],
       finalizedBy: { component: "WorktreeFinalizer", version: ARTIFACT_VERSION, identity: this.runtimeIdentity.name, finalizedAt: new Date().toISOString(), worktreeRoot: toPosix(worktreeRoot) }
     };

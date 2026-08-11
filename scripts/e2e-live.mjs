@@ -15,7 +15,7 @@ if (!args.includes("--confirm-spend-quota")) {
   process.exitCode = 1;
 } else {
   const reporter = createE2eRunReporter({ reportsRoot: resolve(root, "runtime", "e2e-runs") });
-  const child = spawn(process.execPath, ["--test", "test/real-app-server-e2e.test.mjs"], {
+  const child = spawn(process.execPath, ["--test", "test/real-deterministic-scaffold-e2e.test.mjs"], {
     cwd: root, stdio: "inherit", env: { ...process.env, RUN_REAL_CODEX_E2E: "1", E2E_REPORT_DIR: reporter.runDir, CODEX_E2E_WORKERS: String(workerCount) }
   });
   const result = await new Promise((resolveResult) => {

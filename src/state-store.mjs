@@ -1,4 +1,4 @@
-import { mkdirSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { assertRole, assertTransition } from "./domain.mjs";
@@ -8,10 +8,19 @@ const json = (value) => JSON.stringify(value ?? []);
 const parse = (value, fallback) => (value ? JSON.parse(value) : fallback);
 
 export class StateStore {
-  constructor(filePath) {
-    mkdirSync(dirname(filePath), { recursive: true });
-    this.db = new DatabaseSync(filePath);
-    this.db.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;");
+  constructor(filePath, { readOnly = false } = {}) {
+    const isNewDatabase = !existsSync(filePath);
+    if (!readOnly) mkdirSync(dirname(filePath), { recursive: true });
+    this.db = new DatabaseSync(filePath, { readOnly });
+    // `status`/`watch` deliberately open old runtime databases read-only.  A
+    // pre-migration database must remain observable rather than throwing on a
+    // column added by a newer controller.
+    this.hasTokenUsageSource = this.#hasColumn("tasks", "token_usage_source");
+    if (readOnly) return;
+    // Switching journal mode takes an exclusive SQLite lock. Do it once at
+    // database creation, never in every short-lived status/watch reader.
+    if (isNewDatabase) this.db.exec("PRAGMA journal_mode = WAL;");
+    this.db.exec("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 1000;");
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS tasks (
         id TEXT PRIMARY KEY,
@@ -32,6 +41,7 @@ export class StateStore {
         token_budget INTEGER NOT NULL,
         estimated_tokens INTEGER NOT NULL,
         token_used INTEGER NOT NULL DEFAULT 0,
+        token_usage_source TEXT,
         attempt INTEGER NOT NULL DEFAULT 0,
         max_attempts INTEGER NOT NULL,
         created_at TEXT NOT NULL,
@@ -162,6 +172,8 @@ export class StateStore {
     this.#addColumnIfMissing("tasks", "delivery_run_id", "TEXT");
     this.#addColumnIfMissing("tasks", "interrupt_threshold_tokens", "INTEGER");
     this.#addColumnIfMissing("tasks", "configured_budget_cap", "INTEGER");
+    this.#addColumnIfMissing("tasks", "token_usage_source", "TEXT");
+    this.hasTokenUsageSource = true;
     this.#addColumnIfMissing("delivery_runs", "owner_pid", "INTEGER");
     this.#addColumnIfMissing("delivery_runs", "owner_session_id", "TEXT");
     this.#addColumnIfMissing("delivery_runs", "heartbeat_at", "TEXT");
@@ -237,6 +249,22 @@ export class StateStore {
     return this.db.prepare("SELECT * FROM tasks ORDER BY created_at ASC").all().map((row) => this.#mapTask(row));
   }
 
+  cancelUnfinishedTasks({ reason, deliveryRunId = null } = {}) {
+    const cancellable = ["queued", "preparing", "running", "awaiting_approval", "awaiting_review", "awaiting_human", "blocked_budget"];
+    const tasks = this.db.prepare(`SELECT * FROM tasks WHERE status IN (${cancellable.map(() => "?").join(", ")})${deliveryRunId ? " AND delivery_run_id = ?" : ""} ORDER BY created_at`).all(...cancellable, ...(deliveryRunId ? [deliveryRunId] : []));
+    if (!tasks.length) return [];
+    const timestamp = now();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      for (const task of tasks) {
+        this.db.prepare("UPDATE tasks SET status = 'cancelled', error = ?, updated_at = ? WHERE id = ?").run(reason ?? "cancelled", timestamp, task.id);
+        this.#insertEvent(task.id, "task/status", { from: task.status, to: "cancelled", error: reason ?? "cancelled", recovery: "historical task retained; it will not be resumed" });
+      }
+      this.db.exec("COMMIT");
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    return tasks.map((task) => this.getTask(task.id));
+  }
+
   childCount(parentTaskId) {
     return this.db.prepare("SELECT COUNT(*) AS count FROM tasks WHERE parent_task_id = ?").get(parentTaskId).count;
   }
@@ -284,10 +312,10 @@ export class StateStore {
     this.#mutate(taskId, "thread/linked", { threadId, turnId }, () => this.db.prepare("UPDATE tasks SET thread_id = ?, turn_id = ?, updated_at = ? WHERE id = ?").run(threadId, turnId ?? null, now(), taskId));
   }
 
-  setTokenUsage(taskId, tokenUsed) {
+  setTokenUsage(taskId, tokenUsed, { source = "turn_last" } = {}) {
     const current = this.getTask(taskId);
     const measured = Math.max(current?.tokenUsed ?? 0, Number(tokenUsed) || 0);
-    this.#mutate(taskId, "thread/tokenUsage", { tokenUsed: measured }, () => this.db.prepare("UPDATE tasks SET token_used = ?, updated_at = ? WHERE id = ?").run(measured, now(), taskId));
+    this.#mutate(taskId, "thread/tokenUsage", { tokenUsed: measured, source }, () => this.db.prepare("UPDATE tasks SET token_used = ?, token_usage_source = ?, updated_at = ? WHERE id = ?").run(measured, source, now(), taskId));
   }
 
   setRuntimeBudget(taskId, { interruptThresholdTokens, configuredBudgetCap }) {
@@ -323,21 +351,21 @@ export class StateStore {
     return this.db.prepare(`WITH RECURSIVE family(id) AS (
       SELECT id FROM tasks WHERE id = ?
       UNION ALL SELECT t.id FROM tasks t JOIN family f ON t.parent_task_id = f.id
-    ) SELECT COALESCE(SUM(token_used), 0) AS used,
+    ) SELECT COALESCE(SUM(${this.#measuredUsageSql()}), 0) AS used,
       COALESCE(SUM(CASE WHEN status IN ('queued','preparing','running','awaiting_approval') THEN token_budget ELSE 0 END), 0) AS reserved
       FROM tasks WHERE id IN family`).get(rootTaskId);
   }
 
   weeklyUsageSince(since) {
     return this.db.prepare(`SELECT
-      COALESCE(SUM(token_used), 0) AS used,
+      COALESCE(SUM(${this.#measuredUsageSql()}), 0) AS used,
       COALESCE(SUM(estimated_tokens), 0) AS estimate,
       COALESCE(SUM(CASE WHEN status IN ('queued','preparing','running','awaiting_approval','awaiting_human') THEN token_budget ELSE 0 END), 0) AS reserved
       FROM tasks WHERE created_at >= ?`).get(since);
   }
 
   usageForDeliveryRun(deliveryRunId) {
-    return this.db.prepare(`SELECT COALESCE(SUM(token_used), 0) AS used,
+    return this.db.prepare(`SELECT COALESCE(SUM(${this.#measuredUsageSql()}), 0) AS used,
       COALESCE(SUM(CASE WHEN status IN ('queued','preparing','running','awaiting_approval','awaiting_human') THEN token_budget ELSE 0 END), 0) AS reserved
       FROM tasks WHERE delivery_run_id = ?`).get(deliveryRunId);
   }
@@ -561,7 +589,7 @@ export class StateStore {
       prompt: row.prompt, status: row.status, allowedPaths: parse(row.allowed_paths_json, []), humanApprovalRequired: Boolean(row.human_approval_required), humanApproved: Boolean(row.human_approved),
       acceptanceChecks: parse(row.acceptance_checks_json, []), dependencies: parse(row.dependencies_json, []), worktree: row.worktree,
       branch: row.branch, threadId: row.thread_id, turnId: row.turn_id,
-      tokenBudget: row.token_budget, tokenUsed: row.token_used, attempt: row.attempt,
+      tokenBudget: row.token_budget, tokenUsed: row.token_used, tokenUsageSource: row.token_usage_source, attempt: row.attempt,
       estimatedTokens: row.estimated_tokens,
       maxAttempts: row.max_attempts, createdAt: row.created_at, updatedAt: row.updated_at,
       error: row.error, resultPath: row.result_path,
@@ -580,6 +608,15 @@ export class StateStore {
   #addColumnIfMissing(table, column, definition) {
     const columns = this.db.prepare(`PRAGMA table_info(${table})`).all();
     if (!columns.some((item) => item.name === column)) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  }
+
+  #hasColumn(table, column) {
+    try { return this.db.prepare(`PRAGMA table_info(${table})`).all().some((item) => item.name === column); }
+    catch { return false; }
+  }
+
+  #measuredUsageSql() {
+    return this.hasTokenUsageSource ? "CASE WHEN token_usage_source = 'turn_last' THEN token_used ELSE 0 END" : "0";
   }
 
   #insertEvent(taskId, type, payload) {

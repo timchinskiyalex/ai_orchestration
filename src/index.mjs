@@ -55,7 +55,7 @@ try {
     process.exit(0);
   }
   const { SwarmRouter } = await import("./router.mjs");
-  const router = new SwarmRouter(loadConfig(configPath));
+  const router = new SwarmRouter(loadConfig(configPath), { readOnly: ["status", "watch"].includes(command) });
   try {
     if (command === "init") console.log(router.init());
     else if (command === "recover") {
@@ -98,6 +98,10 @@ try {
         const stage = {
           "thread started": "task started",
           "turn started": "turn started",
+          "deterministic scaffold started": "scaffold started",
+          "deterministic scaffold completed": "scaffold completed",
+          "planner repair turn started": "planner remediation started",
+          "writer repair turn started": "writer remediation started",
           "turn completed": "turn completed",
           "token usage updated": "usage update",
           "budget interrupt requested": "budget interrupt",

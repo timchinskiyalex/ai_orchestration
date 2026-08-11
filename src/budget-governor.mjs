@@ -14,6 +14,9 @@ export class BudgetGovernor {
   }
 
   normalizeUsage(notification) {
-    return notification?.tokenUsage?.total?.totalTokens ?? 0;
+    // App Server sends both a thread/session aggregate (`total`) and the
+    // currently reported turn usage (`last`). Runtime task budgets must never
+    // treat the aggregate as a new worker's consumption.
+    return notification?.tokenUsage?.last?.totalTokens ?? notification?.tokenUsage?.total?.totalTokens ?? 0;
   }
 }

@@ -16,10 +16,8 @@ import { Integrator } from "./integrator.mjs";
 import { remediationScope, validateQualityGateReport } from "./quality-gate.mjs";
 import { validateSecurityGateReport } from "./security-gate.mjs";
 import { GitHubCiAdapter, GitHubMergeAdapter, GitHubPullRequestAdapter, RemoteAdapterError, RemoteCiAdapter, RemoteGitAdapter } from "./remote-adapters.mjs";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
-
-const exec = promisify(execFile);
+import { runManagedProcess } from "./managed-process-runner.mjs";
+import { provisionDeterministicScaffold } from "./deterministic-scaffold.mjs";
 
 export function formatTaskPrompt({ task, worktree, project, overlaySnapshot = null, documentationAvailable = true }) {
   const lines = [
@@ -48,16 +46,41 @@ export function agentResultForTurn(response, turnId) {
   return result;
 }
 
+// The project contract, not an LLM, is authoritative for declared product
+// roots. A planner may omit a root or write `frontend/`; both are safe to
+// canonicalize because this only grants the scaffold task paths explicitly
+// declared in project configuration.
+export function normalizePlannerPlanForProject(value, productRoots = []) {
+  if (!value || typeof value !== "object" || Array.isArray(value) || !Array.isArray(value.tasks) || !productRoots.length) return value;
+  const roots = productRoots.map((item) => item?.path).filter((path) => typeof path === "string" && path.trim()).map((path) => path.replace(/[\\/]+$/, ""));
+  if (!roots.length) return value;
+  const hasProductPath = (paths) => Array.isArray(paths) && paths.some((path) => typeof path === "string" && roots.some((root) => path.replace(/[\\/]+$/, "") === root || path.replace(/[\\/]+$/, "").startsWith(`${root}/`)));
+  return {
+    ...value,
+    tasks: value.tasks.map((task) => {
+      if (!task || typeof task !== "object") return task;
+      if (task.id === "scaffold-product" && Array.isArray(task.allowedPaths) && !task.allowedPaths.some((path) => typeof path !== "string")) {
+        return { ...task, allowedPaths: [...new Set([...task.allowedPaths.map((path) => path.replace(/[\\/]+$/, "")), ...roots])] };
+      }
+      if (task.id !== "scaffold-product" && hasProductPath(task.allowedPaths) && Array.isArray(task.dependsOn) && !task.dependsOn.includes("scaffold-product")) {
+        return { ...task, dependsOn: [...task.dependsOn, "scaffold-product"] };
+      }
+      return task;
+    })
+  };
+}
+
 export class SwarmRouter extends EventEmitter {
-  constructor(config) {
+  constructor(config, { readOnly = false } = {}) {
     super();
     this.config = config;
-    this.store = new StateStore(join(config.runtimeDir, "swarm.sqlite"));
+    this.store = new StateStore(join(config.runtimeDir, "swarm.sqlite"), { readOnly });
     this.governor = new BudgetGovernor(config.router);
     this.worktrees = new WorktreeManager(config);
     this.threadTasks = new Map();
     this.account = new BudgetAccountAdapter(this.store);
-    this.finalizer = new WorktreeFinalizer({ repository: config.repository, generatedDir: config.project.generatedDir, autonomy: config.autonomy });
+    this.processRunner = config.processRunner ?? runManagedProcess;
+    this.finalizer = new WorktreeFinalizer({ repository: config.repository, generatedDir: config.project.generatedDir, autonomy: config.autonomy, processRunner: this.processRunner });
     this.lifecycleTrace = [];
     this.lastAppServerDiagnostics = null;
     this.lifecyclePath = join(config.runtimeDir, "lifecycle.jsonl");
@@ -66,6 +89,7 @@ export class SwarmRouter extends EventEmitter {
     this.stopRequested = false;
     this.expectedClientShutdown = false;
     this.budgetInterruptedTasks = new Set();
+    this.pendingBudgetWatchdogs = new Set();
     this.activeTurns = new Map();
     this.closed = false;
   }
@@ -94,10 +118,7 @@ export class SwarmRouter extends EventEmitter {
     const active = [...this.activeTurns.values()];
     this.#lifecycle("controller shutdown requested", { reason, activeTurns: active.map(({ taskId, threadId, turnId }) => ({ taskId, threadId, turnId })) });
     if (client) {
-      await Promise.race([
-        Promise.allSettled(active.map(({ threadId, turnId }) => client.interruptTurn({ threadId, turnId }))),
-        new Promise((resolve) => setTimeout(resolve, this.config.delivery?.shutdownGraceMs ?? 3_000))
-      ]);
+      await Promise.allSettled(active.map((turn) => this.#interruptAndAwaitTurn(client, turn, reason, { timeoutMs: this.config.delivery?.shutdownGraceMs ?? 3_000 })));
     }
     this.#markInterrupted(reason, { activeTurns: active.map(({ taskId, threadId, turnId }) => ({ taskId, threadId, turnId })) });
     client?.shutdown();
@@ -247,7 +268,7 @@ export class SwarmRouter extends EventEmitter {
       return artifact;
     });
     const { overlay } = loadProjectOverlay(this.config.repository, this.config.project.generatedDir);
-    const result = await new Integrator(this.config).integrate({ artifacts, overlay });
+    const result = await new Integrator({ ...this.config, processRunner: this.processRunner }).integrate({ artifacts, overlay });
     this.store.recordIntegrationManifest(result.path, result.manifest);
     return result;
   }
@@ -307,11 +328,11 @@ export class SwarmRouter extends EventEmitter {
     }
   }
 
-  async runToIntegration({ alreadyIdle = false } = {}) {
-    const gates = this.store.listTasks().filter((task) => ["awaiting_human", "awaiting_approval"].includes(task.status));
+  async runToIntegration({ alreadyIdle = false, deliveryRunId = this.activeDeliveryRunId } = {}) {
+    const gates = this.store.listTasks().filter((task) => (!deliveryRunId || task.deliveryRunId === deliveryRunId) && ["awaiting_human", "awaiting_approval"].includes(task.status));
     if (gates.length) throw new Error(`Run-to-integration refuses to bypass human gates: ${gates.map((task) => task.id).join(", ")}`);
     if (!alreadyIdle) await this.runUntilIdle();
-    const tasks = this.store.listTasks();
+    const tasks = this.store.listTasks().filter((task) => !deliveryRunId || task.deliveryRunId === deliveryRunId);
     const unfinished = tasks.filter((task) => ENGINEERING_DOMAINS.has(task.role) && task.status !== "done");
     if (unfinished.length) throw new Error(`Run-to-integration stopped before completion: ${unfinished.map((task) => `${task.id}:${task.status}`).join(", ")}`);
     const writerIds = tasks.filter((task) => this.config.roles[task.role]?.sandbox === "workspace-write" && task.status === "done").map((task) => task.id);
@@ -380,6 +401,7 @@ export class SwarmRouter extends EventEmitter {
     this.stopRequested = false;
     this.expectedClientShutdown = false;
     this.budgetInterruptedTasks.clear();
+    this.pendingBudgetWatchdogs.clear();
     this.activeTurns.clear();
     this.activeDeliverySessionId = deliveryRunId ? randomUUID() : null;
     if (deliveryRunId) this.store.claimDeliveryLease(deliveryRunId, { ownerPid: process.pid, ownerSessionId: this.activeDeliverySessionId });
@@ -404,6 +426,9 @@ export class SwarmRouter extends EventEmitter {
       const scheduler = { active: 0, blockedQuota: false, blockedBudget: false, failed: false };
       const workers = Array.from({ length: this.config.router.maxConcurrentTasks }, () => this.#worker(client, scheduler));
       await Promise.all(workers);
+      // Notification handlers are intentionally non-blocking, but a terminal
+      // scheduler result must not race a just-started budget interrupt.
+      await Promise.allSettled([...this.pendingBudgetWatchdogs]);
       return { blockedQuota: scheduler.blockedQuota, blockedBudget: scheduler.blockedBudget || this.budgetInterruptedTasks.size > 0, failed: scheduler.failed, interrupted: this.stopRequested, quota: this.quotaThrottleStatus() };
     } finally {
       if (heartbeat) clearInterval(heartbeat);
@@ -442,7 +467,7 @@ export class SwarmRouter extends EventEmitter {
           this.store.transition(task.id, "failed", { error: detail });
           await this.#failFastAfterTaskFailure(client, scheduler, task.id, detail);
         }
-      } finally { scheduler.active -= 1; }
+      } finally { this.#forgetTaskTurn(task.id); scheduler.active -= 1; }
     }
   }
 
@@ -484,6 +509,11 @@ export class SwarmRouter extends EventEmitter {
     this.store.transition(task.id, "running", { worktree, branch });
     this.store.setRuntimeBudget(task.id, runtimeBudget);
 
+    if (this.#isScaffoldTask(task)) {
+      await this.#runDeterministicScaffold(task, { worktree, branch, overlayContext });
+      return;
+    }
+
     const sourceDir = fileURLToPath(new URL(".", import.meta.url));
     const developerInstructions = this.#developerInstructions(sourceDir, task.role);
     const threadResult = await client.startThread({
@@ -497,7 +527,14 @@ export class SwarmRouter extends EventEmitter {
     const threadId = threadResult.thread.id;
     this.threadTasks.set(threadId, task.id);
     this.#lifecycle("thread started", { taskId: task.id, threadId });
-    await client.setGoal({ threadId, objective: `${task.title}\n\n${task.prompt}`, status: "active", tokenBudget: task.tokenBudget });
+    const goal = { threadId, objective: `${task.title}\n\n${task.prompt}`, status: "active" };
+    // Delivery workers in tracking-only mode must not receive a token cap: it
+    // turns the forecast into an agent-visible execution limit. Bootstrap and
+    // Planner are deliberately bounded planning conversations, not product
+    // workers; their soft goal budget keeps a malformed planning turn from
+    // consuming the full delivery allowance before any code is written.
+    if (this.#enforcesLocalBudget() || ["bootstrap", "planner"].includes(task.role)) goal.tokenBudget = task.tokenBudget;
+    await client.setGoal(goal);
     const turnOptions = { threadId, input: [{ type: "text", text: this.#taskPrompt(task, worktree, overlayContext?.snapshot) }] };
     // The generated App Server schema explicitly allows `effort`; it does not
     // expose any server-side max-token field for turn/start.
@@ -505,19 +542,23 @@ export class SwarmRouter extends EventEmitter {
     const turnResult = await client.startTurn(turnOptions);
     const turnId = turnResult.turn.id;
     this.store.setThread(task.id, { threadId, turnId });
-    this.activeTurns.set(task.id, { taskId: task.id, threadId, turnId });
+    const completion = client.waitForTurn(threadId, turnId, this.config.router.turnTimeoutMs);
+    this.activeTurns.set(task.id, { taskId: task.id, threadId, turnId, completion });
     this.#lifecycle("turn started", { taskId: task.id, threadId, turnId });
-    const turn = await client.waitForTurn(threadId, turnId, this.config.router.turnTimeoutMs);
+    const watched = { turn: await completion };
+    const turn = watched.turn;
     const resolvedTurnId = turn.id ?? turnId;
     this.#adoptResolvedTurnId(task.id, threadId, resolvedTurnId);
     this.activeTurns.delete(task.id);
     const current = this.store.getTask(task.id);
-    if (["awaiting_approval", "blocked_budget", "interrupted"].includes(current.status)) return;
+    if (this.budgetInterruptedTasks.has(task.id) && current.status === "running") this.store.transition(task.id, "blocked_budget", { error: "budget_interrupt confirmed before result processing" });
+    if (["awaiting_approval", "blocked_budget", "interrupted"].includes(this.store.getTask(task.id).status)) return;
     if (turn.status === "completed") {
-      const resultText = await this.#readAgentResult(client, threadId, resolvedTurnId);
+      let resultText = watched.resultText ?? await this.#readAgentResult(client, threadId, resolvedTurnId);
+      if (watched.overlayContext) overlayContext = watched.overlayContext;
       let resultPath;
       if (task.role === "bootstrap") validateBootstrap(extractOrchestrationJson(resultText));
-      if (task.role === "planner") this.#materializePlan(task, extractOrchestrationJson(resultText));
+      if (task.role === "planner") resultText = await this.#materializePlannerWithRepair(client, task, threadId, resultText);
       if (task.role === "security") {
         const report = validateSecurityGateReport(extractOrchestrationJson(resultText));
         resultPath = this.#saveSecurityReport(task, report);
@@ -545,10 +586,12 @@ export class SwarmRouter extends EventEmitter {
       resultPath = this.#saveAgentResult(task, resultText);
       this.store.setResultPath(task.id, resultPath);
       if (roleConfig.sandbox === "workspace-write") {
-        if (this.#isScaffoldTask(task)) overlayContext = await this.#refreshProjectOverlayFromWorktree(worktree);
-        const finalized = await this.finalizer.finalize({ task, worktree, branch, overlay: overlayContext.overlay, overlayPath: overlayContext.path });
+        let finalizedArtifact;
+        resultPath = this.#saveAgentResult(task, resultText);
+        this.store.setResultPath(task.id, resultPath);
+        ({ overlayContext, resultText, finalized: finalizedArtifact } = await this.#finalizeWriterWithRepair(client, task, threadId, worktree, branch, overlayContext, resultText));
+        const finalized = finalizedArtifact;
         this.store.recordWorkerArtifact(task.id, finalized.path, finalized.artifact);
-        if (this.#isScaffoldTask(task)) this.#connectScaffoldDependents(task, finalized.artifact);
       }
       this.store.transition(task.id, finalStatusForRole(task.role, { autonomous: this.isAutonomous() }));
       if (task.role === "bootstrap" && this.isAutonomous()) this.#enqueuePlanner(task);
@@ -557,11 +600,59 @@ export class SwarmRouter extends EventEmitter {
     else this.store.transition(task.id, "failed", { error: turn.error?.message ?? "Turn failed" });
   }
 
+  async #interruptAndAwaitTurn(client, { taskId, threadId, turnId }, reason, { timeoutMs = 3_000 } = {}) {
+    if (!client || typeof threadId !== "string" || !threadId || typeof turnId !== "string" || !turnId) {
+      this.#lifecycle("turn interrupt forced client shutdown", { taskId, threadId: threadId ?? null, turnId: turnId ?? null, reason: `${reason}: missing turn identity` });
+      client?.shutdown?.();
+      return { terminal: null, forced: true };
+    }
+    this.#lifecycle("turn interrupt requested", { taskId, threadId, turnId, reason, tokenUsed: this.store.getTask(taskId)?.tokenUsed ?? null });
+    try { await client.interruptTurn({ threadId, turnId }); }
+    catch (error) { this.#lifecycle("turn interrupt request failed", { taskId, threadId, turnId, reason, error: String(error.message).slice(0, 300) }); }
+    let terminal = null;
+    try {
+      const active = taskId ? this.activeTurns.get(taskId) : null;
+      terminal = await Promise.race([
+        active?.completion ?? client.waitForTurn(threadId, turnId, timeoutMs),
+        new Promise((resolve) => setTimeout(() => resolve(null), timeoutMs))
+      ]);
+    } catch { terminal = null; }
+    if (terminal && ["completed", "failed", "interrupted", "cancelled"].includes(terminal.status)) {
+      this.#lifecycle("turn interrupt terminal confirmed", { taskId, threadId, turnId: terminal.id ?? turnId, reason, terminalStatus: terminal.status, tokenUsed: this.store.getTask(taskId)?.tokenUsed ?? null });
+      return { terminal, forced: false };
+    }
+    this.#lifecycle("turn interrupt forced client shutdown", { taskId, threadId, turnId, reason, tokenUsed: this.store.getTask(taskId)?.tokenUsed ?? null });
+    const task = this.store.getTask(taskId);
+    if (task?.status === "running") this.store.transition(taskId, "interrupted", { error: `${reason}: terminal confirmation timed out` });
+    client.shutdown();
+    return { terminal: null, forced: true };
+  }
+
+  #forgetTaskTurn(taskId) {
+    this.activeTurns.delete(taskId);
+    for (const [threadId, mappedTaskId] of this.threadTasks.entries()) if (mappedTaskId === taskId) this.threadTasks.delete(threadId);
+  }
+
+  async #runDeterministicScaffold(task, { worktree, branch, overlayContext }) {
+    if (!worktree || !branch) throw new Error("Deterministic scaffold requires an isolated workspace-write worktree");
+    this.#lifecycle("deterministic scaffold started", { taskId: task.id, worktree });
+    const provision = provisionDeterministicScaffold({ worktree, productRoots: this.config.project.productRoots });
+    const refreshed = await this.#refreshProjectOverlayFromWorktree(worktree);
+    const incomplete = (refreshed.overlay.components ?? []).filter((component) => component.state !== "scaffolded").map((component) => component.root);
+    if (incomplete.length) throw new Error(`Deterministic scaffold did not produce declared component roots: ${incomplete.join(", ")}`);
+    const resultText = `Controller-owned deterministic scaffold completed for ${provision.provisioned.map((item) => `${item.id}:${item.root}`).join(", ")}. No App Server turn was started.`;
+    const resultPath = this.#saveAgentResult(task, resultText);
+    this.store.setResultPath(task.id, resultPath);
+    const finalized = await this.finalizer.finalize({ task, worktree, branch, overlay: refreshed.overlay, overlayPath: refreshed.path });
+    this.store.recordWorkerArtifact(task.id, finalized.path, finalized.artifact);
+    this.#connectScaffoldDependents(task, finalized.artifact);
+    this.store.transition(task.id, finalStatusForRole(task.role, { autonomous: this.isAutonomous() }));
+    this.#lifecycle("deterministic scaffold completed", { taskId: task.id, artifactPath: finalized.path, components: provision.provisioned.map((item) => item.root) });
+  }
+
   #taskPrompt(task, worktree, overlaySnapshot) {
-    const scaffoldRequirement = this.#isScaffoldTask(task) ? "MANDATORY PRODUCT SCAFFOLD: execute the scaffold now in this worktree; do not return an analysis or plan. Create every declared product root: a runnable Next.js frontend with package.json, lockfile, build/test scripts; and an ASP.NET Core Web API solution plus xUnit test project. Verify files exist with git status/diff before finishing. Returning with no changed files is a task failure." : null;
     return [
       formatTaskPrompt({ task, worktree, project: this.config.project, overlaySnapshot, documentationAvailable: existsSync(join(this.config.repository, this.config.project.documentationDir, "inventory.json")) }),
-      scaffoldRequirement,
       this.#structuredOutputContract(task.role),
       "Bounded execution: do only the required scoped work, do not create child agents, avoid long explanations, and return the required structured result. Do not merge, push, modify Router configuration, or bypass approval/sandbox policy."
     ].join("\n");
@@ -584,10 +675,10 @@ export class SwarmRouter extends EventEmitter {
     for (const missing of plan.missing) failed.push({ id: `${missing.component}:declared-verification`, source: "controller", status: "failed", error: missing.reason });
     for (const command of plan.commands) {
       try {
-        await exec(command.executable, command.args, { cwd: commandCwd(worktree, command), timeout: command.timeoutMs ?? 120_000, windowsHide: true });
-        passed.push({ id: command.id, source: "controller", status: "passed" });
+        const result = await runManagedProcess({ executable: command.executable, args: command.args, cwd: commandCwd(worktree, command), timeoutMs: command.timeoutMs ?? 120_000 });
+        passed.push({ id: command.id, source: "controller", status: "passed", pid: result.pid, stdout: result.stdout.slice(-4000), stderr: result.stderr.slice(-4000) });
       } catch (error) {
-        failed.push({ id: command.id, source: "controller", status: "failed", error: String(error.message).slice(0, 500) });
+        failed.push({ id: command.id, source: "controller", status: "failed", error: String(error.message).slice(0, 500), pid: error.pid ?? null, stdout: String(error.stdout ?? "").slice(-4000), stderr: String(error.stderr ?? "").slice(-4000), timedOut: Boolean(error.timedOut) });
       }
     }
     if (!plan.commands.length && !plan.missing.length) notRun.push({ id: "declared-verification", reason: "No changed scaffolded product component requires verification" });
@@ -620,6 +711,70 @@ export class SwarmRouter extends EventEmitter {
     const runProjected = runUsage.used + runReservedWithoutCurrent + task.tokenBudget;
     if (runProjected > hardRunTokenLimit) return { allowed: false, scope: "run", projected: runProjected, limit: hardRunTokenLimit, used: runUsage.used, reservedWithoutCurrent: runReservedWithoutCurrent };
     return { allowed: true, scope: "run", projected: runProjected, limit: hardRunTokenLimit, used: runUsage.used, reservedWithoutCurrent: runReservedWithoutCurrent, weeklyUsed: usage.used, weeklyProjected };
+  }
+
+  async #materializePlannerWithRepair(client, task, threadId, initialResultText) {
+    let resultText = initialResultText;
+    const maxRepairTurns = 2;
+    for (let attempt = 0; attempt <= maxRepairTurns; attempt += 1) {
+      try {
+        this.#materializePlan(task, extractOrchestrationJson(resultText));
+        return resultText;
+      } catch (error) {
+        if (attempt === maxRepairTurns) throw error;
+        const reason = String(error.message).slice(0, 1000);
+        this.#lifecycle("planner validation retry", { taskId: task.id, threadId, attempt: attempt + 1, reason });
+        const retry = await client.startTurn({
+          threadId,
+          effort: "low",
+          input: [{ type: "text", text: `Your previous execution DAG was rejected by the deterministic controller: ${reason}\nReturn a corrected replacement JSON only. Preserve the requested project scope. The controller will normalize declared frontend/backend scaffold paths and direct scaffold dependencies; do not invent risk-flag names.` }]
+        });
+        const requestedTurnId = retry.turn.id;
+        this.store.setThread(task.id, { threadId, turnId: requestedTurnId });
+        const completion = client.waitForTurn(threadId, requestedTurnId, this.config.router.turnTimeoutMs);
+        this.activeTurns.set(task.id, { taskId: task.id, threadId, turnId: requestedTurnId, completion });
+        this.#lifecycle("planner repair turn started", { taskId: task.id, threadId, turnId: requestedTurnId, attempt: attempt + 1 });
+        const turn = await completion;
+        const resolvedTurnId = turn.id ?? requestedTurnId;
+        this.#adoptResolvedTurnId(task.id, threadId, resolvedTurnId);
+        this.activeTurns.delete(task.id);
+        if (turn.status !== "completed") throw new Error(`Planner corrective turn did not complete: ${turn.error?.message ?? turn.status}`);
+        resultText = await this.#readAgentResult(client, threadId, resolvedTurnId);
+      }
+    }
+    throw new Error("Planner validation retry loop terminated unexpectedly");
+  }
+
+  async #finalizeWriterWithRepair(client, task, threadId, worktree, branch, initialOverlayContext, initialResultText) {
+    let overlayContext = initialOverlayContext;
+    let resultText = initialResultText;
+    const maxRepairTurns = 2;
+    for (let attempt = 0; attempt <= maxRepairTurns; attempt += 1) {
+      try {
+        const finalized = await this.finalizer.finalize({ task, worktree, branch, overlay: overlayContext.overlay, overlayPath: overlayContext.path });
+        return { overlayContext, resultText, finalized };
+      } catch (error) {
+        if (attempt === maxRepairTurns) throw error;
+        const reason = String(error.message).slice(0, 1600);
+        this.#lifecycle("writer verification retry", { taskId: task.id, threadId, attempt: attempt + 1, reason });
+        const retry = await client.startTurn({
+          threadId,
+          input: [{ type: "text", text: `The controller could not finalize your work because deterministic validation failed: ${reason}\nFix this failure now inside the existing worktree. Keep all edits within the assigned allowed paths. Run the required checks. Do not explain or plan; make the correction and finish.` }]
+        });
+        const requestedTurnId = retry.turn.id;
+        this.store.setThread(task.id, { threadId, turnId: requestedTurnId });
+        const completion = client.waitForTurn(threadId, requestedTurnId, this.config.router.turnTimeoutMs);
+        this.activeTurns.set(task.id, { taskId: task.id, threadId, turnId: requestedTurnId, completion });
+        this.#lifecycle("writer repair turn started", { taskId: task.id, threadId, turnId: requestedTurnId, attempt: attempt + 1 });
+        const turn = await completion;
+        const resolvedTurnId = turn.id ?? requestedTurnId;
+        this.#adoptResolvedTurnId(task.id, threadId, resolvedTurnId);
+        this.activeTurns.delete(task.id);
+        if (turn.status !== "completed") throw new Error(`Writer corrective turn did not complete: ${turn.error?.message ?? turn.status}`);
+        resultText = await this.#readAgentResult(client, threadId, resolvedTurnId);
+      }
+    }
+    throw new Error("Writer verification retry loop terminated unexpectedly");
   }
 
   #enforcesLocalBudget() { return this.config.budget?.enforceLocalLimits === true; }
@@ -758,7 +913,7 @@ export class SwarmRouter extends EventEmitter {
 
   #structuredOutputContract(role) {
     if (role === "bootstrap") return `Return only one fenced JSON object with this schema:\n{"summary":"string","assumptions":["string"],"risks":["string"],"humanGates":["string"]}`;
-    if (role === "planner") return `Return only one fenced JSON object with this schema:\n{"tasks":[{"id":"safe-kebab-id","title":"string","prompt":"specific implementation instruction","primaryDomain":"backend|frontend|database|qa|security|devops","supportingDomains":["qa|security|..."],"riskFlags":["public_api_change|schema_change|..."],"humanApprovalRequired":false,"estimatedTokens":8000,"dependsOn":["other-task-id"],"allowedPaths":["path"],"acceptanceChecks":["test or check"]}]}. allowedPaths must be explicit. Auth, network, permission, sensitive-data and supply-chain flags require security. Schema/destructive work must use database and humanApprovalRequired=true. Do not create implementation tasks for ambiguity; report it to the human instead.`;
+    if (role === "planner") return `Return only one fenced JSON object with this schema:\n{"tasks":[{"id":"safe-kebab-id","title":"string","prompt":"specific implementation instruction","primaryDomain":"backend|frontend|database|qa|security|devops","supportingDomains":["qa","security"],"riskFlags":["public_api_change"],"humanApprovalRequired":false,"estimatedTokens":8000,"dependsOn":["other-task-id"],"allowedPaths":["path"],"acceptanceChecks":["test or check"]}]}. Return the JSON as your first and only deliverable: do not use web search, do not install packages, do not run tests, and do not explore source code beyond the imported Markdown inventory. allowedPaths must be explicit. riskFlags may contain only: public_api_change, auth_or_authorization, secret_handling, sensitive_data, destructive_data_change, schema_change, production_write, network_exposure, permission_change, dependency_supply_chain, irreversible_operation, high_blast_radius. Use exactly dependency_supply_chain for supply-chain risk. Auth, network, permission, sensitive-data and supply-chain flags require security. Schema/destructive work must use database and humanApprovalRequired=true. Do not create implementation tasks for ambiguity; report it to the human instead.`;
     if (role === "qa") return `Return only one fenced JSON QualityGateReport: {"verdict":"pass|remediation_required|blocked","summary":"string","findings":[{"id":"stable-id","severity":"low|medium|high|critical","path":"relative/path","evidence":"concrete safe evidence","requiredFix":"specific fix","verification":"specific verification"}],"executedChecks":[],"notRunChecks":[]}. Never include secrets or raw command output. A pass requires no findings.`;
     if (role === "security") return `Return only one fenced JSON SecurityGateReport: {"verdict":"pass|remediation_required|blocked","summary":"string","findings":[{"id":"stable-id","severity":"low|medium|high|critical","path":"relative/path","evidence":"concrete safe evidence","requiredFix":"specific fix","verification":"specific verification"}],"executedChecks":[],"notRunChecks":[]}. Never include secrets or raw command output. A pass requires no findings.`;
     return "Return a concise Markdown report with evidence; do not return orchestration JSON.";
@@ -784,7 +939,7 @@ export class SwarmRouter extends EventEmitter {
   }
 
   #materializePlan(plannerTask, parsedPlan) {
-    const plan = validatePlan(parsedPlan, { maxTasks: this.config.router.maxPlanTasks, productRoots: this.config.project.productRoots });
+    const plan = validatePlan(normalizePlannerPlanForProject(parsedPlan, this.config.project.productRoots), { maxTasks: this.config.router.maxPlanTasks, productRoots: this.config.project.productRoots });
     const orderedPlanIds = new Map();
     const pending = [...plan.tasks];
     const dispatch = [];
@@ -820,7 +975,10 @@ export class SwarmRouter extends EventEmitter {
       const primaryId = primaryIds.get(item.id);
       const dependencies = [plannerTask.id, ...dependencyPlanIds.map((dependency) => primaryIds.get(dependency))];
       if (scaffoldTaskId && item.id !== "scaffold-product" && primary.sandbox === "workspace-write" && !dependencies.includes(scaffoldTaskId)) dependencies.push(scaffoldTaskId);
-      specs.push({ id: primaryId, role: item.primaryDomain, parentTaskId: plannerTask.id, title: item.title, prompt: item.id === "scaffold-product" ? `[[product-scaffold]]\n${item.prompt}` : item.prompt, allowedPaths: item.allowedPaths, acceptanceChecks: item.acceptanceChecks, dependencies, estimatedTokens: item.estimatedTokens, tokenBudget: primary.tokenBudget, maxAttempts: 1, humanApprovalRequired: elevatedGate, riskFlags: item.riskFlags, supportingDomains: item.supportingDomains, deliveryRunId: plannerTask.deliveryRunId ?? this.activeDeliveryRunId });
+      const prompt = item.id === "scaffold-product"
+        ? "[[product-scaffold]]\nController-owned scaffold contract: create every declared product root now. frontend/ must be a runnable Next.js application with package.json, npm lockfile, build and test scripts. backend/ must be an ASP.NET Core Web API solution with an xUnit test project. Do not create placeholders, plans, or a partial root. Run the declared checks after files are written."
+        : item.prompt;
+      specs.push({ id: primaryId, role: item.primaryDomain, parentTaskId: plannerTask.id, title: item.title, prompt, allowedPaths: item.allowedPaths, acceptanceChecks: item.acceptanceChecks, dependencies, estimatedTokens: item.estimatedTokens, tokenBudget: primary.tokenBudget, maxAttempts: 1, humanApprovalRequired: elevatedGate, riskFlags: item.riskFlags, supportingDomains: item.supportingDomains, deliveryRunId: plannerTask.deliveryRunId ?? this.activeDeliveryRunId });
       let predecessorId = primaryId;
       const mandatoryReview = primary.sandbox === "workspace-write";
       if ((mandatoryReview || securityRequired) && item.primaryDomain !== "security") {
@@ -849,7 +1007,7 @@ export class SwarmRouter extends EventEmitter {
     scheduler.failed = true;
     const active = [...this.activeTurns.values()].filter((item) => item.taskId !== failedTaskId);
     this.#lifecycle("delivery fail-fast", { taskId: failedTaskId, error: String(error).slice(0, 300), interruptedTasks: active.map((item) => item.taskId) });
-    await Promise.allSettled(active.map(({ threadId, turnId }) => client.interruptTurn({ threadId, turnId })));
+    await Promise.allSettled(active.map((turn) => this.#interruptAndAwaitTurn(client, turn, "delivery_fail_fast", { timeoutMs: this.config.delivery?.shutdownGraceMs ?? 3_000 })));
   }
 
   #connectScaffoldDependents(scaffoldTask, artifact) {
@@ -879,14 +1037,18 @@ export class SwarmRouter extends EventEmitter {
     if (message.method !== "thread/tokenUsage/updated") return;
     const taskId = this.threadTasks.get(message.params.threadId);
     if (!taskId) return;
+    if (this.store.getTask(taskId)?.status !== "running") return;
     // App Server may acknowledge turn/start with a client-facing ID and later
     // emit lifecycle events for its canonical turn ID. Budget interruption must
     // target the canonical ID, otherwise the upstream turn keeps running.
     this.#adoptResolvedTurnId(taskId, message.params.threadId, message.params.turnId);
     const reportedTokenUsed = this.governor.normalizeUsage(message.params);
-    this.store.setTokenUsage(taskId, reportedTokenUsed);
+    this.store.setTokenUsage(taskId, reportedTokenUsed, { source: "turn_last" });
     const tokenUsed = this.store.getTask(taskId)?.tokenUsed ?? reportedTokenUsed;
-    this.#enforceUsageBudget(taskId, tokenUsed).catch((error) => this.#lifecycle("budget watchdog failed", { taskId, error: String(error.message).slice(0, 300) }));
+    const watchdog = this.#enforceUsageBudget(taskId, tokenUsed)
+      .catch((error) => this.#lifecycle("budget watchdog failed", { taskId, error: String(error.message).slice(0, 300) }))
+      .finally(() => this.pendingBudgetWatchdogs.delete(watchdog));
+    this.pendingBudgetWatchdogs.add(watchdog);
   }
 
   #adoptResolvedTurnId(taskId, threadId, resolvedTurnId) {
@@ -895,7 +1057,10 @@ export class SwarmRouter extends EventEmitter {
     if (!task || task.threadId !== threadId || task.turnId === resolvedTurnId) return task;
     const requestedTurnId = task.turnId;
     this.store.setThread(taskId, { threadId, turnId: resolvedTurnId });
-    if (this.activeTurns.has(taskId)) this.activeTurns.set(taskId, { taskId, threadId, turnId: resolvedTurnId });
+    if (this.activeTurns.has(taskId)) {
+      const active = this.activeTurns.get(taskId);
+      this.activeTurns.set(taskId, { ...active, taskId, threadId, turnId: resolvedTurnId });
+    }
     this.#lifecycle("turn id alias resolved", { taskId, threadId, requestedTurnId, resolvedTurnId });
     return this.store.getTask(taskId);
   }
@@ -914,11 +1079,9 @@ export class SwarmRouter extends EventEmitter {
       reason: "budget_interrupt"
     });
     this.#lifecycle("budget interrupt requested", { taskId, threadId: task.threadId, turnId: task.turnId, actualTokens, threshold, configuredCap: task.configuredBudgetCap ?? task.tokenBudget, overshoot: interruption.capOvershootTokens });
-    // Persist terminal state before requesting the best-effort upstream interrupt;
-    // late token notifications can therefore only enrich the recorded overshoot.
-    this.store.transition(taskId, "blocked_budget", { error: `budget_interrupt: actual ${actualTokens}, threshold ${threshold}, configured cap ${task.configuredBudgetCap ?? task.tokenBudget}` });
+    const confirmation = await this.#interruptAndAwaitTurn(this.activeClient, { taskId, threadId: task.threadId, turnId: task.turnId }, "budget_interrupt", { timeoutMs: this.config.delivery?.shutdownGraceMs ?? 3_000 });
+    if (this.store.getTask(taskId)?.status === "running") this.store.transition(taskId, "blocked_budget", { error: `budget_interrupt: actual ${actualTokens}, threshold ${threshold}, configured cap ${task.configuredBudgetCap ?? task.tokenBudget}${confirmation.forced ? "; forced client shutdown" : ""}` });
     if (task.deliveryRunId) this.store.updateDeliveryRun(task.deliveryRunId, { state: "blocked_budget", publish: { reason: "budget_interrupt", taskId, interruption, recovery: { action: "Inspect persisted budget interruption and begin a fresh delivery run after increasing limits or reducing scope." } } });
-    await this.activeClient?.interruptTurn({ threadId: task.threadId, turnId: task.turnId });
   }
 
   #onProtocolEvent(event) {
@@ -958,7 +1121,7 @@ export class SwarmRouter extends EventEmitter {
   #onServerRequest(client, message) {
     const taskId = this.threadTasks.get(message.params?.threadId);
     if (!taskId) {
-      if (message.params?.threadId && message.params?.turnId) client.interruptTurn({ threadId: message.params.threadId, turnId: message.params.turnId }).catch(() => {});
+      if (message.params?.threadId && message.params?.turnId) this.#interruptAndAwaitTurn(client, { taskId: null, threadId: message.params.threadId, turnId: message.params.turnId }, "unexpected_unowned_turn", { timeoutMs: this.config.delivery?.shutdownGraceMs ?? 3_000 }).catch(() => {});
       return;
     }
     this.store.recordApproval({ requestId: message.id, taskId, method: message.method, payload: message.params, decision: "deny" });
@@ -970,7 +1133,7 @@ export class SwarmRouter extends EventEmitter {
     } else if (message.method === "item/permissions/requestApproval") {
       client.respond(message.id, { permissions: {}, scope: "turn" });
     } else {
-      client.interruptTurn({ threadId: message.params?.threadId, turnId: message.params?.turnId }).catch(() => {});
+      this.#interruptAndAwaitTurn(client, { taskId, threadId: message.params?.threadId, turnId: message.params?.turnId }, "unexpected_approval", { timeoutMs: this.config.delivery?.shutdownGraceMs ?? 3_000 }).catch(() => {});
     }
   }
 

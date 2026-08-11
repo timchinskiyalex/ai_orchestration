@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { StateStore } from "../src/state-store.mjs";
 
 test("state store claims, transitions and records usage", () => {
@@ -16,6 +17,7 @@ test("state store claims, transitions and records usage", () => {
     store.setThread("task-1", { threadId: "thr-1", turnId: "turn-1" });
     store.setTokenUsage("task-1", 42);
     assert.equal(store.getTask("task-1").tokenUsed, 42);
+    assert.equal(store.getTask("task-1").tokenUsageSource, "turn_last");
     store.transition("task-1", "done");
     assert.equal(store.getTask("task-1").status, "done");
   } finally {
@@ -53,4 +55,44 @@ test("SQLite lifecycle and external-action idempotency survive a restart", () =>
     assert.equal(store.externalAction("push:origin:candidate").status, "passed");
     assert.equal(store.events({ after: 0, limit: 500 }).length >= 153, true, "bounded in-memory traces cannot erase persisted lifecycle history");
   } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("legacy aggregate token rows remain historical evidence but cannot block new local budget reservations", () => {
+  const dir = mkdtempSync(join(tmpdir(), "codex-swarm-legacy-")); const store = new StateStore(join(dir, "state.sqlite"));
+  try {
+    store.createTask({ id: "legacy", role: "planner", title: "Legacy", prompt: "Legacy", tokenBudget: 100, maxAttempts: 1 });
+    store.db.prepare("UPDATE tasks SET token_used = 999999, token_usage_source = NULL WHERE id = 'legacy'").run();
+    store.createTask({ id: "measured", role: "planner", title: "Measured", prompt: "Measured", tokenBudget: 100, maxAttempts: 1 });
+    store.setTokenUsage("measured", 42, { source: "turn_last" });
+    const usage = store.weeklyUsageSince("2000-01-01T00:00:00.000Z");
+    assert.equal(usage.used, 42);
+    assert.equal(store.getTask("legacy").tokenUsed, 999999, "audit history remains untouched");
+  } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("read-only StateStore reads an active runtime without schema writes", () => {
+  const dir = mkdtempSync(join(tmpdir(), "codex-swarm-readonly-")); const path = join(dir, "state.sqlite");
+  const writer = new StateStore(path); let reader;
+  try {
+    writer.createTask({ id: "task", role: "planner", title: "Plan", prompt: "Plan", tokenBudget: 10, maxAttempts: 1 });
+    reader = new StateStore(path, { readOnly: true });
+    assert.equal(reader.getTask("task").title, "Plan");
+  } finally { reader?.close(); writer.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("read-only status remains available for a pre-migration runtime database", () => {
+  const dir = mkdtempSync(join(tmpdir(), "codex-swarm-legacy-readonly-")); const path = join(dir, "state.sqlite");
+  const legacy = new DatabaseSync(path); let reader;
+  try {
+    legacy.exec(`CREATE TABLE tasks (
+      id TEXT PRIMARY KEY, token_used INTEGER NOT NULL DEFAULT 0,
+      estimated_tokens INTEGER NOT NULL DEFAULT 0, token_budget INTEGER NOT NULL DEFAULT 0,
+      status TEXT NOT NULL, created_at TEXT NOT NULL
+    )`);
+    legacy.prepare("INSERT INTO tasks(id, token_used, estimated_tokens, token_budget, status, created_at) VALUES (?, ?, ?, ?, ?, ?)")
+      .run("old", 120550, 0, 0, "interrupted", "2026-01-01T00:00:00.000Z");
+    legacy.close();
+    reader = new StateStore(path, { readOnly: true });
+    assert.equal(reader.weeklyUsageSince("2000-01-01T00:00:00.000Z").used, 0);
+  } finally { reader?.close(); try { legacy.close(); } catch {} rmSync(dir, { recursive: true, force: true }); }
 });

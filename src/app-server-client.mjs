@@ -30,7 +30,8 @@ function terminalTurnFromThread(result, threadId, turnId) {
 }
 
 function tokenTotals(params = {}) {
-  const usage = params.tokenUsage ?? params.usage ?? params;
+  const rawUsage = params.tokenUsage ?? params.usage ?? params;
+  const usage = rawUsage?.last ?? rawUsage?.total ?? rawUsage;
   const totals = Object.fromEntries(["totalTokens", "inputTokens", "outputTokens", "cachedInputTokens"].map((name) => [name, number(usage?.[name])]).filter(([, value]) => value !== null));
   return Object.keys(totals).length ? totals : null;
 }
