@@ -538,14 +538,18 @@ export class SwarmRouter extends EventEmitter {
     this.store.setThread(task.id, { threadId, turnId });
     this.activeTurns.set(task.id, { taskId: task.id, threadId, turnId });
     this.#lifecycle("turn started", { taskId: task.id, threadId, turnId });
-    const turn = await client.waitForTurn(threadId, turnId, this.config.router.turnTimeoutMs);
+    const watched = this.#isScaffoldTask(task)
+      ? await this.#waitForScaffoldTurn(client, task, threadId, turnId, worktree)
+      : { turn: await client.waitForTurn(threadId, turnId, this.config.router.turnTimeoutMs) };
+    const turn = watched.turn;
     const resolvedTurnId = turn.id ?? turnId;
     this.#adoptResolvedTurnId(task.id, threadId, resolvedTurnId);
     this.activeTurns.delete(task.id);
     const current = this.store.getTask(task.id);
     if (["awaiting_approval", "blocked_budget", "interrupted"].includes(current.status)) return;
     if (turn.status === "completed") {
-      let resultText = await this.#readAgentResult(client, threadId, resolvedTurnId);
+      let resultText = watched.resultText ?? await this.#readAgentResult(client, threadId, resolvedTurnId);
+      if (watched.overlayContext) overlayContext = watched.overlayContext;
       let resultPath;
       if (task.role === "bootstrap") validateBootstrap(extractOrchestrationJson(resultText));
       if (task.role === "planner") resultText = await this.#materializePlannerWithRepair(client, task, threadId, resultText);
@@ -714,6 +718,37 @@ export class SwarmRouter extends EventEmitter {
       resultText = await this.#readAgentResult(client, threadId, resolvedTurnId);
     }
     throw new Error("Scaffold completion retry loop terminated unexpectedly");
+  }
+
+  async #waitForScaffoldTurn(client, task, threadId, turnId, worktree) {
+    const completion = client.waitForTurn(threadId, turnId, this.config.router.turnTimeoutMs)
+      .then((turn) => ({ type: "turn", turn }), (error) => ({ type: "error", error }));
+    const pollMs = Math.max(250, Number(this.config.router.scaffoldCompletionPollMs ?? 2_000));
+    let timer;
+    const ready = new Promise((resolve) => {
+      const inspect = async () => {
+        try {
+          const overlayContext = await this.#refreshProjectOverlayFromWorktree(worktree);
+          const components = overlayContext.overlay.components ?? [];
+          if (components.length && components.every((component) => component.state === "scaffolded")) resolve({ type: "ready", overlayContext });
+        } catch {
+          // Partial scaffolds are normal while the worker is writing files.
+        }
+      };
+      timer = setInterval(inspect, pollMs);
+      inspect();
+    });
+    const outcome = await Promise.race([completion, ready]);
+    clearInterval(timer);
+    if (outcome.type === "error") throw outcome.error;
+    if (outcome.type === "turn") return { turn: outcome.turn };
+    this.#lifecycle("scaffold accepted from worktree", { taskId: task.id, threadId, turnId, components: outcome.overlayContext.overlay.components.map((component) => component.root) });
+    await client.interruptTurn({ threadId, turnId }).catch(() => {});
+    return {
+      turn: { id: turnId, status: "completed" },
+      resultText: "Scaffold accepted by the controller after all declared product roots were verified in the isolated worktree.",
+      overlayContext: outcome.overlayContext
+    };
   }
 
   async #finalizeWriterWithRepair(client, task, threadId, worktree, branch, initialOverlayContext, initialResultText) {
