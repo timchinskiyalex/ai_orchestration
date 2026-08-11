@@ -9,6 +9,9 @@ const root = fileURLToPath(new URL("..", import.meta.url));
 test("autonomous launcher has no interactive prompt and starts the complete delivery command", () => {
   const script = readFileSync(join(root, "scripts", "start-delivery.ps1"), "utf8");
   assert.doesNotMatch(script, /Read-Host|APPROVE|OVERRIDE|\bPUSH\b/i);
+  assert.match(script, /src\/index\.mjs recover/);
+  assert.match(script, /NODE_NO_WARNINGS/);
+  assert.match(script, /Main window will print stage and budget progress/);
   assert.match(script, /src\/index\.mjs', 'deliver/);
   assert.match(script, /completed_merged/);
   assert.match(script, /docs\/orchestration-generated/);
