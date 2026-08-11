@@ -13,9 +13,9 @@ import { BudgetAccountAdapter } from "./budget-account-adapter.mjs";
 import { commandCwd, commandsForPaths, generateProjectOverlay, loadProjectOverlay, projectOverlayExecutionSnapshot } from "./project-overlay.mjs";
 import { WorktreeFinalizer } from "./worktree-finalizer.mjs";
 import { Integrator } from "./integrator.mjs";
-import { remediationScope, requiresHumanQualityGate, validateQualityGateReport } from "./quality-gate.mjs";
+import { remediationScope, validateQualityGateReport } from "./quality-gate.mjs";
 import { validateSecurityGateReport } from "./security-gate.mjs";
-import { RemoteCiAdapter, RemoteGitAdapter } from "./remote-adapters.mjs";
+import { GitHubCiAdapter, GitHubMergeAdapter, GitHubPullRequestAdapter, RemoteAdapterError, RemoteCiAdapter, RemoteGitAdapter } from "./remote-adapters.mjs";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
@@ -57,7 +57,7 @@ export class SwarmRouter extends EventEmitter {
     this.worktrees = new WorktreeManager(config);
     this.threadTasks = new Map();
     this.account = new BudgetAccountAdapter(this.store);
-    this.finalizer = new WorktreeFinalizer({ repository: config.repository, generatedDir: config.project.generatedDir });
+    this.finalizer = new WorktreeFinalizer({ repository: config.repository, generatedDir: config.project.generatedDir, autonomy: config.autonomy });
     this.lifecycleTrace = [];
     this.lastAppServerDiagnostics = null;
     this.lifecyclePath = join(config.runtimeDir, "lifecycle.jsonl");
@@ -198,28 +198,59 @@ export class SwarmRouter extends EventEmitter {
     return result;
   }
 
-  async publishCandidate(integration, { confirmRemotePush = false, remoteGitAdapter = null, remoteCiAdapter = null } = {}) {
+  async publishCandidate(integration, { confirmRemotePush = false, remoteGitAdapter = null, pullRequestAdapter = null, remoteCiAdapter = null, mergeAdapter = null } = {}) {
     const manifest = integration?.manifest;
-    if (!manifest || manifest.status !== "awaiting_human_merge") return { terminalState: "conflict_blocked", status: "conflict_blocked", reason: manifest?.blockedReason ?? "No verified candidate integration manifest" };
+    if (!manifest || !["candidate_ready", "awaiting_human_merge"].includes(manifest.status) || manifest.localVerification?.status !== "passed") return { terminalState: "conflict_blocked", status: "conflict_blocked", reason: manifest?.blockedReason ?? "No locally verified candidate integration manifest" };
     const remote = this.config.remote ?? {};
-    if (!confirmRemotePush || !remote.enabled) return { terminalState: "awaiting_human", status: "awaiting_human_remote_handoff", reason: "Remote push is disabled or requires explicit --confirm-remote-push", candidate: { branch: manifest.branch, sha: manifest.candidateSha } };
-    const idempotencyKey = `push:${remote.remoteName}:${manifest.branch}:${manifest.candidateSha}`;
-    let action = this.store.externalAction(idempotencyKey);
-    if (!action) {
-      this.store.recordExternalAction({ idempotencyKey, kind: "remote-push", status: "started", payload: { branch: manifest.branch, sha: manifest.candidateSha } });
-      const adapter = remoteGitAdapter ?? new RemoteGitAdapter({ repository: this.config.repository, remoteName: remote.remoteName, allowedRemotes: remote.allowedRemotes, branchPrefix: remote.candidateBranchPrefix });
+    const autonomy = { mode: "autonomous", autoPush: true, autoCreatePullRequest: true, autoMerge: true, autoRemediate: true, ...(this.config.autonomy ?? {}) };
+    const autonomous = this.isAutonomous();
+    const auto = autonomous && autonomy.autoPush && autonomy.autoCreatePullRequest && autonomy.autoMerge;
+    if (!remote.enabled || (!auto && !confirmRemotePush)) return { terminalState: autonomous ? "blocked_credentials" : "awaiting_human", status: autonomous ? "blocked_remote" : "awaiting_human_remote_handoff", reason: remote.enabled ? "Remote publication is disabled by autonomy policy." : "Remote publication is disabled in config.", candidate: { branch: manifest.branch, sha: manifest.candidateSha } };
+    const candidate = { branch: manifest.branch, sha: manifest.candidateSha, base: this.config.baseRef };
+    const failure = (error, stage, extra = {}) => {
+      const code = error instanceof RemoteAdapterError ? error.code : "remote_failed";
+      const terminalState = code === "credentials" ? "blocked_credentials" : code === "branch_protection" ? "blocked_branch_protection" : stage === "ci" ? "blocked_ci" : "failed";
+      return { terminalState, status: terminalState, stage, reason: String(error.message ?? error).slice(0, 500), candidate, recovery: { action: "Inspect the persisted remote action and resolve the stated remote condition; rerun the launcher to resume idempotently." }, ...extra };
+    };
+    const runAction = async ({ key, kind, action }) => {
+      let stored = this.store.externalAction(key);
+      if (stored?.status === "passed") return stored.payload;
+      if (!stored) this.store.recordExternalAction({ idempotencyKey: key, kind, status: "started", payload: { candidate } });
       try {
-        const pushed = await adapter.pushCandidate({ branch: manifest.branch, sha: manifest.candidateSha, confirmRemotePush, idempotencyKey });
-        action = this.store.updateExternalAction(idempotencyKey, { status: "passed", payload: pushed });
+        const payload = await action();
+        this.store.updateExternalAction(key, { status: payload?.status === "failed" || payload?.status === "timed_out" ? "failed" : "passed", payload });
+        return payload;
       } catch (error) {
-        this.store.updateExternalAction(idempotencyKey, { status: "failed", payload: { reason: String(error.message).slice(0, 500) } });
-        return { terminalState: "awaiting_human", status: "awaiting_human_remote_handoff", reason: "Remote push failed; inspect recorded recovery", candidate: { branch: manifest.branch, sha: manifest.candidateSha } };
+        this.store.updateExternalAction(key, { status: "failed", payload: { reason: String(error.message ?? error).slice(0, 500), code: error.code ?? null } });
+        throw error;
       }
+    };
+    try {
+      const pushKey = `push:${remote.remoteName}:${candidate.branch}:${candidate.sha}`;
+      const remotePush = await runAction({ key: pushKey, kind: "remote-push", action: () => (remoteGitAdapter ?? new RemoteGitAdapter({ repository: this.config.repository, remoteName: remote.remoteName, allowedRemotes: remote.allowedRemotes, branchPrefix: remote.candidateBranchPrefix })).pushCandidate({ branch: candidate.branch, sha: candidate.sha, confirmRemotePush: auto || confirmRemotePush, idempotencyKey: pushKey }) });
+      if (!autonomy.autoCreatePullRequest && !confirmRemotePush) return { terminalState: "awaiting_human", status: "awaiting_human_remote_handoff", candidate, remotePush, reason: "Candidate is pushed; manual PR mode is active." };
+      const prKey = `pr:${candidate.branch}:${candidate.base}:${candidate.sha}`;
+      const pullRequest = await runAction({ key: prKey, kind: "pull-request", action: async () => {
+        const adapter = pullRequestAdapter ?? new GitHubPullRequestAdapter({ repository: this.config.repository });
+        if (typeof adapter.ensurePullRequest === "function") return adapter.ensurePullRequest({ branch: candidate.branch, base: candidate.base, sha: candidate.sha, idempotencyKey: prKey });
+        if (typeof adapter.handoff === "function") return adapter.handoff(candidate);
+        throw new RemoteAdapterError("pr_create_failed", "Configured pull request adapter cannot create a pull request.");
+      } });
+      if (!pullRequest?.number) throw new RemoteAdapterError("pr_create_failed", "Pull request adapter did not return a PR number.");
+      const ciKey = `ci:${pullRequest.number}:${candidate.sha}`;
+      const remoteCi = await runAction({ key: ciKey, kind: "remote-ci", action: async () => {
+        const adapter = remoteCiAdapter ?? new GitHubCiAdapter({ repository: this.config.repository, timeoutMs: remote.ciTimeoutMs, pollIntervalMs: remote.ciPollIntervalMs });
+        return typeof adapter.waitForChecks === "function" ? adapter.waitForChecks({ pullRequest, candidate }) : adapter.verify(candidate);
+      } });
+      if (remote.requireCi && remoteCi.status !== "passed") return { terminalState: "blocked_ci", status: "blocked_ci", candidate, remotePush, pullRequest, remoteCi, reason: remoteCi.reason ?? "Required remote CI is not green.", recovery: { action: "Read the persisted CI failure summary. A CI-only failure has no safely scoped source remediation artifact, so the candidate is retained without a forced merge." } };
+      if (!autonomy.autoMerge && !confirmRemotePush) return { terminalState: "completed_candidate_ready", status: "completed_candidate_ready", candidate, remotePush, pullRequest, remoteCi };
+      const mergeKey = `merge:${pullRequest.number}:${candidate.sha}`;
+      const merge = await runAction({ key: mergeKey, kind: "pull-request-merge", action: () => (mergeAdapter ?? new GitHubMergeAdapter({ repository: this.config.repository, mergeMethod: remote.mergeMethod })).merge({ pullRequest, candidate, base: candidate.base, idempotencyKey: mergeKey }) });
+      if (merge.status !== "merged" || !merge.mainSha) throw new RemoteAdapterError("merge_verify_failed", "Merge adapter did not verify main after merge.");
+      return { terminalState: "completed_merged", status: "completed_merged", candidate, remotePush, pullRequest, remoteCi, merge };
+    } catch (error) {
+      return failure(error, error?.code?.startsWith("ci") ? "ci" : error?.code?.startsWith("pr") ? "pull-request" : error?.code?.startsWith("merge") || error?.code === "branch_protection" ? "merge" : "push");
     }
-    if (action.status !== "passed") return { terminalState: "awaiting_human", status: "awaiting_human_remote_handoff", reason: "Remote push has incomplete recovery state" };
-    const ci = await (remoteCiAdapter ?? new RemoteCiAdapter()).verify({ branch: manifest.branch, sha: manifest.candidateSha });
-    if (remote.requireCi && ci.status !== "passed") return { terminalState: "awaiting_human", status: "awaiting_human_remote_handoff", reason: ci.reason ?? "Configured remote CI is not passed", remotePush: action.payload, remoteCi: ci };
-    return { terminalState: "completed_candidate_ready", status: "completed_candidate_ready", candidate: { branch: manifest.branch, sha: manifest.candidateSha }, remotePush: action.payload, remoteCi: ci, humanMergeGate: manifest.humanMergeGate };
   }
 
   async runToIntegration({ alreadyIdle = false } = {}) {
@@ -231,13 +262,11 @@ export class SwarmRouter extends EventEmitter {
     if (unfinished.length) throw new Error(`Run-to-integration stopped before completion: ${unfinished.map((task) => `${task.id}:${task.status}`).join(", ")}`);
     const writerIds = tasks.filter((task) => this.config.roles[task.role]?.sandbox === "workspace-write" && task.status === "done").map((task) => task.id);
     if (!writerIds.length) throw new Error("Run-to-integration found no finalized writer artifacts");
-    const security = tasks.filter((task) => task.role === "security" && task.sourceWriterTaskId);
-    const quality = tasks.filter((task) => task.role === "qa" && task.sourceWriterTaskId);
-    const missingSecurity = security.filter((task) => this.store.securityReport(task.id)?.report.verdict !== "pass");
-    const missingQuality = quality.filter((task) => this.store.qualityReport(task.id)?.report.verdict !== "pass");
-    if (missingSecurity.length || missingQuality.length) throw new Error(`Run-to-integration requires passed Security and QA reports: ${[...missingSecurity, ...missingQuality].map((task) => task.id).join(", ")}`);
+    const writers = tasks.filter((task) => this.config.roles[task.role]?.sandbox === "workspace-write" && task.status === "done");
+    const missingReviews = writers.filter((writer) => !this.#writerReviewPassed(writer.id));
+    if (missingReviews.length) throw new Error(`Run-to-integration requires a passed Security and QA report for every final artifact chain: ${missingReviews.map((task) => task.id).join(", ")}`);
     const result = await this.integrateFinalized(writerIds);
-    return { writerArtifacts: writerIds.map((id) => this.store.workerArtifact(id)), integration: result, nextAction: result.manifest.status === "awaiting_human_merge" ? "Review local verification and explicitly create a PR or perform the SHA-bound merge." : "Resolve the blocked integration and retry." };
+    return { writerArtifacts: writerIds.map((id) => this.store.workerArtifact(id)), integration: result, nextAction: result.manifest.status === "candidate_ready" ? "Autonomous remote publication will push the verified candidate, create a PR, wait for CI, and merge when green." : "Resolve the blocked integration and retry." };
   }
 
   startProject() {
@@ -273,13 +302,7 @@ export class SwarmRouter extends EventEmitter {
       return { task: this.store.getTask(task.id), next: null, budget: this.budgetSummary(), forecast: this.implementationForecast(), account: this.accountSummary(), shouldRun: true };
     }
     this.store.transition(task.id, "done");
-    const planner = this.enqueue({
-      role: "planner",
-      parentTaskId: task.id,
-      title: `Plan ${this.config.project.name}`,
-      prompt: `Use the approved Bootstrap blueprint at ${task.resultPath}. Produce the required JSON execution DAG. For this greenfield multi-stack contract, include a devops writer task with id scaffold-product that creates every declared product root before any task writing under frontend/ or backend/.`,
-      dependencies: [task.id], estimatedTokens: this.config.roles.planner.tokenBudget,
-    });
+    const planner = this.#enqueuePlanner(task);
     return { task: this.store.getTask(task.id), next: planner, shouldRun: true };
   }
 
@@ -310,9 +333,10 @@ export class SwarmRouter extends EventEmitter {
       this.#lifecycle("app-server connected");
       const snapshot = await this.account.refresh(client);
       this.#lifecycle(snapshot.diagnostics?.length ? "account read failed" : "account read completed", { diagnostics: snapshot.diagnostics?.length ?? 0 });
-      const scheduler = { active: 0 };
+      const scheduler = { active: 0, blockedQuota: false };
       const workers = Array.from({ length: this.config.router.maxConcurrentTasks }, () => this.#worker(client, scheduler));
       await Promise.all(workers);
+      return { blockedQuota: scheduler.blockedQuota, quota: this.quotaThrottleStatus() };
     } finally {
       this.lastAppServerDiagnostics = client.diagnostics();
       client.shutdown();
@@ -323,7 +347,7 @@ export class SwarmRouter extends EventEmitter {
 
   async #worker(client, scheduler) {
     while (true) {
-      if (this.quotaThrottleStatus().throttled) return;
+      if (this.quotaThrottleStatus().throttled) { scheduler.blockedQuota = true; return; }
       const task = this.store.claimNext();
       if (!task) {
         if (!scheduler.active) return;
@@ -349,15 +373,12 @@ export class SwarmRouter extends EventEmitter {
 
   async #runTask(client, task) {
     const roleConfig = this.config.roles[task.role];
-    let overlayContext = ENGINEERING_DOMAINS.has(task.role) ? this.#workerOverlayContext() : null;
-    if (ENGINEERING_DOMAINS.has(task.role)) {
-      const planner = this.#plannerAncestor(task);
-      const readiness = this.executionReadiness();
-      if (readiness.localP90ProjectedTokens > readiness.localBudget.weeklyTokenLimit && (!planner || !this.store.budgetOverride(planner.id))) {
-        this.store.transition(task.id, "blocked_budget", { error: "P90 local forecast requires a separately recorded human budget override" });
-        return;
-      }
+    const localBudget = this.#localBudgetDecision(task);
+    if (!localBudget.allowed) {
+      this.store.transition(task.id, "blocked_budget", { error: `Local scheduler hard cap blocks this task: projected ${localBudget.projected} exceeds ${localBudget.limit}` });
+      return;
     }
+    let overlayContext = ENGINEERING_DOMAINS.has(task.role) ? this.#workerOverlayContext() : null;
     const rootId = this.#rootId(task);
     const usage = this.store.usageForRoot(rootId);
     const decision = this.governor.canStart({ task, alreadyUsed: usage.used, alreadyReserved: Math.max(0, usage.reserved - task.tokenBudget), parentBudget: this.config.router.defaultParentBudget });
@@ -428,7 +449,7 @@ export class SwarmRouter extends EventEmitter {
         report.notRunChecks = [...report.notRunChecks, ...checks.notRun];
         if (checks.failed.length) {
           report.verdict = "blocked";
-          report.summary = "Controller verification failed; human review is required.";
+          report.summary = "Controller verification failed; autonomous remediation cannot safely continue without valid scoped findings.";
         }
         resultPath = this.#saveQualityReport(task, report);
         this.store.setResultPath(task.id, resultPath);
@@ -444,7 +465,8 @@ export class SwarmRouter extends EventEmitter {
         this.store.recordWorkerArtifact(task.id, finalized.path, finalized.artifact);
         if (this.#isScaffoldTask(task)) this.#connectScaffoldDependents(task, finalized.artifact);
       }
-      this.store.transition(task.id, finalStatusForRole(task.role));
+      this.store.transition(task.id, finalStatusForRole(task.role, { autonomous: this.isAutonomous() }));
+      if (task.role === "bootstrap" && this.isAutonomous()) this.#enqueuePlanner(task);
     }
     else if (turn.status === "interrupted") this.store.transition(task.id, "cancelled", { error: "Turn interrupted" });
     else this.store.transition(task.id, "failed", { error: turn.error?.message ?? "Turn failed" });
@@ -485,6 +507,46 @@ export class SwarmRouter extends EventEmitter {
     return { passed, failed, notRun };
   }
 
+  #enqueuePlanner(bootstrapTask) {
+    const existing = this.store.listTasks().find((task) => task.role === "planner" && task.parentTaskId === bootstrapTask.id);
+    if (existing) return existing;
+    return this.enqueue({
+      role: "planner",
+      parentTaskId: bootstrapTask.id,
+      title: `Plan ${this.config.project.name}`,
+      prompt: `Use the Bootstrap blueprint at ${bootstrapTask.resultPath}. Produce the required JSON execution DAG. For this greenfield multi-stack contract, include a devops writer task with id scaffold-product that creates every declared product root before any task writing under frontend/ or backend/.`,
+      dependencies: [bootstrapTask.id], estimatedTokens: this.config.roles.planner.tokenBudget,
+    });
+  }
+
+  isAutonomous() { return this.config.autonomy?.mode !== "manual"; }
+
+  #localBudgetDecision(task) {
+    const since = new Date(Date.now() - this.config.budget.weeklyWindowDays * 86_400_000).toISOString();
+    const usage = this.store.weeklyUsageSince(since);
+    const reservedWithoutCurrent = Math.max(0, usage.reserved - task.tokenBudget);
+    const projected = usage.used + reservedWithoutCurrent + task.estimatedTokens;
+    return { allowed: projected <= this.config.budget.weeklyTokenLimit, projected, limit: this.config.budget.weeklyTokenLimit, used: usage.used, reservedWithoutCurrent };
+  }
+
+  #writerReviewPassed(writerId) {
+    const tasks = this.store.listTasks();
+    const descendants = new Set([writerId]);
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const task of tasks) {
+        if (this.config.roles[task.role]?.sandbox !== "workspace-write" || descendants.has(task.id)) continue;
+        if ((task.artifactDependencies ?? []).some((dependency) => descendants.has(dependency))) { descendants.add(task.id); changed = true; }
+      }
+    }
+    return [...descendants].some((candidate) => {
+      const security = tasks.find((task) => task.role === "security" && task.sourceWriterTaskId === candidate);
+      const quality = tasks.find((task) => task.role === "qa" && task.sourceWriterTaskId === candidate);
+      return this.store.securityReport(security?.id)?.report.verdict === "pass" && this.store.qualityReport(quality?.id)?.report.verdict === "pass";
+    });
+  }
+
   #saveQualityReport(task, report) {
     const root = join(this.config.repository, this.config.project.generatedDir, "quality-reports");
     mkdirSync(root, { recursive: true });
@@ -511,9 +573,15 @@ export class SwarmRouter extends EventEmitter {
       this.#lifecycle("quality gate passed", { taskId: task.id, writerTaskId: writer.id });
       return;
     }
-    if (requiresHumanQualityGate(report, report.verdict === "remediation_required" && nextRound > maxRounds)) {
-      this.store.transition(task.id, "awaiting_human", { error: report.verdict === "blocked" ? "Quality gate blocked" : "Quality findings require human escalation" });
-      this.#lifecycle("quality gate awaiting human", { taskId: task.id, writerTaskId: writer.id, verdict: report.verdict });
+    const terminal = report.verdict === "blocked" || (report.verdict === "remediation_required" && nextRound > maxRounds);
+    if (terminal) {
+      const reason = report.verdict === "blocked" ? "Quality gate blocked; verification or findings are not safely remediable." : `Quality remediation limit (${maxRounds}) exhausted.`;
+      this.store.transition(task.id, this.isAutonomous() ? "failed" : "awaiting_human", { error: reason });
+      this.#lifecycle(this.isAutonomous() ? "quality gate terminal" : "quality gate awaiting human", { taskId: task.id, writerTaskId: writer.id, verdict: report.verdict, reason });
+      return;
+    }
+    if (!this.isAutonomous() || this.config.autonomy?.autoRemediate === false) {
+      this.store.transition(task.id, "awaiting_human", { error: "Quality findings require manual remediation in manual mode." });
       return;
     }
     const predecessor = this.store.workerArtifactRecord(writer.id);
@@ -563,9 +631,15 @@ export class SwarmRouter extends EventEmitter {
       this.#lifecycle("security gate passed", { taskId: task.id, writerTaskId: writer.id });
       return;
     }
-    if (requiresHumanQualityGate(report, report.verdict === "remediation_required" && nextRound > maxRounds)) {
-      this.store.transition(task.id, "awaiting_human", { error: report.verdict === "blocked" ? "Security gate blocked" : "Security findings require human escalation" });
-      this.#lifecycle("security gate awaiting human", { taskId: task.id, writerTaskId: writer.id, verdict: report.verdict });
+    const terminal = report.verdict === "blocked" || (report.verdict === "remediation_required" && nextRound > maxRounds);
+    if (terminal) {
+      const reason = report.verdict === "blocked" ? "Security gate blocked; findings are not safely remediable." : `Security remediation limit (${maxRounds}) exhausted.`;
+      this.store.transition(task.id, this.isAutonomous() ? "failed" : "awaiting_human", { error: reason });
+      this.#lifecycle(this.isAutonomous() ? "security gate terminal" : "security gate awaiting human", { taskId: task.id, writerTaskId: writer.id, verdict: report.verdict, reason });
+      return;
+    }
+    if (!this.isAutonomous() || this.config.autonomy?.autoRemediate === false) {
+      this.store.transition(task.id, "awaiting_human", { error: "Security findings require manual remediation in manual mode." });
       return;
     }
     const predecessor = this.store.workerArtifactRecord(writer.id);
@@ -615,7 +689,7 @@ export class SwarmRouter extends EventEmitter {
       if (readyIndex === -1) throw new Error("Unable to topologically order the validated plan");
       const [item] = pending.splice(readyIndex, 1);
       const securityRequired = item.supportingDomains.includes("security") || item.riskFlags.some((flag) => ["auth_or_authorization", "secret_handling", "sensitive_data", "network_exposure", "permission_change", "dependency_supply_chain"].includes(flag));
-      const elevatedGate = item.humanApprovalRequired || securityRequired || item.riskFlags.some((flag) => ["schema_change", "destructive_data_change", "irreversible_operation", "permission_change"].includes(flag));
+      const elevatedGate = !this.isAutonomous() && (item.humanApprovalRequired || securityRequired || item.riskFlags.some((flag) => ["schema_change", "destructive_data_change", "irreversible_operation", "permission_change"].includes(flag)));
       if (!this.config.roles[item.primaryDomain]) throw new Error(`No role configuration for planned domain ${item.primaryDomain}`);
       dispatch.push({ item, securityRequired, elevatedGate, dependencyPlanIds: [...item.dependsOn] });
       orderedPlanIds.set(item.id, true);
@@ -732,7 +806,7 @@ export class SwarmRouter extends EventEmitter {
     this.store.recordApproval({ requestId: message.id, taskId, method: message.method, payload: message.params, decision: "deny" });
     const task = this.store.getTask(taskId);
     this.#lifecycle("approval requested", { taskId, threadId: message.params?.threadId ?? null, turnId: message.params?.turnId ?? null, method: message.method });
-    if (task.status === "running") this.store.transition(taskId, "awaiting_approval", { error: `Approval requested: ${message.method}` });
+    if (task.status === "running") this.store.transition(taskId, this.isAutonomous() ? "failed" : "awaiting_approval", { error: this.isAutonomous() ? `Unexpected App Server approval request in autonomous mode: ${message.method}` : `Approval requested: ${message.method}` });
     if (message.method === "item/commandExecution/requestApproval" || message.method === "item/fileChange/requestApproval") {
       client.respond(message.id, { decision: "cancel" });
     } else if (message.method === "item/permissions/requestApproval") {

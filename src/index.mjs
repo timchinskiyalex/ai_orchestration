@@ -30,8 +30,8 @@ function usage() {
   node src/index.mjs override-budget --task <planner-task-id> --reason <human-reason>
   node src/index.mjs integrate --tasks <finalized-task-id,finalized-task-id>
   node src/index.mjs run-to-integration
-  node src/index.mjs deliver --source <directory-with-project-docs> [--confirm-remote-push]
-  node src/index.mjs deliver --resume [--confirm-remote-push]
+  node src/index.mjs deliver --source <directory-with-project-docs>
+  node src/index.mjs deliver --resume
   node src/index.mjs watch [--once] [--interval-ms <ms>]
   node src/index.mjs create-instance --target <empty-instance-repository> --name <project-name>
   node src/index.mjs enqueue --role <bootstrap|planner|backend|frontend|database|qa|security|devops> --title <text> --prompt <text> [--parent <taskId>]
@@ -82,7 +82,7 @@ try {
       if (!Number.isInteger(intervalMs) || intervalMs < 250) throw new Error("--interval-ms must be an integer of at least 250");
       const render = () => {
         const snapshot = router.statusSnapshot();
-        console.log(JSON.stringify({ generatedAt: snapshot.generatedAt, deliveryRun: snapshot.deliveryRun, tasks: snapshot.tasks.map((task) => ({ id: task.id, title: task.title, role: task.role, status: task.status, dependencies: task.dependencies, blocker: task.blocker, tokenUsed: task.tokenUsed, remediationRound: task.remediationRound })), activeTurns: snapshot.activeTurns, realConcurrency: snapshot.realConcurrency, localBudget: snapshot.localBudget, localForecast: snapshot.localForecast, appServerQuotaWindows: snapshot.appServerQuotaWindows, securityReports: snapshot.securityReports, qualityReports: snapshot.qualityReports, requiredHumanAction: snapshot.tasks.filter((task) => ["awaiting_human", "awaiting_approval", "blocked_budget"].includes(task.status)).map((task) => task.id) }, null, 2));
+        console.log(JSON.stringify({ generatedAt: snapshot.generatedAt, deliveryRun: snapshot.deliveryRun, tasks: snapshot.tasks.map((task) => ({ id: task.id, title: task.title, role: task.role, status: task.status, dependencies: task.dependencies, blocker: task.blocker, tokenUsed: task.tokenUsed, remediationRound: task.remediationRound })), activeTurns: snapshot.activeTurns, realConcurrency: snapshot.realConcurrency, localBudget: snapshot.localBudget, localForecast: snapshot.localForecast, appServerQuotaWindows: snapshot.appServerQuotaWindows, securityReports: snapshot.securityReports, qualityReports: snapshot.qualityReports, remoteProgress: snapshot.deliveryRun?.publish ?? null }, null, 2));
       };
       render();
       if (!hasFlag("--once")) await new Promise((resolve) => { const timer = setInterval(render, intervalMs); process.on("SIGINT", () => { clearInterval(timer); resolve(); }); });
@@ -90,8 +90,8 @@ try {
       const { DeliveryCoordinator } = await import("./delivery-coordinator.mjs");
       const coordinator = new DeliveryCoordinator(router);
       const delivery = hasFlag("--resume")
-        ? await coordinator.resume({ confirmRemotePush: hasFlag("--confirm-remote-push") })
-        : await coordinator.begin({ source: option("--source"), confirmRemotePush: hasFlag("--confirm-remote-push") });
+        ? await coordinator.resume()
+        : await coordinator.begin({ source: option("--source") });
       console.log(JSON.stringify(delivery, null, 2));
     }
     else if (command === "ingest-docs") {
@@ -105,7 +105,7 @@ try {
       console.log(`Imported ${result.files} Markdown files. ProjectOverlay: ${overlay.path}. Bootstrap task: ${bootstrap.id}`);
       console.table([router.budgetSummary()]);
       await router.runUntilIdle();
-      console.log("Bootstrap completed. Inspect its artifact with status, then approve it to generate the execution DAG.");
+      console.log("Bootstrap completed. In autonomous mode the delivery command continues directly through Planner, DAG, verification, and publication.");
     } else if (command === "approve") {
       const result = router.approveHumanGate(option("--task"));
       if (result.readiness) {

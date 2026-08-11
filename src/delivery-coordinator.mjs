@@ -2,66 +2,77 @@ import { randomUUID } from "node:crypto";
 import { ingestDocumentation } from "./project-intake.mjs";
 import { ENGINEERING_DOMAINS } from "./domain.mjs";
 
-function gateFor(tasks) {
-  const task = tasks.find((item) => ["awaiting_human", "awaiting_approval", "blocked_budget"].includes(item.status));
+function manualGateFor(tasks) {
+  const task = tasks.find((item) => ["awaiting_human", "awaiting_approval"].includes(item.status));
   if (!task) return null;
-  const reason = task.error ?? (task.status === "blocked_budget" ? "Local budget policy blocks execution" : "Explicit human approval is required");
-  return { taskId: task.id, status: task.status, reason, approveCommand: task.status === "blocked_budget" ? `npm run status -- --json` : `npm run approve -- --task ${task.id}`, resumeCommand: "npm run deliver -- --resume" };
+  return { taskId: task.id, status: task.status, reason: task.error ?? "Explicit manual workflow approval is required", approveCommand: `npm run approve -- --task ${task.id}`, resumeCommand: "npm run deliver -- --resume" };
+}
+
+function terminalForTask(task) {
+  if (task.status === "blocked_budget") return { state: "blocked_budget", reason: task.error ?? "Local scheduler hard cap blocked task execution" };
+  if (task.status === "awaiting_approval") return { state: "failed", reason: task.error ?? "Unexpected App Server approval request" };
+  return { state: "failed", reason: task.error ?? task.status };
 }
 
 export class DeliveryCoordinator {
   constructor(router) { this.router = router; }
 
-  async begin({ source, confirmRemotePush = false }) {
+  async begin({ source, ...adapters }) {
     const current = this.router.store.currentDeliveryRun();
     if (current && ["running", "awaiting_human", "awaiting_human_remote_handoff"].includes(current.state)) throw new Error(`A delivery run is already active: ${current.id}. Use npm run deliver -- --resume.`);
     const intake = ingestDocumentation({ source, repository: this.router.config.repository, destinationRelative: this.router.config.project.documentationDir });
     const overlay = await this.router.ensureProjectOverlay();
     const bootstrap = this.router.startProject();
-    const run = this.router.store.createDeliveryRun({ id: randomUUID(), source, bootstrapTaskId: bootstrap.id, confirmRemotePush });
-    return this.#advance(run, { intake, overlayPath: overlay.path, confirmRemotePush });
+    const run = this.router.store.createDeliveryRun({ id: randomUUID(), source, bootstrapTaskId: bootstrap.id, confirmRemotePush: this.router.isAutonomous() });
+    return this.#advance(run, { intake, overlayPath: overlay.path, ...adapters });
   }
 
-  async resume({ confirmRemotePush = false, remoteGitAdapter = null, remoteCiAdapter = null } = {}) {
+  async resume(adapters = {}) {
     const run = this.router.store.currentDeliveryRun();
     if (!run) throw new Error("No delivery run exists; start with npm run deliver -- --source <docs-dir>");
-    if (run.state === "completed_candidate_ready") return run;
-    if (["failed", "conflict_blocked"].includes(run.state)) return run;
-    const updated = confirmRemotePush && !run.confirmRemotePush ? this.router.store.updateDeliveryRun(run.id, { confirmRemotePush: true, state: "running" }) : run;
-    if (updated.integrationPath && updated.publish?.status === "awaiting_human_remote_handoff") {
-      const manifest = this.router.store.integrationManifest(updated.integrationPath);
-      if (!manifest) throw new Error("Persisted delivery integration manifest is missing");
-      const publish = await this.router.publishCandidate({ path: updated.integrationPath, manifest }, { confirmRemotePush: updated.confirmRemotePush, remoteGitAdapter, remoteCiAdapter });
-      return this.router.store.updateDeliveryRun(updated.id, { state: publish.terminalState, integrationPath: updated.integrationPath, publish, confirmRemotePush: updated.confirmRemotePush });
-    }
-    return this.#advance(updated, { confirmRemotePush: updated.confirmRemotePush, remoteGitAdapter, remoteCiAdapter });
+    if (["completed_merged", "completed_candidate_ready", "failed", "blocked_budget", "blocked_quota", "blocked_credentials", "blocked_ci", "blocked_branch_protection", "conflict_blocked"].includes(run.state)) return run;
+    if (run.integrationPath) return this.#publishPersisted(run, adapters);
+    return this.#advance(run, adapters);
+  }
+
+  async #publishPersisted(run, adapters) {
+    const manifest = this.router.store.integrationManifest(run.integrationPath);
+    if (!manifest) return this.router.store.updateDeliveryRun(run.id, { state: "failed", publish: { reason: "Persisted delivery integration manifest is missing", recovery: { action: "Restore the generated integration manifest before resuming." } } });
+    const publish = await this.router.publishCandidate({ path: run.integrationPath, manifest }, adapters);
+    return this.router.store.updateDeliveryRun(run.id, { state: publish.terminalState, integrationPath: run.integrationPath, publish, confirmRemotePush: this.router.isAutonomous() });
   }
 
   async #advance(run, context = {}) {
-    let gate = gateFor(this.router.list());
-    if (gate) return this.#awaiting(run, gate, context);
-    try { await this.router.runUntilIdle(); }
-    catch (error) { return this.router.store.updateDeliveryRun(run.id, { state: "failed", publish: { reason: String(error.message).slice(0, 500) } }); }
-    const tasks = this.router.list();
-    gate = gateFor(tasks);
-    if (gate) return this.#awaiting(run, gate, context);
-    const failed = tasks.find((task) => ["failed", "cancelled"].includes(task.status));
-    if (failed) return this.router.store.updateDeliveryRun(run.id, { state: "failed", publish: { taskId: failed.id, reason: failed.error ?? failed.status } });
-    const engineering = tasks.filter((task) => ENGINEERING_DOMAINS.has(task.role));
-    if (!engineering.length || engineering.some((task) => task.status !== "done")) return this.router.store.updateDeliveryRun(run.id, { state: "failed", publish: { reason: "Delivery stopped without a valid gate or completed engineering DAG" } });
-    const security = engineering.filter((task) => task.role === "security" && task.sourceWriterTaskId);
-    const quality = engineering.filter((task) => task.role === "qa" && task.sourceWriterTaskId);
-    if (security.some((task) => this.router.store.securityReport(task.id)?.report.verdict !== "pass") || quality.some((task) => this.router.store.qualityReport(task.id)?.report.verdict !== "pass")) {
-      return this.router.store.updateDeliveryRun(run.id, { state: "awaiting_human", publish: { reason: "Required Security or QA gate is not passed" } });
+    if (!this.router.isAutonomous()) {
+      const existingGate = manualGateFor(this.router.list());
+      if (existingGate) return this.#awaiting(run, existingGate);
     }
-    const integration = await this.router.runToIntegration({ alreadyIdle: true });
-    if (integration.integration.manifest.status !== "awaiting_human_merge") return this.router.store.updateDeliveryRun(run.id, { state: "conflict_blocked", integrationPath: integration.integration.path, publish: { reason: integration.integration.manifest.blockedReason } });
-    const publish = await this.router.publishCandidate(integration.integration, { confirmRemotePush: Boolean(context.confirmRemotePush), remoteGitAdapter: context.remoteGitAdapter, remoteCiAdapter: context.remoteCiAdapter });
-    return this.router.store.updateDeliveryRun(run.id, { state: publish.terminalState, integrationPath: integration.integration.path, publish, confirmRemotePush: Boolean(context.confirmRemotePush) });
+    let execution;
+    try { execution = await this.router.runUntilIdle(); }
+    catch (error) { return this.router.store.updateDeliveryRun(run.id, { state: "failed", publish: { reason: String(error.message).slice(0, 500), recovery: { action: "Inspect the preserved task worktree and structured task error." } } }); }
+    if (execution?.blockedQuota) return this.router.store.updateDeliveryRun(run.id, { state: "blocked_quota", publish: { reason: execution.quota?.reason ?? "App Server quota policy blocked new turns", quota: execution.quota } });
+    const tasks = this.router.list();
+    if (!this.router.isAutonomous()) {
+      const gate = manualGateFor(tasks);
+      if (gate) return this.#awaiting(run, gate);
+    }
+    const terminalTask = tasks.find((task) => ["failed", "cancelled", "blocked_budget", "awaiting_approval"].includes(task.status));
+    if (terminalTask) {
+      const terminal = terminalForTask(terminalTask);
+      return this.router.store.updateDeliveryRun(run.id, { state: terminal.state, publish: { taskId: terminalTask.id, reason: terminal.reason, recovery: { action: "Inspect the task result/report and preserved worktree, correct the source condition, then start a fresh delivery run." } } });
+    }
+    const engineering = tasks.filter((task) => ENGINEERING_DOMAINS.has(task.role));
+    if (!engineering.length || engineering.some((task) => task.status !== "done")) return this.router.store.updateDeliveryRun(run.id, { state: "failed", publish: { reason: "Delivery stopped without a completed engineering DAG", recovery: { action: "Inspect the persisted scheduler state and task dependencies." } } });
+    let integration;
+    try { integration = await this.router.runToIntegration({ alreadyIdle: true }); }
+    catch (error) { return this.router.store.updateDeliveryRun(run.id, { state: "conflict_blocked", publish: { reason: String(error.message).slice(0, 500), recovery: { action: "Inspect the retained candidate/worktree and verification results." } } }); }
+    if (integration.integration.manifest.status !== "candidate_ready") return this.router.store.updateDeliveryRun(run.id, { state: "conflict_blocked", integrationPath: integration.integration.path, publish: { reason: integration.integration.manifest.blockedReason, recovery: integration.integration.manifest.recovery } });
+    const publish = await this.router.publishCandidate(integration.integration, context);
+    return this.router.store.updateDeliveryRun(run.id, { state: publish.terminalState, integrationPath: integration.integration.path, publish, confirmRemotePush: this.router.isAutonomous() });
   }
 
-  #awaiting(run, gate, context) {
-    const updated = this.router.store.updateDeliveryRun(run.id, { state: "awaiting_human", confirmRemotePush: Boolean(context.confirmRemotePush) });
+  #awaiting(run, gate) {
+    const updated = this.router.store.updateDeliveryRun(run.id, { state: "awaiting_human", confirmRemotePush: false });
     return { ...updated, terminalState: "awaiting_human", currentGate: gate };
   }
 }

@@ -42,8 +42,7 @@ export function depthOf(task, taskById) {
   return depth;
 }
 
-export function finalStatusForRole(role) {
-  if (role === "bootstrap") return "awaiting_human";
-  if (role === "planner") return "awaiting_human";
+export function finalStatusForRole(role, { autonomous = true } = {}) {
+  if (!autonomous && (role === "bootstrap" || role === "planner")) return "awaiting_human";
   return "done";
 }

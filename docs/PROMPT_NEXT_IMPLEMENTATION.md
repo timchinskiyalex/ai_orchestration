@@ -157,3 +157,6 @@ E2E не має торкатися реальних репозиторіїв, pr
 5. Disposable реальний App Server E2E проходить незалежну перевірку Git і тестів.
 6. Evals блокують небезпечні routing regressions.
 7. Існуючі сценарії template не зламані; усі тести проходять.
+# Superseded historical implementation prompt
+
+> This document is retained only for audit history. It does not describe current operator actions; use `./START_DEVELOPMENT.cmd` and the README.

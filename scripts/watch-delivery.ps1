@@ -7,6 +7,9 @@ $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
 Set-Location -LiteralPath $projectRoot
 
-Write-Host "Live delivery monitor. Press Ctrl+C in this window to stop monitoring; delivery continues."
-& npm.cmd run watch -- --interval-ms $IntervalMs
-exit $LASTEXITCODE
+while ($true) {
+  Clear-Host
+  & node src/index.mjs status --json
+  if ($LASTEXITCODE -ne 0) { throw "Could not read autonomous delivery status" }
+  Start-Sleep -Milliseconds $IntervalMs
+}
