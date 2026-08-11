@@ -21,7 +21,7 @@ export function validateBootstrap(value) {
   return value;
 }
 
-export function validatePlan(value, { maxTasks }) {
+export function validatePlan(value, { maxTasks, productRoots = [] }) {
   if (!value || typeof value !== "object" || !Array.isArray(value.tasks)) fail("plan must contain a tasks array");
   if (!value.tasks.length) fail("plan must contain at least one task");
   if (value.tasks.length > maxTasks) fail(`plan exceeds configured maxPlanTasks (${maxTasks})`);
@@ -44,6 +44,18 @@ export function validatePlan(value, { maxTasks }) {
   for (const task of value.tasks) {
     for (const dependency of task.dependsOn) {
       if (!ids.has(dependency) || dependency === task.id) fail(`task '${task.id}' has an invalid dependency '${dependency}'`);
+    }
+  }
+  if (productRoots.length) {
+    const scaffold = value.tasks.find((task) => task.id === "scaffold-product");
+    if (!scaffold) fail("greenfield multi-stack plan requires a scaffold-product task");
+    if (scaffold.primaryDomain !== "devops") fail("scaffold-product must be a devops writer task");
+    const roots = productRoots.map((item) => item.path);
+    if (!roots.every((root) => scaffold.allowedPaths.includes(root))) fail("scaffold-product must be allowed to create every declared product root");
+    for (const task of value.tasks) {
+      if (task.id === scaffold.id) continue;
+      const writesProduct = task.allowedPaths.some((path) => roots.some((root) => path === root || path.startsWith(`${root}/`)));
+      if (writesProduct && !task.dependsOn.includes(scaffold.id)) fail(`product task '${task.id}' must directly depend on scaffold-product`);
     }
   }
   const visiting = new Set();

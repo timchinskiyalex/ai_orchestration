@@ -1,29 +1,31 @@
 {
-  "name": "ai-orchestration-template",
-  "version": "0.1.0",
-  "private": true,
-  "type": "module",
-  "description": "Reusable, safety-first foundation for project-specific Codex App Server orchestrators.",
-  "scripts": {
-    "init": "node src/index.mjs init",
-    "status": "node src/index.mjs status",
-    "enqueue": "node src/index.mjs enqueue",
-    "ingest-docs": "node src/index.mjs ingest-docs",
-    "orchestrate": "node src/index.mjs orchestrate",
-    "approve": "node src/index.mjs approve",
-    "override-budget": "node src/index.mjs override-budget",
-    "integrate": "node src/index.mjs integrate",
-    "run-to-integration": "node src/index.mjs run-to-integration",
-    "deliver": "node src/index.mjs deliver",
-    "watch": "node src/index.mjs watch",
-    "create-instance": "node src/index.mjs create-instance",
-    "run": "node src/index.mjs run",
-    "test": "node --test",
-    "e2e:live": "node scripts/e2e-live.mjs",
-    "e2e:cleanup": "node scripts/e2e-cleanup.mjs",
-    "test:app-server-schema": "node scripts/app-server-schema-preflight.mjs"
-  },
-  "engines": {
-    "node": ">=24.0.0"
-  }
+    "name":  "ai-orchestration-template",
+    "version":  "0.1.0",
+    "private":  true,
+    "type":  "module",
+    "description":  "Reusable, safety-first foundation for project-specific Codex App Server orchestrators.",
+    "scripts":  {
+                    "init":  "node src/index.mjs init",
+                    "status":  "node src/index.mjs status",
+                    "enqueue":  "node src/index.mjs enqueue",
+                    "ingest-docs":  "node src/index.mjs ingest-docs",
+                    "orchestrate":  "node src/index.mjs orchestrate",
+                    "approve":  "node src/index.mjs approve",
+                    "override-budget":  "node src/index.mjs override-budget",
+                    "integrate":  "node src/index.mjs integrate",
+                    "run-to-integration":  "node src/index.mjs run-to-integration",
+                    "deliver":  "node src/index.mjs deliver",
+                    "watch":  "node src/index.mjs watch",
+                    "create-instance":  "node src/index.mjs create-instance",
+                    "run":  "node src/index.mjs run",
+                    "test":  "node --test",
+                    "e2e:live":  "node scripts/e2e-live.mjs",
+                    "e2e:cleanup":  "node scripts/e2e-cleanup.mjs",
+                    "test:app-server-schema":  "node scripts/app-server-schema-preflight.mjs",
+                    "develop":  "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/start-delivery.ps1",
+                    "start:delivery":  "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/start-delivery.ps1"
+                },
+    "engines":  {
+                    "node":  "\u003e=24.0.0"
+                }
 }

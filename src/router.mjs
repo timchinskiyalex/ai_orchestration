@@ -10,7 +10,7 @@ import { StateStore } from "./state-store.mjs";
 import { WorktreeManager } from "./worktree-manager.mjs";
 import { extractOrchestrationJson, validateBootstrap, validatePlan } from "./workflow-contract.mjs";
 import { BudgetAccountAdapter } from "./budget-account-adapter.mjs";
-import { generateProjectOverlay, loadProjectOverlay, projectOverlayExecutionSnapshot } from "./project-overlay.mjs";
+import { commandCwd, commandsForPaths, generateProjectOverlay, loadProjectOverlay, projectOverlayExecutionSnapshot } from "./project-overlay.mjs";
 import { WorktreeFinalizer } from "./worktree-finalizer.mjs";
 import { Integrator } from "./integrator.mjs";
 import { remediationScope, requiresHumanQualityGate, validateQualityGateReport } from "./quality-gate.mjs";
@@ -181,7 +181,7 @@ export class SwarmRouter extends EventEmitter {
   }
 
   async ensureProjectOverlay() {
-    return generateProjectOverlay({ repository: this.config.repository, baseRef: this.config.baseRef, generatedDir: this.config.project.generatedDir });
+    return generateProjectOverlay({ repository: this.config.repository, baseRef: this.config.baseRef, generatedDir: this.config.project.generatedDir, project: this.config.project });
   }
 
   async integrateFinalized(taskIds) {
@@ -277,7 +277,7 @@ export class SwarmRouter extends EventEmitter {
       role: "planner",
       parentTaskId: task.id,
       title: `Plan ${this.config.project.name}`,
-      prompt: `Use the approved Bootstrap blueprint at ${task.resultPath}. Produce the required JSON execution DAG.`,
+      prompt: `Use the approved Bootstrap blueprint at ${task.resultPath}. Produce the required JSON execution DAG. For this greenfield multi-stack contract, include a devops writer task with id scaffold-product that creates every declared product root before any task writing under frontend/ or backend/.`,
       dependencies: [task.id], estimatedTokens: this.config.roles.planner.tokenBudget,
     });
     return { task: this.store.getTask(task.id), next: planner, shouldRun: true };
@@ -349,7 +349,7 @@ export class SwarmRouter extends EventEmitter {
 
   async #runTask(client, task) {
     const roleConfig = this.config.roles[task.role];
-    const overlayContext = ENGINEERING_DOMAINS.has(task.role) ? this.#workerOverlayContext() : null;
+    let overlayContext = ENGINEERING_DOMAINS.has(task.role) ? this.#workerOverlayContext() : null;
     if (ENGINEERING_DOMAINS.has(task.role)) {
       const planner = this.#plannerAncestor(task);
       const readiness = this.executionReadiness();
@@ -422,7 +422,8 @@ export class SwarmRouter extends EventEmitter {
       }
       if (task.role === "qa") {
         const report = validateQualityGateReport(extractOrchestrationJson(resultText));
-        const checks = await this.#runDeclaredVerification(worktree, overlayContext.overlay);
+        const artifact = this.store.workerArtifact(task.sourceWriterTaskId);
+        const checks = await this.#runDeclaredVerification(worktree, overlayContext.overlay, artifact?.changedPaths ?? []);
         report.executedChecks = [...report.executedChecks, ...checks.passed];
         report.notRunChecks = [...report.notRunChecks, ...checks.notRun];
         if (checks.failed.length) {
@@ -438,8 +439,10 @@ export class SwarmRouter extends EventEmitter {
       resultPath = this.#saveAgentResult(task, resultText);
       this.store.setResultPath(task.id, resultPath);
       if (roleConfig.sandbox === "workspace-write") {
+        if (this.#isScaffoldTask(task)) overlayContext = await this.#refreshProjectOverlayFromWorktree(worktree);
         const finalized = await this.finalizer.finalize({ task, worktree, branch, overlay: overlayContext.overlay, overlayPath: overlayContext.path });
         this.store.recordWorkerArtifact(task.id, finalized.path, finalized.artifact);
+        if (this.#isScaffoldTask(task)) this.#connectScaffoldDependents(task, finalized.artifact);
       }
       this.store.transition(task.id, finalStatusForRole(task.role));
     }
@@ -466,17 +469,19 @@ export class SwarmRouter extends EventEmitter {
     }
   }
 
-  async #runDeclaredVerification(worktree, overlay) {
+  async #runDeclaredVerification(worktree, overlay, changedPaths = []) {
     const passed = []; const failed = []; const notRun = [];
-    for (const command of overlay.verificationCommands ?? []) {
+    const plan = commandsForPaths(overlay, changedPaths);
+    for (const missing of plan.missing) failed.push({ id: `${missing.component}:declared-verification`, source: "controller", status: "failed", error: missing.reason });
+    for (const command of plan.commands) {
       try {
-        await exec(command.executable, command.args, { cwd: worktree, timeout: command.timeoutMs ?? 120_000, windowsHide: true });
+        await exec(command.executable, command.args, { cwd: commandCwd(worktree, command), timeout: command.timeoutMs ?? 120_000, windowsHide: true });
         passed.push({ id: command.id, source: "controller", status: "passed" });
       } catch (error) {
         failed.push({ id: command.id, source: "controller", status: "failed", error: String(error.message).slice(0, 500) });
       }
     }
-    if (!overlay.verificationCommands?.length) notRun.push({ id: "declared-verification", reason: "ProjectOverlay declared no verification command" });
+    if (!plan.commands.length && !plan.missing.length) notRun.push({ id: "declared-verification", reason: "No changed scaffolded product component requires verification" });
     return { passed, failed, notRun };
   }
 
@@ -601,7 +606,7 @@ export class SwarmRouter extends EventEmitter {
   }
 
   #materializePlan(plannerTask, parsedPlan) {
-    const plan = validatePlan(parsedPlan, { maxTasks: this.config.router.maxPlanTasks });
+    const plan = validatePlan(parsedPlan, { maxTasks: this.config.router.maxPlanTasks, productRoots: this.config.project.productRoots });
     const orderedPlanIds = new Map();
     const pending = [...plan.tasks];
     const dispatch = [];
@@ -634,7 +639,7 @@ export class SwarmRouter extends EventEmitter {
     for (const { item, elevatedGate, securityRequired, dependencyPlanIds } of dispatch) {
       const primary = assertRoute(item.primaryDomain, item.estimatedTokens);
       const primaryId = primaryIds.get(item.id);
-      specs.push({ id: primaryId, role: item.primaryDomain, parentTaskId: plannerTask.id, title: item.title, prompt: item.prompt, allowedPaths: item.allowedPaths, acceptanceChecks: item.acceptanceChecks, dependencies: [plannerTask.id, ...dependencyPlanIds.map((dependency) => primaryIds.get(dependency))], estimatedTokens: item.estimatedTokens, tokenBudget: primary.tokenBudget, maxAttempts: 1, humanApprovalRequired: elevatedGate, riskFlags: item.riskFlags, supportingDomains: item.supportingDomains });
+      specs.push({ id: primaryId, role: item.primaryDomain, parentTaskId: plannerTask.id, title: item.title, prompt: item.id === "scaffold-product" ? `[[product-scaffold]]\n${item.prompt}` : item.prompt, allowedPaths: item.allowedPaths, acceptanceChecks: item.acceptanceChecks, dependencies: [plannerTask.id, ...dependencyPlanIds.map((dependency) => primaryIds.get(dependency))], estimatedTokens: item.estimatedTokens, tokenBudget: primary.tokenBudget, maxAttempts: 1, humanApprovalRequired: elevatedGate, riskFlags: item.riskFlags, supportingDomains: item.supportingDomains });
       let predecessorId = primaryId;
       const mandatoryReview = primary.sandbox === "workspace-write";
       if ((mandatoryReview || securityRequired) && item.primaryDomain !== "security") {
@@ -652,6 +657,18 @@ export class SwarmRouter extends EventEmitter {
     this.store.createTasks(specs);
   }
 
+  async #refreshProjectOverlayFromWorktree(worktree) {
+    return generateProjectOverlay({ repository: this.config.repository, inspectionRoot: worktree, baseRef: this.config.baseRef, generatedDir: this.config.project.generatedDir, project: this.config.project });
+  }
+
+  #isScaffoldTask(task) { return task.prompt.startsWith("[[product-scaffold]]"); }
+
+  #connectScaffoldDependents(scaffoldTask, artifact) {
+    for (const task of this.store.listTasks()) {
+      if (task.id === scaffoldTask.id || !task.dependencies.includes(scaffoldTask.id) || this.config.roles[task.role]?.sandbox !== "workspace-write") continue;
+      this.store.setArtifactLineage(task.id, { artifactBaseSha: artifact.headSha, artifactDependencies: [scaffoldTask.id] });
+    }
+  }
   #inheritedWorktree(task) {
     let parent = task.parentTaskId ? this.store.getTask(task.parentTaskId) : null;
     while (parent) {

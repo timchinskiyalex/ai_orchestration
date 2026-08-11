@@ -2,7 +2,11 @@
   "project": {
     "name": "replace-with-project-name",
     "documentationDir": "docs/orchestration-input",
-    "generatedDir": "docs/orchestration-generated"
+    "generatedDir": "docs/orchestration-generated",
+    "productRoots": [
+      { "id": "frontend", "path": "frontend", "adapter": "next-node" },
+      { "id": "backend", "path": "backend", "adapter": "dotnet" }
+    ]
   },
   "repository": "D:/path/to/your/git/repository",
   "baseRef": "main",

@@ -5,6 +5,7 @@ import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { validateWorkerArtifact } from "./worktree-finalizer.mjs";
+import { commandCwd, commandsForPaths } from "./project-overlay.mjs";
 
 const exec = promisify(execFile);
 const toPosix = (value) => value.replace(/\\/g, "/");
@@ -79,8 +80,10 @@ export class Integrator {
         catch { await git(worktree, ["cherry-pick", "--abort"]); return this.#blocked(overlay, sorted, `CONFLICT_BLOCKED: cherry-pick failed for ${artifact.taskId}`, { id, branch, worktree, applied }); }
       }
       const verificationResults = [];
-      for (const command of overlay.verificationCommands ?? []) {
-        try { const result = await exec(command.executable, command.args, { cwd: worktree, timeout: command.timeoutMs ?? 120_000, windowsHide: true }); verificationResults.push({ id: command.id, status: "passed", stdout: result.stdout.slice(-4000), stderr: result.stderr.slice(-4000) }); }
+      const verificationPlan = commandsForPaths(overlay, (overlay.components ?? []).filter((component) => component.state === "scaffolded").map((component) => component.root));
+      if (verificationPlan.missing.length) return this.#blocked(overlay, sorted, "CONFLICT_BLOCKED: integration verification unavailable for a scaffolded component", { id, branch, worktree, applied, verificationResults });
+      for (const command of verificationPlan.commands) {
+        try { const result = await exec(command.executable, command.args, { cwd: commandCwd(worktree, command), timeout: command.timeoutMs ?? 120_000, windowsHide: true }); verificationResults.push({ id: command.id, status: "passed", stdout: result.stdout.slice(-4000), stderr: result.stderr.slice(-4000) }); }
         catch (error) { verificationResults.push({ id: command.id, status: "failed", error: error.message }); return this.#blocked(overlay, sorted, `CONFLICT_BLOCKED: integration verification failed (${command.id})`, { id, branch, worktree, applied, verificationResults }); }
       }
       const [headSha, clean] = await Promise.all([git(worktree, ["rev-parse", "HEAD"]), gitRaw(worktree, ["status", "--porcelain=v1", "-z", "--untracked-files=all"])]);

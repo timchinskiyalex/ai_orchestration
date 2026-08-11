@@ -199,6 +199,11 @@ export class StateStore {
     return row ? this.#mapTask(row) : null;
   }
 
+  setArtifactLineage(taskId, { artifactBaseSha, artifactDependencies }) {
+    if (!this.getTask(taskId)) throw new Error(`Task not found: ${taskId}`);
+    this.db.prepare("UPDATE tasks SET artifact_base_sha = ?, artifact_dependencies_json = ?, updated_at = ? WHERE id = ? AND status = 'queued'").run(artifactBaseSha, json(artifactDependencies), now(), taskId);
+    return this.getTask(taskId);
+  }
   listTasks() {
     return this.db.prepare("SELECT * FROM tasks ORDER BY created_at ASC").all().map((row) => this.#mapTask(row));
   }

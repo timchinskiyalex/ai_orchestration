@@ -10,6 +10,7 @@ export function loadConfig(configPath) {
   config.project.name ??= "unnamed-project";
   config.project.documentationDir ??= "docs/orchestration-input";
   config.project.generatedDir ??= "docs/orchestration-generated";
+  config.project.productRoots ??= [];
   config.repository = resolve(base, config.repository);
   config.runtimeDir = resolve(base, config.runtimeDir ?? "./runtime");
   config.baseRef ??= "main";
@@ -45,6 +46,21 @@ export function loadConfig(configPath) {
   };
   config.project.documentationDir = safeProjectPath("project.documentationDir", config.project.documentationDir);
   config.project.generatedDir = safeProjectPath("project.generatedDir", config.project.generatedDir);
+  if (!Array.isArray(config.project.productRoots)) throw new Error("project.productRoots must be an allowlisted array");
+  const supportedProductAdapters = new Set(["next-node", "dotnet"]);
+  const productIds = new Set();
+  const productPaths = new Set();
+  config.project.productRoots = config.project.productRoots.map((entry, index) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) throw new Error(`project.productRoots[${index}] must be an object`);
+    const { id, path, adapter } = entry;
+    if (typeof id !== "string" || !/^[a-z][a-z0-9-]{0,31}$/.test(id) || productIds.has(id)) throw new Error("project.productRoots ids must be unique safe identifiers");
+    if (!supportedProductAdapters.has(adapter)) throw new Error(`project.productRoots[${index}].adapter is not allowlisted`);
+    const normalizedPath = safeProjectPath(`project.productRoots[${index}].path`, path);
+    if (productPaths.has(normalizedPath) || normalizedPath === config.project.documentationDir || normalizedPath === config.project.generatedDir) throw new Error("project.productRoots paths must be unique and outside controller directories");
+    if ((id === "frontend") !== (adapter === "next-node") || (id === "backend") !== (adapter === "dotnet")) throw new Error("project.productRoots must use frontend/next-node and backend/dotnet identities");
+    productIds.add(id); productPaths.add(normalizedPath);
+    return { id, path: normalizedPath, adapter };
+  });
   if (config.router.approvalMode !== "deny") throw new Error("Only router.approvalMode=deny is implemented in this safety-first MVP");
   if (!Number.isInteger(config.router.maxConcurrentTasks) || config.router.maxConcurrentTasks < 1) throw new Error("router.maxConcurrentTasks must be a positive integer");
   if (!Number.isInteger(config.router.turnTimeoutMs) || config.router.turnTimeoutMs < 1000) throw new Error("router.turnTimeoutMs must be an integer of at least 1000");
