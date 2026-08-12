@@ -7,16 +7,19 @@ export const ACCEPTANCE_STATUSES = new Set(["pass", "partial", "missing", "not_v
 const sha = (value) => /^[a-f0-9]{40,64}$/i.test(value ?? "");
 const fail = (message) => { throw new Error(`Invalid ProductAcceptanceReport: ${message}`); };
 export const acceptanceDigest = (value) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
+const stable = (value) => typeof value === "string" && value.trim().length > 0;
 
-function validateResult(result, knownRequirements, knownCriteria) {
+function validateEvidence(evidence, candidateSha, label) {
+  if (!evidence || typeof evidence !== "object" || !ACCEPTANCE_STATUSES.has(evidence.status) || !stable(evidence.kind) || !stable(evidence.reference)) fail(`${label} must have a valid status, stable kind, and stable reference`);
+  if (!sha(evidence.candidateSha) || evidence.candidateSha.toLowerCase() !== candidateSha.toLowerCase()) fail(`${label} candidateSha must exactly match the report candidate SHA`);
+}
+
+function validateResult(result, knownRequirements, knownCriteria, candidateSha) {
   if (!result || typeof result !== "object" || !ACCEPTANCE_STATUSES.has(result.status)) fail("result has invalid status");
   if (!knownRequirements.has(result.requirementId)) fail(`unknown requirement '${result.requirementId}'`);
   if (result.criterionId !== null && result.criterionId !== undefined && !knownCriteria.has(`${result.requirementId}:${result.criterionId}`)) fail(`unknown criterion '${result.criterionId}'`);
   if (!Array.isArray(result.evidence) || !result.evidence.length) fail(`result '${result.requirementId}' requires structured evidence`);
-  for (const evidence of result.evidence) {
-    if (!evidence || typeof evidence !== "object" || typeof evidence.kind !== "string" || typeof evidence.reference !== "string" || !evidence.reference || !ACCEPTANCE_STATUSES.has(evidence.status)) fail("evidence must be a structured reference with status");
-    if (evidence.candidateSha !== undefined && !sha(evidence.candidateSha)) fail("evidence candidateSha is invalid");
-  }
+  for (const evidence of result.evidence) validateEvidence(evidence, candidateSha, "result evidence");
 }
 
 export function validateProductAcceptanceReport(report, { blueprint, blueprintDigest, manifest, manifestPath = null } = {}) {
@@ -29,7 +32,8 @@ export function validateProductAcceptanceReport(report, { blueprint, blueprintDi
   if (Number.isNaN(Date.parse(report.generatedAt)) || !Array.isArray(report.results) || !report.results.length || !report.evidence || typeof report.evidence !== "object") fail("timestamp, results, or evidence is invalid");
   const knownRequirements = new Set(blueprint.requirements.map((item) => item.requirementId));
   const knownCriteria = new Set(blueprint.requirements.flatMap((item) => item.acceptanceCriteria.map((criterion) => `${item.requirementId}:${criterion.criterionId}`)));
-  for (const result of report.results) validateResult(result, knownRequirements, knownCriteria);
+  for (const category of ["integration", "qa", "security", "productE2e", "ci"]) validateEvidence(report.evidence[category], report.candidateSha, `${category} evidence`);
+  for (const result of report.results) validateResult(result, knownRequirements, knownCriteria, report.candidateSha);
   for (const requirement of blueprint.requirements) {
     const requirementResult = report.results.find((item) => item.requirementId === requirement.requirementId && (item.criterionId === null || item.criterionId === undefined));
     if (!requirementResult) fail(`missing requirement result '${requirement.requirementId}'`);

@@ -45,6 +45,16 @@ class RepairingWriterClient extends DeliveryClient {
     return { id: turnId, status: "completed" };
   }
 }
+class SourceBlockedClient extends DeliveryClient {
+  async readThread({ threadId }) {
+    const thread = this.threads.get(threadId);
+    if (/^Bootstrap/.test(thread.goal)) {
+      const blueprint = fakeBlueprint(thread.cwd, { question: { questionId: "missing-source-fact", description: "A source fact is missing.", requiredForRequirementIds: ["fix-value"], status: "unresolved" } });
+      return { thread: { turns: [{ id: `turn-${threadId}`, items: [{ type: "agentMessage", text: `\`\`\`json\n${JSON.stringify(blueprint)}\n\`\`\`` }] }] } };
+    }
+    return super.readThread({ threadId });
+  }
+}
 function setup(remote = true) {
   const root = mkdtempSync(join(tmpdir(), "delivery-coordinator-")); git(root, ["init", "-b", "main"]); mkdirSync(join(root, "src")); mkdirSync(join(root, "test")); const source = join(root, "requirements"); mkdirSync(source); writeFileSync(join(source, "requirements.md"), "# Requirement\nFix value.\n"); writeFileSync(join(root, "package.json"), JSON.stringify({ packageManager: "npm@10", scripts: { test: "node --test" } })); writeFileSync(join(root, "package-lock.json"), "{}"); writeFileSync(join(root, "src", "value.mjs"), "export const value = 1;\n"); writeFileSync(join(root, "test", "value.test.mjs"), "import test from 'node:test'; import assert from 'node:assert/strict'; import { value } from '../src/value.mjs'; test('value',()=>assert.equal(value,2));\n"); git(root, ["add", "."]); git(root, ["-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "base"]);
   const roles = Object.fromEntries(["bootstrap", "planner", "backend", "frontend", "database", "qa", "security", "devops"].map((role) => [role, { sandbox: role === "backend" ? "workspace-write" : "read-only", approvalPolicy: "never", tokenBudget: 200, usesWorktree: role === "backend" }]));
@@ -75,6 +85,25 @@ test("completed autonomous delivery is restart-idempotent", async () => {
   try {
     const ready = await coordinator.begin({ source: fixture.source, ...fakeRemote(calls) }); assert.equal(ready.state, "completed_merged");
     const restarted = await coordinator.resume(fakeRemote(calls)); assert.equal(restarted.state, "completed_merged"); assert.deepEqual(calls, { push: 1, pr: 1, ci: 1, merge: 1 });
+  } finally { router.close(); rmSync(fixture.root, { recursive: true, force: true }); }
+});
+
+test("green exact-candidate CI without available product E2E evidence is blocked_acceptance and never merges", async () => {
+  const fixture = setup(true); const router = new SwarmRouter(fixture.config); const coordinator = new DeliveryCoordinator(router); const calls = { push: 0, pr: 0, ci: 0, merge: 0 };
+  try {
+    const adapters = fakeRemote(calls); delete adapters.productEvidenceAdapter;
+    const final = await coordinator.begin({ source: fixture.source, ...adapters });
+    assert.equal(final.state, "blocked_acceptance"); assert.equal(calls.merge, 0);
+    const report = router.store.productAcceptanceForRun(final.id);
+    assert.equal(report.passing, false); assert.equal(report.report.evidence.productE2e.status, "not_verified");
+  } finally { router.close(); rmSync(fixture.root, { recursive: true, force: true }); }
+});
+
+test("only a persisted source-specification blocker yields blocked_specification", async () => {
+  const fixture = setup(true); fixture.config.appServerClientFactory = () => new SourceBlockedClient(); const router = new SwarmRouter(fixture.config); const coordinator = new DeliveryCoordinator(router); const calls = { push: 0, pr: 0, ci: 0, merge: 0 };
+  try {
+    const final = await coordinator.begin({ source: fixture.source, ...fakeRemote(calls) });
+    assert.equal(final.state, "blocked_specification"); assert.deepEqual(calls, { push: 0, pr: 0, ci: 0, merge: 0 });
   } finally { router.close(); rmSync(fixture.root, { recursive: true, force: true }); }
 });
 

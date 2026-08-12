@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { GitHubCiAdapter, PullRequestAdapter, RemoteCiAdapter, RemoteGitAdapter, assertSafeRemoteTarget } from "../src/remote-adapters.mjs";
+import { GitHubCiAdapter, GitHubMergeAdapter, PullRequestAdapter, RemoteCiAdapter, RemoteGitAdapter, assertSafeRemoteTarget } from "../src/remote-adapters.mjs";
 
 test("RemoteGitAdapter verifies exact SHA without force-push and refuses unsafe targets", async () => {
   const calls = []; let pushed = false; const sha = "a".repeat(40);
@@ -21,7 +21,7 @@ function githubForChecks({ runs = [], statuses = [] }) {
   return {
     async repositoryName() { return "owner/repo"; },
     async api(args) {
-      const path = args.at(-1);
+      const path = args.find((item) => typeof item === "string" && item.startsWith("repos/"));
       if (path.includes("check-runs")) return { stdout: JSON.stringify({ check_runs: runs }) };
       if (path.endsWith("/status")) return { stdout: JSON.stringify({ sha: "a".repeat(40), statuses }) };
       throw new Error(`Unexpected GitHub API request: ${path}`);
@@ -32,15 +32,32 @@ function githubForChecks({ runs = [], statuses = [] }) {
 test("required CI contexts are evaluated only for the exact candidate SHA", async () => {
   const candidate = { sha: "a".repeat(40), base: "main" };
   const check = (name, status, conclusion = null, headSha = candidate.sha) => ({ name, status, conclusion, head_sha: headSha });
-  const verify = async (fixture) => new GitHubCiAdapter({ github: githubForChecks(fixture), requiredContexts: ["build"], timeoutMs: 1, pollIntervalMs: 1 }).waitForChecks({ pullRequest: { number: 7 }, candidate });
+  const verify = async (fixture) => new GitHubCiAdapter({ github: githubForChecks(fixture), requiredContexts: ["build", "lint"], timeoutMs: 1, pollIntervalMs: 1 }).waitForChecks({ pullRequest: { number: 7 }, candidate });
   const unrelated = await verify({ runs: [check("unrelated", "completed", "success")] });
   assert.equal(unrelated.status, "timed_out"); assert.equal(unrelated.required[0].state, "missing");
-  const pending = await verify({ runs: [check("build", "in_progress", null)] });
+  const missing = await verify({ runs: [check("build", "completed", "success")] });
+  assert.equal(missing.status, "timed_out"); assert.equal(missing.required[1].state, "missing");
+  const pending = await verify({ runs: [check("build", "in_progress", null), check("lint", "completed", "success")] });
   assert.equal(pending.status, "timed_out"); assert.equal(pending.required[0].state, "pending");
-  const failed = await verify({ runs: [check("build", "completed", "failure")] });
+  const failed = await verify({ runs: [check("build", "completed", "failure"), check("lint", "completed", "success")] });
   assert.equal(failed.status, "failed");
-  const stale = await verify({ runs: [check("build", "completed", "success", "b".repeat(40))] });
+  const stale = await verify({ runs: [check("build", "completed", "success", "b".repeat(40)), check("lint", "completed", "success")] });
   assert.equal(stale.status, "timed_out"); assert.equal(stale.required[0].state, "missing");
-  const passed = await verify({ runs: [check("build", "completed", "success")] });
-  assert.equal(passed.status, "passed"); assert.deepEqual(passed.requiredContexts, ["build"]);
+  const passed = await verify({ runs: [check("build", "completed", "success"), check("lint", "completed", "success")] });
+  assert.equal(passed.status, "passed"); assert.deepEqual(passed.requiredContexts, ["build", "lint"]);
+});
+
+test("GitHub merge refuses a PR whose head mutated after green candidate CI", async () => {
+  const candidate = { branch: "swarm/candidate/test", sha: "a".repeat(40), base: "main" }; let mergeCalls = 0;
+  const github = {
+    async repositoryName() { return "owner/repo"; },
+    async api(args) {
+      const path = args.find((item) => typeof item === "string" && item.startsWith("repos/"));
+      if (path === "repos/owner/repo/pulls/9") return { stdout: JSON.stringify({ number: 9, head: { sha: "b".repeat(40) }, base: { ref: "main" } }) };
+      if (path.includes("/merge")) { mergeCalls += 1; return { stdout: "{}" }; }
+      throw new Error(`Unexpected GitHub API request: ${path}`);
+    }
+  };
+  await assert.rejects(new GitHubMergeAdapter({ repository: "C:/repo", github }).merge({ pullRequest: { number: 9 }, candidate, base: "main", idempotencyKey: "merge:9" }), /no longer points at the candidate SHA/);
+  assert.equal(mergeCalls, 0);
 });

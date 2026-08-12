@@ -24,3 +24,18 @@ test("candidate and immutable manifest identities are required", () => {
   const manifestBad = report(); manifestBad.integrationManifestId = "other";
   assert.throws(() => validateProductAcceptanceReport(manifestBad, { blueprint, blueprintDigest: "b".repeat(64), manifest, manifestPath: "docs/out/manifest.json" }), /manifest identity/);
 });
+
+test("every top-level and result evidence item is stable and bound to the exact candidate", () => {
+  for (const mutate of [
+    (value) => { value.evidence.integration = { status: "pass" }; },
+    (value) => { value.evidence.qa.kind = "   "; },
+    (value) => { value.evidence.security.reference = ""; },
+    (value) => { delete value.evidence.productE2e.candidateSha; },
+    (value) => { value.evidence.ci.candidateSha = "c".repeat(40); },
+    (value) => { value.results[0].evidence[0].candidateSha = "c".repeat(40); },
+    (value) => { value.results[1].evidence[0].kind = ""; }
+  ]) {
+    const value = report(); mutate(value);
+    assert.throws(() => validateProductAcceptanceReport(value, { blueprint, blueprintDigest: "b".repeat(64), manifest, manifestPath: "docs/out/manifest.json" }));
+  }
+});
