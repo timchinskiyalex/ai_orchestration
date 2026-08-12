@@ -3,6 +3,8 @@
     "name": "replace-with-project-name",
     "documentationDir": "docs/orchestration-input",
     "generatedDir": "docs/orchestration-generated",
+    "repositoryMode": "legacy",
+    "repositoryBaselineDeclaration": null,
     "productRoots": [
       { "id": "frontend", "path": "frontend", "adapter": "next-node" },
       { "id": "backend", "path": "backend", "adapter": "dotnet" }

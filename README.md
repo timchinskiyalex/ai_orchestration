@@ -80,6 +80,14 @@ The controller root is not a product root. Configure allowlisted product roots:
 
 Greenfield repositories are valid before either root exists. Planner must create `scaffold-product`; every product task directly depends on it. After scaffold, the controller refreshes the ProjectOverlay from the scaffold worktree. Frontend verification runs only declared scripts in `frontend/package.json`; backend verification runs allowlisted `dotnet test` against the discovered solution/project in `backend/`. A scaffolded component without a declared/allowlisted verification command blocks integration rather than passing empty QA.
 
+## Brownfield repository baselines
+
+`project.repositoryMode` defaults to `legacy`. `greenfield` remains baseline-free. Set `brownfield` only for an existing repository and provide one configured, repository-relative `repositoryBaselineDeclaration` file. The controller captures its exact `baseRef` SHA and tracked tree before Bootstrap, then finalizes an immutable baseline only after the ProductBlueprint is persisted.
+
+The declaration is input, never worker evidence. It declares safe behavior IDs, labels/categories, protected write surfaces, one existing ProjectOverlay verification command ID per behavior, explicit impact edges, and optional selected tracked paths. Planner tasks whose `allowedPaths` intersect an impact edge must provide the exact controller-required `baselineBehaviorIds`; these links never widen write authority. Candidate acceptance reruns the named checks in the integrated worktree and requires one exact-SHA, exact-baseline passing proof per protected behavior before publication or merge.
+
+Brownfield records missing or failing this identity check become `blocked_repository_baseline` before an App Server or remote action. Status exposes only mode, IDs, digests, SHAs, counts, state, and allowlisted reason codes; it does not project declaration contents, paths, commands, or outputs.
+
 ## Verification
 
 ```powershell

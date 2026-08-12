@@ -2,6 +2,7 @@ function fail(message) { throw new Error(`Invalid orchestration JSON: ${message}
 import { enforceRoutingInvariants } from "./routing-evaluator.mjs";
 import { assertMandatoryRequirementCoverage, authorizeBootstrapClaims, validateRequirementIds } from "./product-blueprint.mjs";
 import { isWriteSurfaceAncestorOrSame, normalizeAllowedPaths } from "./write-surface.mjs";
+import { validateTaskBaselineBehaviorIds } from "./repository-baseline.mjs";
 const domains = new Set(["backend", "frontend", "database", "qa", "security", "devops"]);
 const riskFlags = new Set(["public_api_change", "auth_or_authorization", "secret_handling", "sensitive_data", "destructive_data_change", "schema_change", "production_write", "network_exposure", "permission_change", "dependency_supply_chain", "irreversible_operation", "high_blast_radius"]);
 const sha = (value) => typeof value === "string" && /^[a-f0-9]{40,64}$/i.test(value);
@@ -19,7 +20,7 @@ export function validateBootstrap(value, { sourceDocuments = null, sourceResolve
   catch (error) { fail(error.message.replace(/^Invalid ProductBlueprint: /, "")); }
 }
 
-export function validatePlan(value, { maxTasks, productRoots = [], blueprint = null, requirePlanBatch = false, allowPartialRequirementCoverage = false, recovery = false } = {}) {
+export function validatePlan(value, { maxTasks, productRoots = [], blueprint = null, requirePlanBatch = false, allowPartialRequirementCoverage = false, recovery = false, repositoryBaseline = null } = {}) {
   if (!value || typeof value !== "object" || !Array.isArray(value.tasks)) fail("PlanBatch must contain a tasks array");
   const hasBatchFields = ["schemaVersion", "kind", "id", "deliveryRunId", "wave", "basedOnCheckpointSha", "createdAt"].some((key) => key in value);
   if (requirePlanBatch || hasBatchFields) {
@@ -35,7 +36,7 @@ export function validatePlan(value, { maxTasks, productRoots = [], blueprint = n
   const ids = new Set();
   for (const task of value.tasks) {
     if (!task || typeof task !== "object") fail("every task must be an object");
-    for (const key of ["id", "title", "prompt", "primaryDomain", "supportingDomains", "riskFlags", "estimatedTokens", "dependsOn", "allowedPaths", "acceptanceChecks", "humanApprovalRequired", ...(blueprint ? ["requirementIds"] : [])]) {
+    for (const key of ["id", "title", "prompt", "primaryDomain", "supportingDomains", "riskFlags", "estimatedTokens", "dependsOn", "allowedPaths", "acceptanceChecks", "humanApprovalRequired", ...(blueprint ? ["requirementIds"] : []), ...(repositoryBaseline ? ["baselineBehaviorIds"] : [])]) {
       if (!(key in task)) fail(`task is missing '${key}'`);
     }
     if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(task.id)) fail(`task id '${task.id}' is unsafe`);
@@ -45,6 +46,10 @@ export function validatePlan(value, { maxTasks, productRoots = [], blueprint = n
     if (![task.supportingDomains, task.riskFlags, task.dependsOn, task.allowedPaths, task.acceptanceChecks, ...(blueprint ? [task.requirementIds] : [])].every(Array.isArray)) fail(`task '${task.id}' array fields are invalid`);
     try { task.allowedPaths = normalizeAllowedPaths(task.allowedPaths); }
     catch (error) { fail(`task '${task.id}' ${error.message.replace(/^Invalid write surface: /, "")}`); }
+    if (repositoryBaseline) {
+      try { task.baselineBehaviorIds = validateTaskBaselineBehaviorIds(task, repositoryBaseline); }
+      catch (error) { fail(`task '${task.id}' ${error.message.replace(/^repository_baseline:/, "")}`); }
+    }
     if (blueprint) {
       try { validateRequirementIds(task.requirementIds, blueprint); }
       catch (error) { fail(`task '${task.id}' ${error.message.replace(/^Invalid ProductBlueprint: /, "")}`); }

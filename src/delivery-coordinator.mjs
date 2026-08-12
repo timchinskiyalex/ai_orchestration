@@ -33,11 +33,15 @@ export class DeliveryCoordinator {
     if (cancelled.length) this.router.store.recordEvent(null, "delivery/fresh-start-cleanup", { previousDeliveryRunId: current?.id ?? null, cancelledTaskIds: cancelled.map((task) => task.id) });
     const intake = ingestDocumentation({ source, repository: this.router.config.repository, destinationRelative: this.router.config.project.documentationDir });
     const overlay = await this.router.ensureProjectOverlay();
+    // Brownfield identity is captured before Bootstrap creates the ProductBlueprint.
+    // The immutable draft is finalized only after that persisted blueprint exists.
+    const baselineDraft = this.router.captureRepositoryBaselineDraft(overlay);
     // Intake is verified before Bootstrap is even queued; no blueprint is
     // required at this phase because Bootstrap is the operation that creates it.
     const sourceClaimManifestId = this.router.sourceClaimManifestIdentity();
     const bootstrap = this.router.startProject();
-    const run = this.router.createDeliveryRun({ id: randomUUID(), source, bootstrapTaskId: bootstrap.id, confirmRemotePush: this.router.isAutonomous(), sourceClaimManifestId });
+    const run = this.router.createDeliveryRun({ id: randomUUID(), source, bootstrapTaskId: bootstrap.id, confirmRemotePush: this.router.isAutonomous(), sourceClaimManifestId, repositoryMode: this.router.config.project.repositoryMode, repositoryBaseSha: baselineDraft?.baseSha ?? null });
+    if (baselineDraft) this.router.store.recordRepositoryBaselineDraft(run.id, baselineDraft);
     this.router.store.linkTaskToDelivery(bootstrap.id, run.id);
     return this.#advance(run, { intake, overlayPath: overlay.path, ...adapters });
   }
@@ -46,6 +50,10 @@ export class DeliveryCoordinator {
     this.router.recoverStaleDeliveries();
     const run = this.router.store.currentDeliveryRun();
     if (!run) throw new Error("No delivery run exists; start with npm run deliver -- --source <docs-dir>");
+    if (typeof this.router.assertRepositoryBaseline === "function") {
+      try { this.router.assertRepositoryBaseline(run); }
+      catch (error) { return this.router.blockRunForRepositoryBaseline(run, error); }
+    }
     if (["completed_merged", "completed_candidate_ready", "blocked_budget", "blocked_quota", "blocked_specification", "blocked_acceptance", "conflict_blocked"].includes(run.state)) return run;
     const resumed = ["interrupted", "blocked_credentials", "blocked_ci", "blocked_branch_protection", "failed"].includes(run.state)
       ? this.router.resumeDeliveryRun(run.id)
@@ -63,6 +71,10 @@ export class DeliveryCoordinator {
   }
 
   async #publishPersisted(run, adapters) {
+    if (typeof this.router.assertRepositoryBaseline === "function") {
+      try { this.router.assertRepositoryBaseline(run); }
+      catch (error) { return this.router.blockRunForRepositoryBaseline(run, error); }
+    }
     try { this.router.assertRunSourceCompleteness(run); }
     catch (error) { return this.router.blockRunForSourceCompleteness(run, error); }
     const manifest = this.router.store.integrationManifest(run.integrationPath);
@@ -74,6 +86,10 @@ export class DeliveryCoordinator {
 
   async #advance(run, context = {}) {
     this.router.activateDeliveryRun(run.id);
+    if (typeof this.router.assertRepositoryBaseline === "function") {
+      try { this.router.assertRepositoryBaseline(run, { requireFinal: run.repositoryMode === "brownfield" && Boolean(run.blueprintId) }); }
+      catch (error) { return this.router.blockRunForRepositoryBaseline(run, error); }
+    }
     const sourceControlledDelivery = Boolean(run.source || run.sourceClaimManifestId || run.blueprintId);
     if (sourceControlledDelivery) {
       try {
@@ -134,7 +150,7 @@ export class DeliveryCoordinator {
       const adapter = adapters.productEvidenceAdapter;
       const candidate = { branch: integration.manifest.branch, sha: integration.manifest.candidateSha };
       if (adapter) productEvidence = typeof adapter.verify === "function" ? await adapter.verify({ candidate, manifest: integration.manifest, deliveryRunId: run.id }) : await adapter({ candidate, manifest: integration.manifest, deliveryRunId: run.id });
-      acceptance = this.router.store.recordProductAcceptanceReport(this.router.buildProductAcceptanceReport({ integration, remoteCi: preliminary.remoteCi, productEvidence }));
+      acceptance = this.router.store.recordProductAcceptanceReport(await this.router.buildProductAcceptanceReport({ integration, remoteCi: preliminary.remoteCi, productEvidence }));
     }
     if (!acceptance.passing) {
       const report = acceptance.report;

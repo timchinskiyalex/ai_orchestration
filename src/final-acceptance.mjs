@@ -32,7 +32,21 @@ function validateCriterionResult(result, candidateSha) {
   validateEvidence(evidence, candidateSha, `criterion '${result.criterionId}' product evidence`);
 }
 
-export function validateProductAcceptanceReport(report, { blueprint, blueprintDigest, manifest, manifestPath = null } = {}) {
+function validateBehaviorEvidence(report, repositoryBaseline, activeBehaviorIds = null) {
+  if (!repositoryBaseline) return;
+  if (report.repositoryBaselineDigest !== repositoryBaseline.digest || !Array.isArray(report.behaviorEvidence)) fail("repository baseline identity or behavior evidence is missing");
+  const known = new Set(repositoryBaseline.behaviors.map((behavior) => behavior.behaviorId));
+  const active = new Set(activeBehaviorIds ?? known);
+  if ([...active].some((id) => !known.has(id))) fail("protected behavior activation is invalid");
+  if (report.behaviorEvidence.length !== active.size) fail("protected behavior evidence must have exactly one proof per active behavior");
+  const seen = new Set(); const commands = new Map(repositoryBaseline.behaviors.map((behavior) => [behavior.behaviorId, behavior.verificationCommandId]));
+  for (const evidence of report.behaviorEvidence) {
+    if (!evidence || !active.has(evidence.behaviorId) || seen.has(evidence.behaviorId) || evidence.commandId !== commands.get(evidence.behaviorId) || evidence.baselineDigest !== repositoryBaseline.digest || evidence.candidateSha?.toLowerCase() !== report.candidateSha.toLowerCase() || evidence.classification !== "pass" || !stable(evidence.safeReference) || !["passed", "failed", "not-run"].includes(evidence.exitClassification) || !Number.isInteger(evidence.durationMs) || evidence.durationMs < 0) fail("protected behavior evidence is invalid or stale");
+    seen.add(evidence.behaviorId);
+  }
+}
+
+export function validateProductAcceptanceReport(report, { blueprint, blueprintDigest, manifest, manifestPath = null, repositoryBaseline = null, activeBehaviorIds = null } = {}) {
   if (!report || typeof report !== "object") fail("must be an object");
   for (const key of ["schemaVersion", "kind", "deliveryRunId", "blueprintId", "blueprintDigest", "documentSetDigest", "integrationManifestPath", "integrationManifestId", "candidateSha", "generatedAt", "results", "evidence"]) if (!(key in report)) fail(`missing '${key}'`);
   if (report.schemaVersion !== PRODUCT_ACCEPTANCE_SCHEMA_VERSION || report.kind !== PRODUCT_ACCEPTANCE_KIND) fail("schema version or kind is invalid");
@@ -61,12 +75,14 @@ export function validateProductAcceptanceReport(report, { blueprint, blueprintDi
     });
     if (requirement.mandatory && requirementResult.status === "pass" && criterionResults.some((result) => result.status !== "pass")) fail(`mandatory requirement '${requirement.requirementId}' cannot pass while a criterion is not pass`);
   }
+  validateBehaviorEvidence(report, repositoryBaseline, activeBehaviorIds);
   return structuredClone(report);
 }
 
-export function productAcceptancePasses(report, { blueprint }) {
+export function productAcceptancePasses(report, { blueprint, repositoryBaseline = null, activeBehaviorIds = null }) {
   const blockers = specificationBlockers(blueprint);
   if (blockers.length || report.evidence.integration?.status !== "pass" || report.evidence.qa?.status !== "pass" || report.evidence.security?.status !== "pass" || report.evidence.productE2e?.status !== "pass" || report.evidence.ci?.status !== "pass") return false;
+  if (repositoryBaseline && (!Array.isArray(report.behaviorEvidence) || report.behaviorEvidence.length !== new Set(activeBehaviorIds ?? repositoryBaseline.behaviors.map((item) => item.behaviorId)).size || report.behaviorEvidence.some((item) => item.classification !== "pass" || item.baselineDigest !== repositoryBaseline.digest))) return false;
   if (report.results.some((result) => result.criterionId !== null && result.criterionId !== undefined && ["failed", "not_verified"].includes(result.status))) return false;
   return blueprint.requirements.filter((item) => item.mandatory).every((requirement) => {
     const requirementResult = report.results.find((item) => item.requirementId === requirement.requirementId && (item.criterionId === null || item.criterionId === undefined));

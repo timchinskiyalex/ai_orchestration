@@ -12,6 +12,8 @@ export function loadConfig(configPath) {
   config.project.documentationDir ??= "docs/orchestration-input";
   config.project.generatedDir ??= "docs/orchestration-generated";
   config.project.productRoots ??= [];
+  config.project.repositoryMode ??= "legacy";
+  config.project.repositoryBaselineDeclaration ??= null;
   config.repository = resolve(base, config.repository);
   config.runtimeDir = resolve(base, config.runtimeDir ?? "./runtime");
   config.baseRef ??= "main";
@@ -74,6 +76,12 @@ export function loadConfig(configPath) {
   };
   config.project.documentationDir = safeProjectPath("project.documentationDir", config.project.documentationDir);
   config.project.generatedDir = safeProjectPath("project.generatedDir", config.project.generatedDir);
+  if (!["legacy", "greenfield", "brownfield"].includes(config.project.repositoryMode)) throw new Error("project.repositoryMode must be legacy, greenfield, or brownfield");
+  if (config.project.repositoryMode === "brownfield") {
+    config.project.repositoryBaselineDeclaration = safeProjectPath("project.repositoryBaselineDeclaration", config.project.repositoryBaselineDeclaration);
+  } else if (config.project.repositoryBaselineDeclaration !== null && config.project.repositoryBaselineDeclaration !== undefined) {
+    throw new Error("project.repositoryBaselineDeclaration is only allowed in brownfield mode");
+  }
   if (!Array.isArray(config.project.productRoots)) throw new Error("project.productRoots must be an allowlisted array");
   const supportedProductAdapters = new Set(["next-node", "dotnet"]);
   const productIds = new Set();

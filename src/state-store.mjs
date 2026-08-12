@@ -20,6 +20,7 @@ export class StateStore {
     this.hasTokenUsageSource = this.#hasColumn("tasks", "token_usage_source");
     this.hasResolutionAuthorityEvidence = this.#hasTable("specification_resolution_evidence");
     this.hasSourceClaimManifests = this.#hasTable("source_claim_manifests");
+    this.hasRepositoryBaselines = this.#hasTable("repository_baselines") && this.#hasColumn("delivery_runs", "repository_mode");
     if (readOnly) return;
     // Switching journal mode takes an exclusive SQLite lock. Do it once at
     // database creation, never in every short-lived status/watch reader.
@@ -71,6 +72,7 @@ export class StateStore {
         ,execution_is_writer INTEGER NOT NULL DEFAULT 0
         ,execution_release_state TEXT
         ,execution_release_artifact_task_id TEXT
+        ,baseline_behavior_ids_json TEXT NOT NULL DEFAULT '[]'
       );
       CREATE TABLE IF NOT EXISTS events (
         sequence INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -149,6 +151,9 @@ export class StateStore {
         recovery_json TEXT,
         blueprint_id TEXT,
         completion_contract_version INTEGER NOT NULL DEFAULT 0,
+        repository_mode TEXT NOT NULL DEFAULT 'legacy',
+        repository_base_sha TEXT,
+        repository_baseline_id TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
@@ -193,6 +198,15 @@ export class StateStore {
       CREATE TABLE IF NOT EXISTS source_claim_manifests (
         manifest_id TEXT PRIMARY KEY, schema_version INTEGER NOT NULL, digest TEXT NOT NULL,
         document_set_digest TEXT NOT NULL, manifest_json TEXT NOT NULL, created_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS repository_baseline_drafts (
+        delivery_run_id TEXT PRIMARY KEY REFERENCES delivery_runs(id),
+        schema_version INTEGER NOT NULL, draft_json TEXT NOT NULL, created_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS repository_baselines (
+        baseline_id TEXT PRIMARY KEY, delivery_run_id TEXT UNIQUE NOT NULL REFERENCES delivery_runs(id),
+        schema_version INTEGER NOT NULL, digest TEXT NOT NULL, base_sha TEXT NOT NULL,
+        blueprint_id TEXT NOT NULL, blueprint_digest TEXT NOT NULL, baseline_json TEXT NOT NULL, created_at TEXT NOT NULL
       );
       CREATE TABLE IF NOT EXISTS traceability_records (
         sequence INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -250,6 +264,7 @@ export class StateStore {
     `);
     this.hasResolutionAuthorityEvidence = true;
     this.hasSourceClaimManifests = true;
+    this.hasRepositoryBaselines = true;
     this.#addColumnIfMissing("tasks", "dependencies_json", "TEXT NOT NULL DEFAULT '[]'");
     this.#addColumnIfMissing("tasks", "result_path", "TEXT");
     this.#addColumnIfMissing("tasks", "estimated_tokens", "INTEGER NOT NULL DEFAULT 0");
@@ -276,6 +291,7 @@ export class StateStore {
     this.#addColumnIfMissing("tasks", "execution_is_writer", "INTEGER NOT NULL DEFAULT 0");
     this.#addColumnIfMissing("tasks", "execution_release_state", "TEXT");
     this.#addColumnIfMissing("tasks", "execution_release_artifact_task_id", "TEXT");
+    this.#addColumnIfMissing("tasks", "baseline_behavior_ids_json", "TEXT NOT NULL DEFAULT '[]'");
     this.#addColumnIfMissing("integration_checkpoints", "checkpoint_type", "TEXT");
     this.#addColumnIfMissing("integration_checkpoints", "barrier_id", "TEXT");
     this.#addColumnIfMissing("integration_checkpoints", "effective_lineage_json", "TEXT");
@@ -315,6 +331,9 @@ export class StateStore {
     this.#addColumnIfMissing("delivery_runs", "blueprint_id", "TEXT");
     this.#addColumnIfMissing("delivery_runs", "completion_contract_version", "INTEGER NOT NULL DEFAULT 0");
     this.#addColumnIfMissing("delivery_runs", "source_claim_manifest_id", "TEXT");
+    this.#addColumnIfMissing("delivery_runs", "repository_mode", "TEXT NOT NULL DEFAULT 'legacy'");
+    this.#addColumnIfMissing("delivery_runs", "repository_base_sha", "TEXT");
+    this.#addColumnIfMissing("delivery_runs", "repository_baseline_id", "TEXT");
     this.#addColumnIfMissing("product_blueprints", "source_claim_manifest_id", "TEXT");
     // Older resumable runs have no immutable intake contract. Preserve every
     // row, but prevent them from silently continuing under the new semantics.
@@ -331,7 +350,8 @@ export class StateStore {
     this.#validateTaskBlueprint(task);
     const timestamp = now();
     const initialStatus = task.humanApprovalRequired ? "awaiting_human" : "queued";
-    this.#mutate(task.id, `task/${initialStatus}`, { role: task.role, title: task.title, humanApprovalRequired: Boolean(task.humanApprovalRequired) }, () => this.db.prepare(`INSERT INTO tasks (
+    this.#mutate(task.id, `task/${initialStatus}`, { role: task.role, title: task.title, humanApprovalRequired: Boolean(task.humanApprovalRequired) }, () => {
+      this.db.prepare(`INSERT INTO tasks (
       id, parent_task_id, role, title, prompt, status, allowed_paths_json,
       acceptance_checks_json, dependencies_json, human_approval_required, token_budget, estimated_tokens, max_attempts, created_at, updated_at,
       risk_flags_json, supporting_domains_json, artifact_base_sha, artifact_dependencies_json, remediation_round, source_writer_task_id, delivery_run_id, blueprint_id, requirement_ids_json, plan_batch_id, wave, integration_barrier_id, execution_dependencies_json, execution_topology_version, execution_is_writer, execution_release_state, execution_release_artifact_task_id
@@ -340,7 +360,9 @@ export class StateStore {
       initialStatus, json(task.allowedPaths), json(task.acceptanceChecks), json(task.dependencies), task.humanApprovalRequired ? 1 : 0, task.tokenBudget, task.estimatedTokens ?? task.tokenBudget,
       task.maxAttempts, timestamp, timestamp, json(task.riskFlags), json(task.supportingDomains), task.artifactBaseSha ?? null,
       json(task.artifactDependencies), task.remediationRound ?? 0, task.sourceWriterTaskId ?? null, task.deliveryRunId ?? null, task.blueprintId ?? null, json(task.requirementIds), task.planBatchId ?? null, task.wave ?? null, task.integrationBarrierId ?? null, task.executionDependencies === undefined ? null : json(task.executionDependencies), task.executionTopologyVersion ?? 0, task.executionIsWriter ? 1 : 0, task.executionReleaseState ?? null, task.executionReleaseArtifactTaskId ?? null
-    ));
+      );
+      this.db.prepare("UPDATE tasks SET baseline_behavior_ids_json = ? WHERE id = ?").run(json(task.baselineBehaviorIds), task.id);
+    });
     return this.getTask(task.id);
   }
 
@@ -370,6 +392,7 @@ export class StateStore {
           task.tokenBudget, task.estimatedTokens ?? task.tokenBudget, task.maxAttempts ?? 1, timestamp, timestamp,
           json(task.riskFlags), json(task.supportingDomains), task.artifactBaseSha ?? null, json(task.artifactDependencies), task.remediationRound ?? 0, task.sourceWriterTaskId ?? null, task.deliveryRunId ?? null, task.blueprintId ?? null, json(task.requirementIds), task.planBatchId ?? null, task.wave ?? null, task.integrationBarrierId ?? null, task.executionDependencies === undefined ? null : json(task.executionDependencies), task.executionTopologyVersion ?? 0, task.executionIsWriter ? 1 : 0, task.executionReleaseState ?? null, task.executionReleaseArtifactTaskId ?? null
         );
+        this.db.prepare("UPDATE tasks SET baseline_behavior_ids_json = ? WHERE id = ?").run(json(task.baselineBehaviorIds), task.id);
         this.#insertEvent(task.id, `task/${initialStatus}`, { role: task.role, title: task.title, humanApprovalRequired: Boolean(task.humanApprovalRequired) });
         for (const requirementId of task.requirementIds ?? []) this.#insertTraceability({ requirementId, blueprintId: task.blueprintId, taskId: task.id, checkpoint: "planned", payload: { role: task.role, parentTaskId: task.parentTaskId ?? null } });
       }
@@ -616,18 +639,55 @@ export class StateStore {
     return row ? { writerTaskId: row.writer_task_id, path: row.report_path, report: JSON.parse(row.report_json) } : null;
   }
 
-  createDeliveryRun({ id, source = null, bootstrapTaskId = null, confirmRemotePush = false, ownerPid, ownerSessionId, sourceClaimManifestId = null }) {
+  createDeliveryRun({ id, source = null, bootstrapTaskId = null, confirmRemotePush = false, ownerPid, ownerSessionId, sourceClaimManifestId = null, repositoryMode = "legacy", repositoryBaseSha = null }) {
     if (!Number.isInteger(ownerPid) || ownerPid < 1 || typeof ownerSessionId !== "string" || !ownerSessionId) throw new Error("Delivery run requires an initial owner lease");
     const timestamp = now();
     this.db.exec("BEGIN IMMEDIATE");
     try {
       const active = this.db.prepare("SELECT id FROM delivery_runs WHERE state IN ('running','awaiting_human','awaiting_human_remote_handoff') LIMIT 1").get();
       if (active) throw new Error(`Delivery already owned by active run: ${active.id}`);
-      this.db.prepare("INSERT INTO delivery_runs(id, schema_version, state, source, bootstrap_task_id, confirm_remote_push, owner_pid, owner_session_id, heartbeat_at, completion_contract_version, source_claim_manifest_id, created_at, updated_at) VALUES (?, 1, 'running', ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)").run(id, source, bootstrapTaskId, confirmRemotePush ? 1 : 0, ownerPid, ownerSessionId, timestamp, sourceClaimManifestId, timestamp, timestamp);
+      this.db.prepare("INSERT INTO delivery_runs(id, schema_version, state, source, bootstrap_task_id, confirm_remote_push, owner_pid, owner_session_id, heartbeat_at, completion_contract_version, source_claim_manifest_id, repository_mode, repository_base_sha, created_at, updated_at) VALUES (?, 1, 'running', ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)").run(id, source, bootstrapTaskId, confirmRemotePush ? 1 : 0, ownerPid, ownerSessionId, timestamp, sourceClaimManifestId, repositoryMode, repositoryBaseSha, timestamp, timestamp);
       this.#insertEvent(bootstrapTaskId, "delivery/created", { deliveryRunId: id, confirmRemotePush: Boolean(confirmRemotePush), ownerPid, ownerSessionId, heartbeatAt: timestamp });
       this.db.exec("COMMIT");
     } catch (error) { this.db.exec("ROLLBACK"); throw error; }
     return this.deliveryRun(id);
+  }
+
+  recordRepositoryBaselineDraft(deliveryRunId, draft) {
+    if (!this.hasRepositoryBaselines || !draft || draft.kind !== "RepositoryBaselineDraft" || !draft.baseSha) throw new Error("Repository baseline draft is invalid");
+    const run = this.deliveryRun(deliveryRunId); if (!run || run.repositoryMode !== "brownfield" || run.repositoryBaseSha !== draft.baseSha) throw new Error("Repository baseline draft delivery identity mismatch");
+    const existing = this.repositoryBaselineDraft(deliveryRunId);
+    if (existing && JSON.stringify(existing) !== JSON.stringify(draft)) throw new Error("Repository baseline draft is immutable and mismatched");
+    if (!existing) this.db.prepare("INSERT INTO repository_baseline_drafts(delivery_run_id,schema_version,draft_json,created_at) VALUES (?,?,?,?)").run(deliveryRunId, draft.schemaVersion, JSON.stringify(draft), now());
+    return this.repositoryBaselineDraft(deliveryRunId);
+  }
+
+  repositoryBaselineDraft(deliveryRunId) {
+    if (!this.hasRepositoryBaselines) return null;
+    const row = this.db.prepare("SELECT draft_json FROM repository_baseline_drafts WHERE delivery_run_id = ?").get(deliveryRunId);
+    return row ? JSON.parse(row.draft_json) : null;
+  }
+
+  recordRepositoryBaseline(deliveryRunId, baseline) {
+    if (!this.hasRepositoryBaselines || !baseline || baseline.kind !== "RepositoryBaseline" || !baseline.baselineId || !baseline.digest) throw new Error("Repository baseline is invalid");
+    const run = this.deliveryRun(deliveryRunId); const draft = this.repositoryBaselineDraft(deliveryRunId);
+    if (!run || run.repositoryMode !== "brownfield" || !draft || draft.baseSha !== baseline.baseSha || run.repositoryBaseSha !== baseline.baseSha || baseline.productBlueprintId !== run.blueprintId) throw new Error("Repository baseline finalization identity mismatch");
+    const existing = this.repositoryBaselineForRun(deliveryRunId);
+    if (existing && existing.digest !== baseline.digest) throw new Error("Repository baseline is immutable and mismatched");
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      if (!existing) this.db.prepare("INSERT INTO repository_baselines(baseline_id,delivery_run_id,schema_version,digest,base_sha,blueprint_id,blueprint_digest,baseline_json,created_at) VALUES (?,?,?,?,?,?,?,?,?)").run(baseline.baselineId, deliveryRunId, baseline.schemaVersion, baseline.digest, baseline.baseSha, baseline.productBlueprintId, baseline.productBlueprintDigest, JSON.stringify(baseline), now());
+      this.db.prepare("UPDATE delivery_runs SET repository_baseline_id = ?, updated_at = ? WHERE id = ? AND repository_baseline_id IS NULL").run(baseline.baselineId, now(), deliveryRunId);
+      this.#insertEvent(run.bootstrapTaskId, "repository-baseline/finalized", { deliveryRunId, baselineId: baseline.baselineId, digest: baseline.digest, baseSha: baseline.baseSha });
+      this.db.exec("COMMIT");
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    return this.repositoryBaselineForRun(deliveryRunId);
+  }
+
+  repositoryBaselineForRun(deliveryRunId) {
+    if (!this.hasRepositoryBaselines) return null;
+    const row = this.db.prepare("SELECT baseline_json FROM repository_baselines WHERE delivery_run_id = ?").get(deliveryRunId);
+    return row ? JSON.parse(row.baseline_json) : null;
   }
 
   deliveryRun(id) {
@@ -674,6 +734,22 @@ export class StateStore {
     return this.deliveryRun(id);
   }
 
+  blockDeliveryForRepositoryBaseline(id, { reason = "repository_baseline:validation_failed", recovery } = {}) {
+    const current = this.deliveryRun(id); if (!current) throw new Error(`Delivery run not found: ${id}`);
+    const safeReason = String(reason).match(/^repository_baseline:[a-z_]+$/)?.[0] ?? "repository_baseline:validation_failed";
+    const publish = { reason: safeReason, codes: [safeReason], recovery: recovery ?? { action: "Start a fresh brownfield delivery from a valid repository baseline; historical records remain readable." } };
+    const timestamp = now();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.prepare("UPDATE delivery_runs SET state = 'blocked_repository_baseline', publish_json = ?, owner_pid = NULL, owner_session_id = NULL, heartbeat_at = NULL, updated_at = ? WHERE id = ?").run(JSON.stringify(publish), timestamp, id);
+      this.db.prepare("UPDATE tasks SET status = 'blocked_repository_baseline', error = ?, updated_at = ? WHERE delivery_run_id = ? AND status IN ('queued','preparing','running','awaiting_approval','awaiting_human','interrupted')").run(safeReason, timestamp, id);
+      this.db.prepare("UPDATE scoped_replans SET status = 'fatal', failure_detail = ?, updated_at = ?, completed_at = ? WHERE delivery_run_id = ? AND status IN ('pending','planning','materialized')").run(safeReason, timestamp, timestamp, id);
+      this.#insertEvent(current.bootstrapTaskId, "delivery/blocked_repository_baseline", { deliveryRunId: id, reason: safeReason });
+      this.db.exec("COMMIT");
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    return this.deliveryRun(id);
+  }
+
   claimDeliveryLease(id, { ownerPid, ownerSessionId }) {
     const timestamp = now();
     if (!Number.isInteger(ownerPid) || ownerPid < 1 || typeof ownerSessionId !== "string" || !ownerSessionId) throw new Error("Delivery lease requires owner pid and session");
@@ -709,6 +785,7 @@ export class StateStore {
         if (task.executionTopologyVersion !== 1 || !Array.isArray(task.executionDependencies) || typeof task.executionIsWriter !== "boolean") throw new Error("PlanBatch task is missing controller-owned execution topology");
         this.db.prepare(`INSERT INTO tasks (id,parent_task_id,role,title,prompt,status,allowed_paths_json,acceptance_checks_json,dependencies_json,human_approval_required,token_budget,estimated_tokens,max_attempts,created_at,updated_at,risk_flags_json,supporting_domains_json,artifact_base_sha,artifact_dependencies_json,remediation_round,source_writer_task_id,delivery_run_id,blueprint_id,requirement_ids_json,plan_batch_id,wave,integration_barrier_id,execution_dependencies_json,execution_topology_version,execution_is_writer,execution_release_state,execution_release_artifact_task_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
           .run(task.id, task.parentTaskId ?? null, task.role, task.title, task.prompt, initialStatus, json(task.allowedPaths), json(task.acceptanceChecks), json(task.dependencies), task.humanApprovalRequired ? 1 : 0, task.tokenBudget, task.estimatedTokens ?? task.tokenBudget, task.maxAttempts ?? 1, timestamp, timestamp, json(task.riskFlags), json(task.supportingDomains), task.artifactBaseSha ?? null, json(task.artifactDependencies), task.remediationRound ?? 0, task.sourceWriterTaskId ?? null, task.deliveryRunId ?? null, task.blueprintId ?? null, json(task.requirementIds), batch.id, batch.wave, task.integrationBarrierId ?? null, json(task.executionDependencies), task.executionTopologyVersion, task.executionIsWriter ? 1 : 0, task.executionIsWriter ? (task.executionReleaseState ?? "pending") : null, task.executionReleaseArtifactTaskId ?? null);
+        this.db.prepare("UPDATE tasks SET baseline_behavior_ids_json = ? WHERE id = ?").run(json(task.baselineBehaviorIds), task.id);
         this.#insertEvent(task.id, `task/${initialStatus}`, { role: task.role, title: task.title, planBatchId: batch.id, wave: batch.wave });
         for (const requirementId of task.requirementIds ?? []) this.#insertTraceability({ requirementId, blueprintId: task.blueprintId, taskId: task.id, checkpoint: "planned", payload: { planBatchId: batch.id, wave: batch.wave } });
       }
@@ -1034,13 +1111,13 @@ export class StateStore {
       planBatchId: row.plan_batch_id, wave: row.wave, integrationBarrierId: row.integration_barrier_id, localCheckpointId: row.local_checkpoint_id,
       executionDependencies: row.execution_dependencies_json === null ? null : parse(row.execution_dependencies_json, []), executionTopologyVersion: row.execution_topology_version ?? 0, executionIsWriter: Boolean(row.execution_is_writer), executionReleaseState: row.execution_release_state, executionReleaseArtifactTaskId: row.execution_release_artifact_task_id,
       remediationRound: row.remediation_round, sourceWriterTaskId: row.source_writer_task_id,
-      deliveryRunId: row.delivery_run_id, blueprintId: row.blueprint_id, requirementIds: parse(row.requirement_ids_json, []), interruptThresholdTokens: row.interrupt_threshold_tokens, configuredBudgetCap: row.configured_budget_cap,
+      deliveryRunId: row.delivery_run_id, blueprintId: row.blueprint_id, requirementIds: parse(row.requirement_ids_json, []), baselineBehaviorIds: parse(row.baseline_behavior_ids_json, []), interruptThresholdTokens: row.interrupt_threshold_tokens, configuredBudgetCap: row.configured_budget_cap,
       budgetInterrupt: this.budgetInterruption(row.id)
     };
   }
 
   #mapDeliveryRun(row) {
-    return { id: row.id, schemaVersion: row.schema_version, state: row.state, source: row.source, bootstrapTaskId: row.bootstrap_task_id, blueprintId: row.blueprint_id, sourceClaimManifestId: row.source_claim_manifest_id ?? null, completionContractVersion: row.completion_contract_version ?? 0, integrationPath: row.integration_path, candidate: row.candidate_branch && row.candidate_sha ? { branch: row.candidate_branch, sha: row.candidate_sha } : null, publicationCheckpoint: parse(row.publication_checkpoint_json, null), publish: parse(row.publish_json, null), confirmRemotePush: Boolean(row.confirm_remote_push), ownerPid: row.owner_pid, ownerSessionId: row.owner_session_id, heartbeatAt: row.heartbeat_at, interruptedAt: row.interrupted_at, recovery: parse(row.recovery_json, null), createdAt: row.created_at, updatedAt: row.updated_at };
+    return { id: row.id, schemaVersion: row.schema_version, state: row.state, source: row.source, bootstrapTaskId: row.bootstrap_task_id, blueprintId: row.blueprint_id, sourceClaimManifestId: row.source_claim_manifest_id ?? null, repositoryMode: row.repository_mode ?? "legacy", repositoryBaseSha: row.repository_base_sha ?? null, repositoryBaselineId: row.repository_baseline_id ?? null, completionContractVersion: row.completion_contract_version ?? 0, integrationPath: row.integration_path, candidate: row.candidate_branch && row.candidate_sha ? { branch: row.candidate_branch, sha: row.candidate_sha } : null, publicationCheckpoint: parse(row.publication_checkpoint_json, null), publish: parse(row.publish_json, null), confirmRemotePush: Boolean(row.confirm_remote_push), ownerPid: row.owner_pid, ownerSessionId: row.owner_session_id, heartbeatAt: row.heartbeat_at, interruptedAt: row.interrupted_at, recovery: parse(row.recovery_json, null), createdAt: row.created_at, updatedAt: row.updated_at };
   }
 
   #mapScopedReplan(row) {
@@ -1059,11 +1136,13 @@ export class StateStore {
     const run = this.deliveryRun(report.deliveryRunId); if (!run) throw new Error("Final acceptance report requires an existing delivery run");
     const blueprint = this.productBlueprint(report.blueprintId); const manifest = this.integrationManifest(report.integrationManifestPath);
     if (!blueprint || !manifest) throw new Error("Final acceptance report requires persisted blueprint and integration manifest");
-    validateProductAcceptanceReport(report, { blueprint: blueprint.blueprint, blueprintDigest: blueprint.digest, manifest, manifestPath: report.integrationManifestPath });
+    const repositoryBaseline = run.repositoryMode === "brownfield" ? this.repositoryBaselineForRun(run.id) : null;
+    const activeBehaviorIds = repositoryBaseline ? [...new Set(this.listTasks().filter((task) => task.deliveryRunId === run.id).flatMap((task) => task.baselineBehaviorIds ?? []))].sort() : null;
+    validateProductAcceptanceReport(report, { blueprint: blueprint.blueprint, blueprintDigest: blueprint.digest, manifest, manifestPath: report.integrationManifestPath, repositoryBaseline, activeBehaviorIds });
     if (run.blueprintId !== report.blueprintId || run.candidate?.sha?.toLowerCase() !== report.candidateSha.toLowerCase()) throw new Error("Final acceptance report identity does not match delivery run");
     const id = report.id ?? `${report.deliveryRunId}:${report.integrationManifestId}:${report.candidateSha}`;
     if (this.db.prepare("SELECT id FROM product_acceptance_reports WHERE id = ?").get(id)) return this.productAcceptanceReport(id);
-    const passing = productAcceptancePasses(report, { blueprint: blueprint.blueprint }) ? 1 : 0;
+    const passing = productAcceptancePasses(report, { blueprint: blueprint.blueprint, repositoryBaseline, activeBehaviorIds }) ? 1 : 0;
     this.#mutate(run.bootstrapTaskId, "acceptance/persisted", { reportId: id, candidateSha: report.candidateSha, passing: Boolean(passing) }, () => {
       this.db.prepare("INSERT INTO product_acceptance_reports(id,schema_version,delivery_run_id,blueprint_id,blueprint_digest,manifest_id,manifest_path,candidate_sha,report_json,passing,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)")
         .run(id, report.schemaVersion, report.deliveryRunId, report.blueprintId, report.blueprintDigest, report.integrationManifestId, report.integrationManifestPath, report.candidateSha, JSON.stringify(report), passing, now());
