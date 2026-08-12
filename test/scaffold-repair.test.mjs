@@ -63,6 +63,7 @@ test("deterministic scaffold creates a WorkerArtifact before two dependent write
       remoteGitAdapter: { async pushCandidate({ sha }) { return { status: "pushed", verifiedSha: sha }; } },
       pullRequestAdapter: { async ensurePullRequest({ sha }) { return { status: "open", number: 1, url: "https://example.test/pr/1", headSha: sha }; } },
       remoteCiAdapter: { async waitForChecks() { return { status: "passed", checkRuns: [] }; } },
+      productEvidenceAdapter: { async verify({ candidate }) { return { status: "pass", candidateSha: candidate.sha, reference: "deterministic-product-check" }; } },
       mergeAdapter: { async merge() { return { status: "merged", mainSha: "a".repeat(40), mergeSha: "a".repeat(40), targetVerified: true }; } }
     });
     const scaffold = router.list().find((task) => task.title === "Scaffold product roots");

@@ -3,6 +3,7 @@ import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { assertRole, assertTransition } from "./domain.mjs";
 import { validateIntegrationBarrier, validateIntegrationCheckpoint, validatePlan, validateWorkerArtifactContract } from "./workflow-contract.mjs";
+import { productAcceptancePasses, validateProductAcceptanceReport } from "./final-acceptance.mjs";
 
 const now = () => new Date().toISOString();
 const json = (value) => JSON.stringify(value ?? []);
@@ -187,6 +188,12 @@ export class StateStore {
         payload_json TEXT NOT NULL,
         created_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS product_acceptance_reports (
+        id TEXT PRIMARY KEY, schema_version INTEGER NOT NULL, delivery_run_id TEXT NOT NULL REFERENCES delivery_runs(id),
+        blueprint_id TEXT NOT NULL, blueprint_digest TEXT NOT NULL, manifest_id TEXT NOT NULL, manifest_path TEXT NOT NULL,
+        candidate_sha TEXT NOT NULL, report_json TEXT NOT NULL, passing INTEGER NOT NULL, created_at TEXT NOT NULL
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_acceptance_identity ON product_acceptance_reports(delivery_run_id, manifest_id, candidate_sha);
       CREATE TABLE IF NOT EXISTS plan_batches (
         id TEXT PRIMARY KEY, schema_version INTEGER NOT NULL, kind TEXT NOT NULL,
         delivery_run_id TEXT NOT NULL, blueprint_id TEXT NOT NULL, wave INTEGER NOT NULL,
@@ -528,8 +535,8 @@ export class StateStore {
   }
 
   qualityReport(qaTaskId) {
-    const row = this.db.prepare("SELECT report_path, report_json FROM quality_reports WHERE qa_task_id = ?").get(qaTaskId);
-    return row ? { path: row.report_path, report: JSON.parse(row.report_json) } : null;
+    const row = this.db.prepare("SELECT writer_task_id, report_path, report_json FROM quality_reports WHERE qa_task_id = ?").get(qaTaskId);
+    return row ? { writerTaskId: row.writer_task_id, path: row.report_path, report: JSON.parse(row.report_json) } : null;
   }
 
   recordSecurityReport({ securityTaskId, writerTaskId, reportPath, report }) {
@@ -542,8 +549,8 @@ export class StateStore {
   }
 
   securityReport(securityTaskId) {
-    const row = this.db.prepare("SELECT report_path, report_json FROM security_reports WHERE security_task_id = ?").get(securityTaskId);
-    return row ? { path: row.report_path, report: JSON.parse(row.report_json) } : null;
+    const row = this.db.prepare("SELECT writer_task_id, report_path, report_json FROM security_reports WHERE security_task_id = ?").get(securityTaskId);
+    return row ? { writerTaskId: row.writer_task_id, path: row.report_path, report: JSON.parse(row.report_json) } : null;
   }
 
   createDeliveryRun({ id, source = null, bootstrapTaskId = null, confirmRemotePush = false, ownerPid, ownerSessionId }) {
@@ -572,6 +579,7 @@ export class StateStore {
 
   updateDeliveryRun(id, { state, integrationPath, publish, confirmRemotePush, candidate, publicationCheckpoint } = {}) {
     const current = this.deliveryRun(id); if (!current) throw new Error(`Delivery run not found: ${id}`);
+    if (state === "completed_merged") throw new Error("completed_merged may only be set by completeDeliveryWithAcceptance");
     const next = { state: state ?? current.state, integrationPath: integrationPath ?? current.integrationPath, publish: publish ?? current.publish, confirmRemotePush: confirmRemotePush ?? current.confirmRemotePush, candidate: candidate ?? current.candidate, publicationCheckpoint: publicationCheckpoint ?? current.publicationCheckpoint };
     this.db.exec("BEGIN IMMEDIATE");
     try {
@@ -841,6 +849,48 @@ export class StateStore {
     return { id: row.id, schemaVersion: row.schema_version, state: row.state, source: row.source, bootstrapTaskId: row.bootstrap_task_id, blueprintId: row.blueprint_id, completionContractVersion: row.completion_contract_version ?? 0, integrationPath: row.integration_path, candidate: row.candidate_branch && row.candidate_sha ? { branch: row.candidate_branch, sha: row.candidate_sha } : null, publicationCheckpoint: parse(row.publication_checkpoint_json, null), publish: parse(row.publish_json, null), confirmRemotePush: Boolean(row.confirm_remote_push), ownerPid: row.owner_pid, ownerSessionId: row.owner_session_id, heartbeatAt: row.heartbeat_at, interruptedAt: row.interrupted_at, recovery: parse(row.recovery_json, null), createdAt: row.created_at, updatedAt: row.updated_at };
   }
 
+  recordProductAcceptanceReport(report) {
+    const run = this.deliveryRun(report.deliveryRunId); if (!run) throw new Error("Final acceptance report requires an existing delivery run");
+    const blueprint = this.productBlueprint(report.blueprintId); const manifest = this.integrationManifest(report.integrationManifestPath);
+    if (!blueprint || !manifest) throw new Error("Final acceptance report requires persisted blueprint and integration manifest");
+    validateProductAcceptanceReport(report, { blueprint: blueprint.blueprint, blueprintDigest: blueprint.digest, manifest, manifestPath: report.integrationManifestPath });
+    if (run.blueprintId !== report.blueprintId || run.candidate?.sha?.toLowerCase() !== report.candidateSha.toLowerCase()) throw new Error("Final acceptance report identity does not match delivery run");
+    const id = report.id ?? `${report.deliveryRunId}:${report.integrationManifestId}:${report.candidateSha}`;
+    if (this.db.prepare("SELECT id FROM product_acceptance_reports WHERE id = ?").get(id)) return this.productAcceptanceReport(id);
+    const passing = productAcceptancePasses(report, { blueprint: blueprint.blueprint }) ? 1 : 0;
+    this.#mutate(run.bootstrapTaskId, "acceptance/persisted", { reportId: id, candidateSha: report.candidateSha, passing: Boolean(passing) }, () => {
+      this.db.prepare("INSERT INTO product_acceptance_reports(id,schema_version,delivery_run_id,blueprint_id,blueprint_digest,manifest_id,manifest_path,candidate_sha,report_json,passing,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)")
+        .run(id, report.schemaVersion, report.deliveryRunId, report.blueprintId, report.blueprintDigest, report.integrationManifestId, report.integrationManifestPath, report.candidateSha, JSON.stringify(report), passing, now());
+      for (const result of report.results) this.#insertTraceability({ requirementId: result.requirementId, blueprintId: report.blueprintId, verificationPath: id, checkpoint: "final-acceptance", payload: { criterionId: result.criterionId ?? null, status: result.status, candidateSha: report.candidateSha, manifestId: report.integrationManifestId, evidence: result.evidence } });
+    });
+    return this.productAcceptanceReport(id);
+  }
+
+  productAcceptanceReport(id) {
+    const row = this.db.prepare("SELECT * FROM product_acceptance_reports WHERE id = ?").get(id);
+    return row ? { id: row.id, report: parse(row.report_json, null), passing: Boolean(row.passing), createdAt: row.created_at } : null;
+  }
+
+  productAcceptanceForRun(deliveryRunId, { candidateSha = null, manifestId = null } = {}) {
+    const rows = this.db.prepare("SELECT id FROM product_acceptance_reports WHERE delivery_run_id = ? ORDER BY created_at DESC").all(deliveryRunId);
+    return rows.map((row) => this.productAcceptanceReport(row.id)).find((item) => (!candidateSha || item.report.candidateSha.toLowerCase() === candidateSha.toLowerCase()) && (!manifestId || item.report.integrationManifestId === manifestId)) ?? null;
+  }
+
+  completeDeliveryWithAcceptance({ deliveryRunId, reportId, merge, publish = {} }) {
+    const run = this.deliveryRun(deliveryRunId); const stored = this.productAcceptanceReport(reportId);
+    if (!run || !stored?.passing) throw new Error("Completion requires a persisted passing ProductAcceptanceReport");
+    const report = stored.report; const blueprint = this.productBlueprint(report.blueprintId); const manifest = this.integrationManifest(report.integrationManifestPath);
+    if (!blueprint || !manifest || run.blueprintId !== report.blueprintId || run.candidate?.sha?.toLowerCase() !== report.candidateSha.toLowerCase() || manifest.id !== report.integrationManifestId || manifest.candidateSha?.toLowerCase() !== report.candidateSha.toLowerCase()) throw new Error("Completion acceptance identity mismatch");
+    if (merge?.status !== "merged" || !merge.mainSha || merge.targetVerified !== true) throw new Error("Completion requires a verified merge result");
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.prepare("UPDATE delivery_runs SET state = 'completed_merged', publish_json = ?, completion_contract_version = 2, owner_pid = NULL, owner_session_id = NULL, heartbeat_at = NULL, updated_at = ? WHERE id = ?").run(JSON.stringify({ ...publish, merge, acceptanceReportId: reportId, candidate: run.candidate }), now(), deliveryRunId);
+      this.#insertEvent(run.bootstrapTaskId, "delivery/completed-merged", { deliveryRunId, reportId, candidateSha: report.candidateSha, mergeSha: merge.mainSha });
+      this.db.exec("COMMIT");
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    return this.deliveryRun(deliveryRunId);
+  }
+
   #addColumnIfMissing(table, column, definition) {
     const columns = this.db.prepare(`PRAGMA table_info(${table})`).all();
     if (!columns.some((item) => item.name === column)) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
@@ -856,6 +906,7 @@ export class StateStore {
   }
 
   #blockLegacyRunsWithoutBlueprint() {
+    this.db.prepare("UPDATE delivery_runs SET completion_contract_version = 0 WHERE state = 'completed_merged' AND completion_contract_version < 2 AND id NOT IN (SELECT delivery_run_id FROM product_acceptance_reports WHERE passing = 1)").run();
     const states = ["running", "awaiting_human", "awaiting_human_remote_handoff", "interrupted", "blocked_credentials", "blocked_ci", "blocked_branch_protection"];
     const rows = this.db.prepare(`SELECT id, bootstrap_task_id FROM delivery_runs WHERE blueprint_id IS NULL AND completion_contract_version = 0 AND state IN (${states.map(() => "?").join(",")})`).all(...states);
     if (!rows.length) return;

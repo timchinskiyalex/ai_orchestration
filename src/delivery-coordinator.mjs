@@ -42,7 +42,7 @@ export class DeliveryCoordinator {
     this.router.recoverStaleDeliveries();
     const run = this.router.store.currentDeliveryRun();
     if (!run) throw new Error("No delivery run exists; start with npm run deliver -- --source <docs-dir>");
-    if (["completed_merged", "completed_candidate_ready", "failed", "blocked_budget", "blocked_quota", "blocked_specification", "conflict_blocked"].includes(run.state)) return run;
+    if (["completed_merged", "completed_candidate_ready", "failed", "blocked_budget", "blocked_quota", "blocked_specification", "blocked_acceptance", "conflict_blocked"].includes(run.state)) return run;
     const resumed = ["interrupted", "blocked_credentials", "blocked_ci", "blocked_branch_protection"].includes(run.state)
       ? this.router.resumeDeliveryRun(run.id)
       : (this.router.activateDeliveryRun(run.id), run);
@@ -56,8 +56,7 @@ export class DeliveryCoordinator {
     if (!manifest) return this.router.store.updateDeliveryRun(run.id, { state: "failed", publish: { reason: "Persisted delivery integration manifest is missing", recovery: { action: "Restore the generated integration manifest before resuming." } } });
     if (run.candidate && (run.candidate.branch !== manifest.branch || run.candidate.sha.toLowerCase() !== manifest.candidateSha?.toLowerCase())) return this.router.store.updateDeliveryRun(run.id, { state: "failed", publish: { reason: "Persisted candidate identity does not match the integration manifest", recovery: { action: "Do not publish; inspect the preserved candidate and delivery checkpoint." } } });
     this.router.store.updateDeliveryRun(run.id, { state: "running", integrationPath: run.integrationPath, candidate: { branch: manifest.branch, sha: manifest.candidateSha }, publicationCheckpoint: { stage: "publication-ready", candidate: { branch: manifest.branch, sha: manifest.candidateSha }, resumed: true, updatedAt: new Date().toISOString() } });
-    const publish = await this.router.publishCandidate({ path: run.integrationPath, manifest }, adapters);
-    return this.router.store.updateDeliveryRun(run.id, { state: publish.terminalState, integrationPath: run.integrationPath, publish, confirmRemotePush: this.router.isAutonomous() });
+    return this.#publishWithAcceptance(run, { path: run.integrationPath, manifest }, adapters);
   }
 
   async #advance(run, context = {}) {
@@ -99,8 +98,29 @@ export class DeliveryCoordinator {
     // crash after a remote side effect can therefore only resume this exact
     // candidate and its idempotency keys, never create a fresh DAG.
     this.router.store.updateDeliveryRun(run.id, { state: "running", integrationPath: integration.integration.path, candidate: { branch: integration.integration.manifest.branch, sha: integration.integration.manifest.candidateSha }, publicationCheckpoint: { stage: "publication-ready", candidate: { branch: integration.integration.manifest.branch, sha: integration.integration.manifest.candidateSha }, updatedAt: new Date().toISOString() } });
-    const publish = await this.router.publishCandidate(integration.integration, context);
-    return this.router.store.updateDeliveryRun(run.id, { state: publish.terminalState, integrationPath: integration.integration.path, publish, confirmRemotePush: this.router.isAutonomous() });
+    return this.#publishWithAcceptance(run, integration.integration, context);
+  }
+
+  async #publishWithAcceptance(run, integration, adapters) {
+    const preliminary = await this.router.publishCandidate(integration, adapters);
+    if (preliminary.terminalState !== "awaiting_final_acceptance") return this.router.store.updateDeliveryRun(run.id, { state: preliminary.terminalState, integrationPath: integration.path, publish: preliminary, confirmRemotePush: this.router.isAutonomous() });
+    const existing = this.router.store.productAcceptanceForRun(run.id, { candidateSha: integration.manifest.candidateSha, manifestId: integration.manifest.id });
+    let acceptance = existing;
+    if (!acceptance) {
+      let productEvidence = null;
+      const adapter = adapters.productEvidenceAdapter;
+      const candidate = { branch: integration.manifest.branch, sha: integration.manifest.candidateSha };
+      if (adapter) productEvidence = typeof adapter.verify === "function" ? await adapter.verify({ candidate, manifest: integration.manifest, deliveryRunId: run.id }) : await adapter({ candidate, manifest: integration.manifest, deliveryRunId: run.id });
+      acceptance = this.router.store.recordProductAcceptanceReport(this.router.buildProductAcceptanceReport({ integration, remoteCi: preliminary.remoteCi, productEvidence }));
+    }
+    if (!acceptance.passing) {
+      const report = acceptance.report;
+      const specification = report.results.some((result) => result.status === "blocked");
+      return this.router.store.updateDeliveryRun(run.id, { state: specification ? "blocked_specification" : "blocked_acceptance", integrationPath: integration.path, publish: { ...preliminary, acceptanceReportId: acceptance.id, reason: specification ? "Final acceptance is blocked by a source/specification condition." : "Final acceptance did not pass; candidate and evidence are retained." }, confirmRemotePush: this.router.isAutonomous() });
+    }
+    const merged = await this.router.publishCandidate(integration, { ...adapters, acceptanceReportId: acceptance.id });
+    if (merged.terminalState !== "merge_verified") return this.router.store.updateDeliveryRun(run.id, { state: merged.terminalState, integrationPath: integration.path, publish: merged, confirmRemotePush: this.router.isAutonomous() });
+    return this.router.store.completeDeliveryWithAcceptance({ deliveryRunId: run.id, reportId: acceptance.id, merge: merged.merge, publish: merged });
   }
 
   #awaiting(run, gate) {

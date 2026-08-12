@@ -1,5 +1,5 @@
 export function deliveryExitCode(delivery) {
-  return (delivery?.state ?? delivery?.terminalState) === "completed_merged" ? 0 : 1;
+  return (delivery?.state ?? delivery?.terminalState) === "completed_merged" && delivery?.completionContractVersion >= 2 && Boolean(delivery?.publish?.acceptanceReportId) ? 0 : 1;
 }
 
 export function deliveryFinalSummary(router, delivery) {
@@ -12,6 +12,6 @@ export function deliveryFinalSummary(router, delivery) {
     taskStages: { total: tasks.length, done: count("done"), failed: count("failed"), blocked: tasks.filter((task) => String(task.status).startsWith("blocked_")).length, interrupted: count("interrupted") },
     qa: snapshot.qualityReports?.map((item) => item.report?.verdict).filter(Boolean) ?? [], security: snapshot.securityReports?.map((item) => item.report?.verdict).filter(Boolean) ?? [], remediation: tasks.filter((task) => task.remediationRound > 0).length,
     tokens: snapshot.localBudget, candidate: publish.candidate ?? delivery.candidate ?? snapshot.deliveryRun?.candidate ?? null, pullRequest: publish.pullRequest ?? null, ci: publish.remoteCi ?? null, merge: publish.merge ?? null,
-    artifacts: { integrationPath: delivery.integrationPath ?? snapshot.deliveryRun?.integrationPath ?? null, publicationCheckpoint: snapshot.deliveryRun?.publicationCheckpoint ?? null }, recoveryAction: publish.recovery?.action ?? delivery.recovery?.action ?? null
+    artifacts: { integrationPath: delivery.integrationPath ?? snapshot.deliveryRun?.integrationPath ?? null, publicationCheckpoint: snapshot.deliveryRun?.publicationCheckpoint ?? null }, finalAcceptance: snapshot.finalAcceptance ? { reportId: snapshot.finalAcceptance.id, passing: snapshot.finalAcceptance.passing, results: snapshot.finalAcceptance.report.results.map((result) => ({ requirementId: result.requirementId, criterionId: result.criterionId, status: result.status })) } : null, recoveryAction: publish.recovery?.action ?? delivery.recovery?.action ?? null
   };
 }
