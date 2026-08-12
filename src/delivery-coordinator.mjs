@@ -21,8 +21,8 @@ export class DeliveryCoordinator {
   async begin({ source, ...adapters }) {
     this.router.recoverStaleDeliveries();
     const current = this.router.store.currentDeliveryRun();
-    if (current && ["running", "awaiting_human", "awaiting_human_remote_handoff"].includes(current.state)) throw new Error(`A delivery run is already active: ${current.id}. Use npm run deliver -- --resume.`);
-    if (current && ["interrupted", "blocked_credentials", "blocked_ci", "blocked_branch_protection"].includes(current.state)) throw new Error(`A persisted delivery run is resumable: ${current.id}. Use npm run deliver -- --resume instead of creating a new Bootstrap/DAG.`);
+    if (current && (["running", "awaiting_human", "awaiting_human_remote_handoff"].includes(current.state) || (this.router.store.activeScopedReplans?.(current.id).length ?? 0))) throw new Error(`A delivery run is already active or recovering: ${current.id}. Use npm run deliver -- --resume.`);
+    if (current && ["interrupted", "blocked_credentials", "blocked_ci", "blocked_branch_protection", "failed"].includes(current.state)) throw new Error(`A persisted delivery run is resumable: ${current.id}. Use npm run deliver -- --resume instead of creating a new Bootstrap/DAG.`);
     // A terminal controller run can still have never-claimed DAG rows. They are
     // historical work, not a live delivery: retain their evidence but never let
     // them block a deliberately fresh delivery.
@@ -42,8 +42,8 @@ export class DeliveryCoordinator {
     this.router.recoverStaleDeliveries();
     const run = this.router.store.currentDeliveryRun();
     if (!run) throw new Error("No delivery run exists; start with npm run deliver -- --source <docs-dir>");
-    if (["completed_merged", "completed_candidate_ready", "failed", "blocked_budget", "blocked_quota", "blocked_specification", "blocked_acceptance", "conflict_blocked"].includes(run.state)) return run;
-    const resumed = ["interrupted", "blocked_credentials", "blocked_ci", "blocked_branch_protection"].includes(run.state)
+    if (["completed_merged", "completed_candidate_ready", "blocked_budget", "blocked_quota", "blocked_specification", "blocked_acceptance", "conflict_blocked"].includes(run.state)) return run;
+    const resumed = ["interrupted", "blocked_credentials", "blocked_ci", "blocked_branch_protection", "failed"].includes(run.state)
       ? this.router.resumeDeliveryRun(run.id)
       : (this.router.activateDeliveryRun(run.id), run);
     if (resumed.integrationPath) return this.#publishPersisted(resumed, adapters);
@@ -76,12 +76,15 @@ export class DeliveryCoordinator {
     if (execution?.blockedQuota) return this.router.store.updateDeliveryRun(run.id, { state: "blocked_quota", publish: { reason: execution.quota?.reason ?? "App Server quota policy blocked new turns", quota: execution.quota } });
     if (execution?.interrupted) return this.router.store.deliveryRun(run.id);
     if (execution?.blockedBudget) return this.router.store.deliveryRun(run.id)?.state === "blocked_budget" ? this.router.store.deliveryRun(run.id) : this.router.store.updateDeliveryRun(run.id, { state: "blocked_budget", publish: { reason: "Budget watchdog interrupted an active turn" } });
+    this.router.store.completeReadyScopedReplans?.(run.id);
+    const activeReplans = this.router.store.activeScopedReplans?.(run.id) ?? [];
+    if (activeReplans.length) return this.router.store.updateDeliveryRun(run.id, { state: "running", publish: { reason: "Scoped recovery is still active", replans: activeReplans.map((item) => ({ id: item.id, status: item.status })) } });
     const tasks = this.router.list().filter((task) => task.deliveryRunId === run.id);
     if (!this.router.isAutonomous()) {
       const gate = manualGateFor(tasks);
       if (gate) return this.#awaiting(run, gate);
     }
-    const terminalTask = tasks.find((task) => ["failed", "cancelled", "blocked_budget", "blocked_specification", "interrupted", "awaiting_approval"].includes(task.status));
+    const terminalTask = tasks.find((task) => ["failed", "cancelled", "blocked_budget", "blocked_specification", "interrupted", "awaiting_approval"].includes(task.status) && !(this.router.store.isReplannedHistoricalTask?.(task.id) ?? false));
     if (terminalTask) {
       const terminal = terminalForTask(terminalTask);
       return this.router.store.updateDeliveryRun(run.id, { state: terminal.state, publish: { taskId: terminalTask.id, reason: terminal.reason, recovery: { action: "Inspect the task result/report and preserved worktree, correct the source condition, then start a fresh delivery run." } } });

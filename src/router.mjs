@@ -376,10 +376,11 @@ export class SwarmRouter extends EventEmitter {
   }
 
   async runToIntegration({ alreadyIdle = false, deliveryRunId = this.activeDeliveryRunId } = {}) {
+    if (deliveryRunId && this.store.hasEffectiveInvalidatedWork(deliveryRunId)) throw new Error("Run-to-integration is blocked while scoped replan recovery is active");
     const gates = this.store.listTasks().filter((task) => (!deliveryRunId || task.deliveryRunId === deliveryRunId) && ["awaiting_human", "awaiting_approval"].includes(task.status));
     if (gates.length) throw new Error(`Run-to-integration refuses to bypass human gates: ${gates.map((task) => task.id).join(", ")}`);
     if (!alreadyIdle) await this.runUntilIdle();
-    const tasks = this.store.listTasks().filter((task) => !deliveryRunId || task.deliveryRunId === deliveryRunId);
+    const tasks = this.store.listTasks().filter((task) => (!deliveryRunId || task.deliveryRunId === deliveryRunId) && !this.store.isReplannedHistoricalTask(task.id));
     const unfinished = tasks.filter((task) => ENGINEERING_DOMAINS.has(task.role) && task.status !== "done");
     if (unfinished.length) throw new Error(`Run-to-integration stopped before completion: ${unfinished.map((task) => `${task.id}:${task.status}`).join(", ")}`);
     const writerIds = tasks.filter((task) => this.config.roles[task.role]?.sandbox === "workspace-write" && task.status === "done").map((task) => task.id);
@@ -497,6 +498,7 @@ export class SwarmRouter extends EventEmitter {
     while (true) {
       if (this.stopRequested || scheduler.failed || this.budgetInterruptedTasks.size) { scheduler.blockedBudget ||= this.budgetInterruptedTasks.size > 0; return; }
       if (this.quotaThrottleStatus().throttled) { scheduler.blockedQuota = true; return; }
+      this.#resumeScopedReplans();
       const barriersRan = await this.#runReadyIntegrationBarriers();
       const task = this.store.claimNext();
       if (!task) {
@@ -519,9 +521,13 @@ export class SwarmRouter extends EventEmitter {
           if (/specification_gap/i.test(detail)) {
             this.store.transition(task.id, "blocked_specification", { error: detail });
             if (task.deliveryRunId) this.store.updateDeliveryRun(task.deliveryRunId, { state: "blocked_specification", publish: { reason: detail } });
+            const replan = this.store.scopedReplans(task.deliveryRunId).find((item) => item.plannerTaskId === task.id);
+            if (replan) this.store.blockScopedReplan(replan.id, "blocked_specification", detail);
           } else {
             this.store.transition(task.id, "failed", { error: detail });
-            this.#recordScopedFailure(task, detail);
+            const replan = this.store.scopedReplans(task.deliveryRunId).find((item) => item.plannerTaskId === task.id);
+            if (replan) this.store.blockScopedReplan(replan.id, replan.attempt >= replan.maxAttempts ? "abandoned" : "fatal", detail);
+            else this.#recordScopedFailure(task, detail, this.#failureKind(task, detail));
           }
         }
       } finally { this.#forgetTaskTurn(task.id); scheduler.active -= 1; }
@@ -533,6 +539,7 @@ export class SwarmRouter extends EventEmitter {
     const localBudget = this.#localBudgetDecision(task);
     if (this.#enforcesLocalBudget() && !localBudget.allowed) {
       this.store.transition(task.id, "blocked_budget", { error: `Local scheduler hard cap blocks this task: projected ${localBudget.projected} exceeds ${localBudget.limit}` });
+      this.#blockScopedPlanner(task, "blocked_budget", "Local scheduler hard cap blocks scoped recovery planning");
       this.#lifecycle("budget preflight blocked", { taskId: task.id, scope: localBudget.scope, projected: localBudget.projected, limit: localBudget.limit, reservation: task.tokenBudget });
       return;
     }
@@ -542,11 +549,13 @@ export class SwarmRouter extends EventEmitter {
     const decision = this.governor.canStart({ task, alreadyUsed: usage.used, alreadyReserved: Math.max(0, usage.reserved - task.tokenBudget), parentBudget: this.config.router.defaultParentBudget });
     if (this.#enforcesLocalBudget() && !decision.allowed) {
       this.store.transition(task.id, "blocked_budget", { error: `Projected ${decision.projected} exceeds budget ${decision.budget}` });
+      this.#blockScopedPlanner(task, "blocked_budget", "Projected scoped recovery planning usage exceeds budget");
       return;
     }
     const runtimeBudget = this.#runtimeBudgetFor(task, localBudget);
     if (this.#enforcesLocalBudget() && runtimeBudget.interruptThresholdTokens < 1) {
       this.store.transition(task.id, "blocked_budget", { error: "Local scheduler hard cap leaves no runtime token budget for this task" });
+      this.#blockScopedPlanner(task, "blocked_budget", "No local runtime token budget remains for scoped recovery planning");
       return;
     }
 
@@ -677,7 +686,11 @@ export class SwarmRouter extends EventEmitter {
       if (task.role === "bootstrap" && this.isAutonomous() && this.store.productBlueprintForBootstrap(task.id)) this.#enqueuePlanner(task);
     }
     else if (turn.status === "interrupted") this.store.transition(task.id, "interrupted", { error: "Turn interrupted" });
-    else this.store.transition(task.id, "failed", { error: turn.error?.message ?? "Turn failed" });
+    else {
+      const detail = turn.error?.message ?? "Turn failed";
+      this.store.transition(task.id, "failed", { error: detail });
+      this.#recordScopedFailure(task, detail, "worker_failure");
+    }
   }
 
   buildProductAcceptanceReport({ integration, remoteCi, productEvidence = null }) {
@@ -955,6 +968,7 @@ export class SwarmRouter extends EventEmitter {
     if (terminal) {
       const reason = report.verdict === "blocked" ? "Quality gate blocked; verification or findings are not safely remediable." : `Quality remediation limit (${maxRounds}) exhausted.`;
       this.store.transition(task.id, this.isAutonomous() ? "failed" : "awaiting_human", { error: reason });
+      if (this.isAutonomous()) this.#recordScopedFailure(task, reason, "quality_gate_failure");
       this.#lifecycle(this.isAutonomous() ? "quality gate terminal" : "quality gate awaiting human", { taskId: task.id, writerTaskId: writer.id, verdict: report.verdict, reason });
       return;
     }
@@ -1016,6 +1030,7 @@ export class SwarmRouter extends EventEmitter {
     if (terminal) {
       const reason = report.verdict === "blocked" ? "Security gate blocked; findings are not safely remediable." : `Security remediation limit (${maxRounds}) exhausted.`;
       this.store.transition(task.id, this.isAutonomous() ? "failed" : "awaiting_human", { error: reason });
+      if (this.isAutonomous()) this.#recordScopedFailure(task, reason, "security_gate_failure");
       this.#lifecycle(this.isAutonomous() ? "security gate terminal" : "security gate awaiting human", { taskId: task.id, writerTaskId: writer.id, verdict: report.verdict, reason });
       return;
     }
@@ -1082,14 +1097,18 @@ export class SwarmRouter extends EventEmitter {
     const stored = this.store.productBlueprint(plannerTask.blueprintId);
     if (!stored) throw new Error(`Planner task ${plannerTask.id} has no persisted ProductBlueprint`);
     const planRunId = plannerTask.deliveryRunId ?? `standalone:${plannerTask.id}`;
+    const scopedReplan = this.store.scopedReplans(planRunId).find((item) => item.plannerTaskId === plannerTask.id);
     const previous = this.store.currentCheckpoint(planRunId);
     // Read-only historical fixtures and already-recorded planner responses can
     // be upgraded at this boundary, but persistence is always PlanBatch v1.
-    const batchInput = parsedPlan?.kind === "PlanBatch" ? parsedPlan : { ...parsedPlan, schemaVersion: 1, kind: "PlanBatch", id: randomUUID(), deliveryRunId: planRunId, wave: previous ? previous.wave + 1 : 1, basedOnCheckpointSha: previous?.outputSha ?? gitSha(this.config.repository, this.config.baseRef), createdAt: new Date().toISOString() };
-    const plan = validatePlan(normalizePlannerPlanForProject(batchInput, this.config.project.productRoots), { maxTasks: this.config.router.maxPlanTasks, productRoots: this.config.project.productRoots, blueprint: stored.blueprint, requirePlanBatch: true });
+    const priorBatch = scopedReplan?.priorPlanBatchId ? this.store.planBatch(scopedReplan.priorPlanBatchId) : null;
+    const existingBatches = this.store.planBatches(planRunId);
+    const controllerWave = scopedReplan ? Math.max(0, ...existingBatches.map((batch) => batch.wave)) + 1 : (previous ? previous.wave + 1 : 1);
+    const controllerBase = scopedReplan ? (previous?.outputSha ?? scopedReplan.priorCheckpointSha ?? priorBatch?.basedOnCheckpointSha ?? gitSha(this.config.repository, this.config.baseRef)) : (previous?.outputSha ?? gitSha(this.config.repository, this.config.baseRef));
+    const batchInput = { ...(parsedPlan ?? {}), schemaVersion: 1, kind: "PlanBatch", id: scopedReplan?.replacementPlanBatchId ?? scopedReplan?.id ?? randomUUID(), deliveryRunId: planRunId, blueprintId: stored.blueprint.blueprintId, wave: controllerWave, basedOnCheckpointSha: controllerBase, createdAt: new Date().toISOString() };
+    const plan = validatePlan(normalizePlannerPlanForProject(batchInput, scopedReplan ? [] : this.config.project.productRoots), { maxTasks: this.config.router.maxPlanTasks, productRoots: scopedReplan ? [] : this.config.project.productRoots, blueprint: stored.blueprint, requirePlanBatch: true, allowPartialRequirementCoverage: Boolean(scopedReplan), recovery: Boolean(scopedReplan) });
     if (plan.deliveryRunId !== planRunId) throw new Error("PlanBatch deliveryRunId must match Planner delivery run");
-    const existingBatches = this.store.planBatches(plan.deliveryRunId);
-    if (existingBatches.length) {
+    if (existingBatches.length && !scopedReplan) {
       const checkpoint = this.store.currentCheckpoint(plan.deliveryRunId);
       if (!checkpoint || plan.wave !== checkpoint.wave + 1 || plan.basedOnCheckpointSha !== checkpoint.outputSha) throw new Error("Next PlanBatch requires successful reconciliation of the current verified checkpoint");
     } else if (plan.wave !== 1 || plan.basedOnCheckpointSha !== gitSha(this.config.repository, this.config.baseRef)) {
@@ -1145,15 +1164,20 @@ export class SwarmRouter extends EventEmitter {
         const estimate = Math.min(this.config.roles.security?.tokenBudget ?? 0, Math.max(1000, Math.ceil(item.estimatedTokens * 0.35)));
         const security = assertRoute("security", estimate);
         predecessorId = randomUUID();
-        specs.push({ id: predecessorId, role: "security", parentTaskId: primaryId, title: `Security review: ${item.title}`, prompt: `Review finalized writer artifact '${item.title}' for declared risk flags: ${item.riskFlags.join(", ") || "none"}. Return the required SecurityGateReport only.`, allowedPaths: item.allowedPaths, acceptanceChecks: item.acceptanceChecks, dependencies: [primaryId], estimatedTokens: estimate, tokenBudget: security.tokenBudget, maxAttempts: 1, humanApprovalRequired: false, riskFlags: item.riskFlags, supportingDomains: ["security"], sourceWriterTaskId: primaryId, blueprintId: stored.blueprint.blueprintId, requirementIds: item.requirementIds, deliveryRunId: planRunId });
+        specs.push({ id: predecessorId, role: "security", parentTaskId: primaryId, title: `Security review: ${item.title}`, prompt: `Review finalized writer artifact '${item.title}' for declared risk flags: ${item.riskFlags.join(", ") || "none"}. Return the required SecurityGateReport only.`, allowedPaths: item.allowedPaths, acceptanceChecks: item.acceptanceChecks, dependencies: [primaryId], estimatedTokens: estimate, tokenBudget: security.tokenBudget, maxAttempts: 1, humanApprovalRequired: false, riskFlags: item.riskFlags, supportingDomains: ["security"], sourceWriterTaskId: primaryId, blueprintId: stored.blueprint.blueprintId, requirementIds: item.requirementIds, deliveryRunId: planRunId, planBatchId: plan.id, wave: plan.wave });
       }
       if ((mandatoryReview || item.supportingDomains.includes("qa")) && item.primaryDomain !== "qa") {
         const estimate = Math.min(this.config.roles.qa?.tokenBudget ?? 0, Math.max(1000, Math.ceil(item.estimatedTokens * 0.4)));
         const qa = assertRoute("qa", estimate);
-        specs.push({ id: randomUUID(), role: "qa", parentTaskId: predecessorId, title: `QA: ${item.title}`, prompt: `Verify finalized writer artifact '${item.title}' against acceptance checks. Return the required QualityGateReport only.`, allowedPaths: item.allowedPaths, acceptanceChecks: item.acceptanceChecks, dependencies: [predecessorId], estimatedTokens: estimate, tokenBudget: qa.tokenBudget, maxAttempts: 1, humanApprovalRequired: false, riskFlags: item.riskFlags, supportingDomains: ["qa"], sourceWriterTaskId: primaryId, blueprintId: stored.blueprint.blueprintId, requirementIds: item.requirementIds, deliveryRunId: planRunId });
+        specs.push({ id: randomUUID(), role: "qa", parentTaskId: predecessorId, title: `QA: ${item.title}`, prompt: `Verify finalized writer artifact '${item.title}' against acceptance checks. Return the required QualityGateReport only.`, allowedPaths: item.allowedPaths, acceptanceChecks: item.acceptanceChecks, dependencies: [predecessorId], estimatedTokens: estimate, tokenBudget: qa.tokenBudget, maxAttempts: 1, humanApprovalRequired: false, riskFlags: item.riskFlags, supportingDomains: ["qa"], sourceWriterTaskId: primaryId, blueprintId: stored.blueprint.blueprintId, requirementIds: item.requirementIds, deliveryRunId: planRunId, planBatchId: plan.id, wave: plan.wave });
       }
     }
-    this.store.createPlanBatch(plan, specs);
+    const replacements = scopedReplan ? scopedReplan.affectedTaskIds.map((oldTaskId) => {
+      const old = this.store.getTask(oldTaskId);
+      const replacement = specs.find((candidate) => candidate.role === old?.role && candidate.requirementIds.some((id) => old.requirementIds.includes(id))) ?? specs.find((candidate) => candidate.role === old?.role);
+      return { oldTaskId, replacementTaskId: replacement?.id ?? null, kind: old?.integrationBarrierId ? "barrier-consumer" : "task" };
+    }) : [];
+    this.store.createPlanBatch(plan, specs, scopedReplan ? { replanId: scopedReplan.id, replacements } : undefined);
   }
 
   async #refreshProjectOverlayFromWorktree(worktree) {
@@ -1216,7 +1240,12 @@ export class SwarmRouter extends EventEmitter {
       progressed = true;
       const artifacts = barrier.inputArtifacts.map((item) => this.store.workerArtifact(item.artifactId));
       const result = await new Integrator({ ...this.config, processRunner: this.processRunner }).integrateBarrier({ barrier, artifacts, overlay: this.#workerOverlayContext().overlay });
-      if (result.status !== "passed") { this.store.failIntegrationBarrier(barrier.id, result.error); continue; }
+      if (result.status !== "passed") {
+        this.store.failIntegrationBarrier(barrier.id, result.error);
+        const consumer = this.store.listTasks().find((item) => item.integrationBarrierId === barrier.id);
+        if (consumer) this.#recordScopedFailure(consumer, result.error, "barrier_failure", { barrierId: barrier.id, inputArtifacts: barrier.inputArtifacts });
+        continue;
+      }
       const checkpoint = { schemaVersion: 1, kind: "IntegrationCheckpoint", id: randomUUID(), deliveryRunId: barrier.deliveryRunId, blueprintId: barrier.blueprintId, wave: barrier.wave, baseSha: barrier.baseSha, inputArtifacts: barrier.inputArtifacts, outputSha: result.outputSha, verificationResults: result.verificationResults, status: "passed", createdAt: new Date().toISOString() };
       this.store.recordIntegrationCheckpoint(checkpoint, { barrierId: barrier.id });
       this.store.reconcileWave({ deliveryRunId: barrier.deliveryRunId, wave: barrier.wave, checkpointId: checkpoint.id });
@@ -1226,12 +1255,76 @@ export class SwarmRouter extends EventEmitter {
     return progressed;
   }
 
-  #recordScopedFailure(task, detail) {
-    const tasks = this.store.listTasks(); const affected = new Set([task.id]); let changed = true;
-    while (changed) { changed = false; for (const candidate of tasks) if (!affected.has(candidate.id) && candidate.dependencies.some((id) => affected.has(id))) { affected.add(candidate.id); changed = true; } }
-    const invalidated = [...affected].filter((id) => id !== task.id && this.store.getTask(id)?.status === "queued");
-    this.store.recordScopedReplan({ id: randomUUID(), deliveryRunId: task.deliveryRunId, blueprintId: task.blueprintId, failedTaskId: task.id, invalidatedTaskIds: invalidated, priorPlanBatchId: task.planBatchId, status: "pending", createdAt: new Date().toISOString() });
-    this.#lifecycle("scoped replan required", { failedTaskId: task.id, invalidatedTaskIds: invalidated, reason: String(detail).slice(0, 300) });
+  #failureKind(task, detail) {
+    if (/verification failed|finalize/i.test(String(detail))) return "verification_failure";
+    if (task.role === "qa") return "quality_gate_failure";
+    if (task.role === "security") return "security_gate_failure";
+    return "worker_failure";
+  }
+
+  #blockScopedPlanner(task, status, detail) {
+    const replan = task.deliveryRunId ? this.store.scopedReplans(task.deliveryRunId).find((item) => item.plannerTaskId === task.id) : null;
+    if (replan) this.store.blockScopedReplan(replan.id, status, detail);
+  }
+
+  // Controller-facing typed entry point for adapters that detect an immutable
+  // dependency contract drift after planning.  It deliberately has no generic
+  // adapter policy: callers supply the task that owns the contract.
+  recordDependencyContractChange(taskId, detail) {
+    const task = this.store.getTask(taskId); if (!task) throw new Error(`Task not found: ${taskId}`);
+    if (["running", "preparing", "awaiting_review", "awaiting_approval"].includes(task.status)) this.store.transition(task.id, "failed", { error: String(detail).slice(0, 1200) });
+    return this.#recordScopedFailure(task, detail, "dependency_contract_change");
+  }
+
+  #resumeScopedReplans() {
+    if (!this.activeDeliveryRunId) return;
+    for (const active of this.store.activeScopedReplans(this.activeDeliveryRunId)) {
+      const claimed = active.status === "pending" ? this.store.claimScopedReplan(active.id) : active;
+      if (!claimed || claimed.status !== "planning" || claimed.plannerTaskId) continue;
+      const stored = this.store.productBlueprint(claimed.blueprintId);
+      if (!stored) { this.store.blockScopedReplan(claimed.id, "fatal", "Persisted ProductBlueprint is unavailable"); continue; }
+      const planner = this.enqueue({
+        role: "planner", title: `Scoped recovery plan ${claimed.id.slice(0, 8)}`,
+        prompt: this.#scopedPlannerPrompt(claimed), blueprintId: claimed.blueprintId, deliveryRunId: claimed.deliveryRunId,
+        // Planner is allowed to carry no direct requirements; it plans the
+        // controller-provided remaining immutable requirement subset.
+        requirementIds: []
+      });
+      this.store.attachScopedReplanPlanner(claimed.id, planner.id);
+      this.#lifecycle("scoped replan planner queued", { replanId: claimed.id, plannerTaskId: planner.id, attempt: claimed.attempt });
+    }
+  }
+
+  #scopedPlannerPrompt(replan) {
+    return `Scoped recovery only. Do not create Bootstrap or re-plan the entire product DAG. Controller-owned recovery context follows; it is authoritative and sanitized:\n${JSON.stringify({ replanId: replan.id, failedTaskId: replan.failedTaskId, failureKind: replan.failureKind, failureDetail: replan.failureDetail, affectedTaskIds: replan.affectedTaskIds, invalidatedTaskIds: replan.invalidatedTaskIds, preservedArtifacts: replan.preservedArtifacts, priorCheckpointId: replan.priorCheckpointId, priorCheckpointSha: replan.priorCheckpointSha, remainingRequirementIds: replan.remainingRequirementIds, priorContext: replan.priorContext, maxAttempts: replan.maxAttempts })}\nReturn only the replacement PlanBatch JSON. Include only work needed for the affected scope. The controller assigns the immutable batch id, delivery run, wave, and base SHA.`;
+  }
+
+  #recordScopedFailure(task, detail, failureKind = "worker_failure", context = {}) {
+    if (!task.deliveryRunId || !task.blueprintId) { this.#lifecycle("scoped replan required", { failedTaskId: task.id, failureKind, invalidatedTaskIds: [], reason: String(detail).slice(0, 300), unavailable: "missing immutable delivery/blueprint contract" }); return null; }
+    const tasks = this.store.listTasks().filter((item) => item.deliveryRunId === task.deliveryRunId);
+    const affected = new Set([task.id]);
+    // Dependency edges are not the only execution edges: reviews, remediation
+    // parent chains and fan-in barrier consumers must be replaced together.
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const candidate of tasks) {
+        const touches = candidate.dependencies.some((id) => affected.has(id)) || affected.has(candidate.sourceWriterTaskId) || (candidate.parentTaskId && affected.has(candidate.parentTaskId)) || (candidate.integrationBarrierId && context.barrierId === candidate.integrationBarrierId);
+        if (!affected.has(candidate.id) && touches) { affected.add(candidate.id); changed = true; }
+      }
+    }
+    const affectedTaskIds = [...affected];
+    const invalidatedTaskIds = affectedTaskIds.filter((id) => id !== task.id);
+    const preservedArtifacts = tasks.filter((item) => !affected.has(item.id)).map((item) => this.store.workerArtifact(item.id)).filter(Boolean).map((artifact) => ({ taskId: artifact.taskId, headSha: artifact.headSha, baseSha: artifact.baseSha }));
+    const checkpoint = this.store.currentCheckpoint(task.deliveryRunId);
+    const priorBatch = task.planBatchId ? this.store.planBatch(task.planBatchId) : null;
+    const remainingRequirementIds = [...new Set(tasks.filter((item) => affected.has(item.id)).flatMap((item) => item.requirementIds))];
+    const keySource = `${task.deliveryRunId}:${task.id}:${failureKind}:${task.planBatchId ?? "none"}:${context.barrierId ?? ""}`;
+    const idempotencyKey = createHash("sha256").update(keySource).digest("hex");
+    const id = randomUUID();
+    const replanId = this.store.recordScopedReplan({ id, deliveryRunId: task.deliveryRunId, blueprintId: task.blueprintId, failedTaskId: task.id, failureKind, failureDetail: detail, affectedTaskIds, invalidatedTaskIds, preservedArtifacts, priorPlanBatchId: task.planBatchId, priorCheckpointId: checkpoint?.checkpointId ?? null, priorCheckpointSha: checkpoint?.outputSha ?? priorBatch?.basedOnCheckpointSha ?? null, remainingRequirementIds, priorContext: { failureReference: context, priorPlanBatchId: task.planBatchId ?? null }, maxAttempts: this.config.delivery?.maxScopedReplanAttempts ?? 2, idempotencyKey, status: "pending", createdAt: new Date().toISOString() });
+    this.#lifecycle("scoped replan required", { replanId, failedTaskId: task.id, failureKind, affectedTaskIds, invalidatedTaskIds, reason: String(detail).slice(0, 300) });
+    return this.store.scopedReplan(replanId);
   }
   #inheritedWorktree(task) {
     let parent = task.parentTaskId ? this.store.getTask(task.parentTaskId) : null;

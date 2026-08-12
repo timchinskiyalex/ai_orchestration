@@ -18,7 +18,7 @@ export function validateBootstrap(value, { sourceDocuments = null } = {}) {
   catch (error) { fail(error.message.replace(/^Invalid ProductBlueprint: /, "")); }
 }
 
-export function validatePlan(value, { maxTasks, productRoots = [], blueprint = null, requirePlanBatch = false } = {}) {
+export function validatePlan(value, { maxTasks, productRoots = [], blueprint = null, requirePlanBatch = false, allowPartialRequirementCoverage = false, recovery = false } = {}) {
   if (!value || typeof value !== "object" || !Array.isArray(value.tasks)) fail("PlanBatch must contain a tasks array");
   const hasBatchFields = ["schemaVersion", "kind", "id", "deliveryRunId", "wave", "basedOnCheckpointSha", "createdAt"].some((key) => key in value);
   if (requirePlanBatch || hasBatchFields) {
@@ -56,7 +56,7 @@ export function validatePlan(value, { maxTasks, productRoots = [], blueprint = n
       if (!ids.has(dependency) || dependency === task.id) fail(`task '${task.id}' has an invalid dependency '${dependency}'`);
     }
   }
-  if (productRoots.length) {
+  if (productRoots.length && !recovery) {
     const scaffold = value.tasks.find((task) => task.id === "scaffold-product");
     if (!scaffold) fail("greenfield multi-stack plan requires a scaffold-product task");
     if (scaffold.primaryDomain !== "devops") fail("scaffold-product must be a devops writer task");
@@ -82,7 +82,7 @@ export function validatePlan(value, { maxTasks, productRoots = [], blueprint = n
   for (const task of value.tasks) visit(task.id);
   try {
     const plan = enforceRoutingInvariants(value);
-    if (blueprint) assertMandatoryRequirementCoverage(plan, blueprint);
+    if (blueprint && !allowPartialRequirementCoverage) assertMandatoryRequirementCoverage(plan, blueprint);
     return plan;
   }
   catch (error) { fail(error.message.replace(/^Unsafe routing plan: /, "")); }
