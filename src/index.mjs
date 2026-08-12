@@ -65,13 +65,14 @@ try {
   try {
     if (command === "init") console.log(router.init());
     else if (command === "recover") {
-      const recovered = router.recoverStaleDeliveries();
-      console.log(JSON.stringify({ recovered: recovered.map((run) => ({ id: run.id, state: run.state, recovery: run.recovery })) }, null, 2));
+      const recovered = await router.recoverStaleDeliveries();
+      console.log(JSON.stringify({ recovered: recovered.map((run) => ({ id: run.id, state: run.state, recovery: run.recovery })), reconciliation: recovered.reconciliation }, null, 2));
     }
     else if (command === "status") {
       if (hasFlag("--json")) {
         console.log(JSON.stringify(router.statusSnapshot(), null, 2));
       } else {
+      const snapshot = router.statusSnapshot();
       console.table(router.list().map((task) => ({ id: task.id, role: task.role, status: task.status, title: task.title, used: task.tokenUsed, estimate: task.estimatedTokens, cap: task.tokenBudget })));
       const readiness = router.executionReadiness();
       const budget = readiness.localBudget;
@@ -82,6 +83,8 @@ try {
       console.table(account.accountActivity ?? []);
       console.table(account.quotaWindows ?? []);
       console.table([readiness.quotaThrottle]);
+      console.table(snapshot.managedWorktrees);
+      console.table(snapshot.managedWorktreeObservations);
       const latestE2e = readLatestE2eReport(join(root, "runtime", "e2e-runs"));
       console.table([latestE2e ? {
         status: latestE2e.status, startedAt: latestE2e.startedAt, finishedAt: latestE2e.finishedAt, durationMs: latestE2e.durationMs,
@@ -93,7 +96,7 @@ try {
       if (!Number.isInteger(intervalMs) || intervalMs < 250) throw new Error("--interval-ms must be an integer of at least 250");
       const render = () => {
         const snapshot = router.statusSnapshot();
-        console.log(JSON.stringify({ generatedAt: snapshot.generatedAt, deliveryRun: snapshot.deliveryRun, tasks: snapshot.tasks.map((task) => ({ id: task.id, title: task.title, role: task.role, status: task.status, dependencies: task.dependencies, blocker: task.blocker, tokenUsed: task.tokenUsed, remediationRound: task.remediationRound })), managedWorktrees: snapshot.managedWorktrees, activeTurns: snapshot.activeTurns, realConcurrency: snapshot.realConcurrency, localBudget: snapshot.localBudget, localForecast: snapshot.localForecast, appServerQuotaWindows: snapshot.appServerQuotaWindows, securityReports: snapshot.securityReports, qualityReports: snapshot.qualityReports, remoteProgress: snapshot.deliveryRun?.publish ?? null }, null, 2));
+        console.log(JSON.stringify({ generatedAt: snapshot.generatedAt, deliveryRun: snapshot.deliveryRun, tasks: snapshot.tasks.map((task) => ({ id: task.id, title: task.title, role: task.role, status: task.status, dependencies: task.dependencies, blocker: task.blocker, tokenUsed: task.tokenUsed, remediationRound: task.remediationRound })), managedWorktrees: snapshot.managedWorktrees, managedWorktreeObservations: snapshot.managedWorktreeObservations, managedWorktreeInventory: snapshot.managedWorktreeInventory, activeTurns: snapshot.activeTurns, realConcurrency: snapshot.realConcurrency, localBudget: snapshot.localBudget, localForecast: snapshot.localForecast, appServerQuotaWindows: snapshot.appServerQuotaWindows, securityReports: snapshot.securityReports, qualityReports: snapshot.qualityReports, remoteProgress: snapshot.deliveryRun?.publish ?? null }, null, 2));
       };
       render();
       if (!hasFlag("--once")) await new Promise((resolve) => { const timer = setInterval(render, intervalMs); process.on("SIGINT", () => { clearInterval(timer); resolve(); }); });

@@ -71,6 +71,20 @@ test("Router startup rejects an incomplete v1 provider before task claim, worktr
   } finally { subject.dispose(); }
 });
 
+test("reconciliation barrier is awaited before a resumed scheduler can claim or start a worker", async () => {
+  const provider = new ControlledProvider(); const subject = fixture(provider);
+  try {
+    await subject.ready;
+    subject.router.enqueue({ role: "backend", title: "wait for recovery", prompt: "no-op" });
+    let release; subject.router.worktrees.reconcile = async () => await new Promise((resolve) => { release = () => resolve({ records: [], observations: [], inventoryCount: 1, truncated: false }); });
+    let claims = 0; const claimNext = subject.router.store.claimNext.bind(subject.router.store); subject.router.store.claimNext = () => { claims += 1; return claimNext(); };
+    const running = subject.router.runUntilIdle(); await tick();
+    assert.equal(claims, 0); assert.equal(provider.calls.startThread, 0); assert.equal(provider.calls.startTurn, 0);
+    release(); await running;
+    assert.ok(claims > 0); assert.equal(provider.calls.startThread, 1);
+  } finally { subject.dispose(); }
+});
+
 for (const mode of ["wrong-correlation", "wrong-thread", "wrong-turn"]) test(`active ${mode} lifecycle event is interrupted exactly once and cannot finalize`, async () => {
   const provider = new ControlledProvider(mode); const subject = fixture(provider);
   try {

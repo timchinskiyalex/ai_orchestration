@@ -34,12 +34,13 @@ function pathAllowed(path, task, overlay, { autonomous = true } = {}) {
 }
 
 export class WorktreeFinalizer {
-  constructor({ repository, generatedDir, autonomy = {}, runtimeIdentity = RUNTIME_GIT_IDENTITY, processRunner = runManagedProcess }) {
+  constructor({ repository, generatedDir, autonomy = {}, runtimeIdentity = RUNTIME_GIT_IDENTITY, processRunner = runManagedProcess, faultHooks = {} }) {
     this.repository = repository;
     this.generatedDir = generatedDir;
     this.autonomous = autonomy.mode !== "manual";
     this.runtimeIdentity = runtimeIdentity;
     this.processRunner = processRunner;
+    this.faultHooks = faultHooks;
   }
 
   async finalize({ task, worktree, branch, overlay, overlayPath }) {
@@ -84,6 +85,7 @@ export class WorktreeFinalizer {
     const diff = await git(worktree, ["diff", "--cached", "--binary", "--no-ext-diff", artifactBaseSha, "--"]);
     if (!diff) throw new Error("Finalizer staging produced no diff");
     await exec("git", ["-C", worktree, ...runtimeGitIdentityArgs(this.runtimeIdentity), "commit", "-m", `swarm: finalize ${task.id}`]);
+    await this.faultHooks?.finalizer_git_committed?.({ taskId: task.id, worktree, branch });
     const [headSha, treeSha, clean] = await Promise.all([
       git(worktree, ["rev-parse", "HEAD"]), git(worktree, ["rev-parse", "HEAD^{tree}"]), gitRaw(worktree, ["status", "--porcelain=v1", "-z", "--untracked-files=all"])
     ]);
@@ -99,6 +101,7 @@ export class WorktreeFinalizer {
     mkdirSync(artifactsDir, { recursive: true });
     const absolutePath = join(artifactsDir, `${task.id}.v${ARTIFACT_VERSION}.json`);
     writeFileSync(absolutePath, JSON.stringify(artifact, null, 2) + "\n", "utf8");
+    await this.faultHooks?.finalizer_artifact_file_written?.({ taskId: task.id, path: absolutePath, artifact });
     validateWorkerArtifact(artifact); return { artifact, path: toPosix(relative(this.repository, absolutePath)) };
   }
 }

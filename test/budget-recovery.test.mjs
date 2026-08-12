@@ -161,13 +161,13 @@ test("SIGINT-equivalent shutdown and App Server exit persist interrupted deliver
   } finally { crashed.dispose(); }
 });
 
-test("stale owner lease recovery marks the historical run interrupted without erasing token history", () => {
+test("stale owner lease recovery marks the historical run interrupted without erasing token history", async () => {
   const subject = fixture();
   try {
     const task = subject.router.enqueue({ role: "bootstrap", title: "stale", prompt: "bounded" }); const run = createRun(subject.router, task);
     subject.router.store.db.prepare("UPDATE delivery_runs SET owner_pid = ?, owner_session_id = ?, heartbeat_at = ? WHERE id = ?").run(999999, "dead-session", "2000-01-01T00:00:00.000Z", run.id);
     subject.router.store.transition(task.id, "preparing"); subject.router.store.transition(task.id, "running", { threadId: "historic-thread", turnId: "historic-turn" }); subject.router.store.setTokenUsage(task.id, 120550);
-    const recovered = subject.router.recoverStaleDeliveries();
+    const recovered = await subject.router.recoverStaleDeliveries();
     assert.equal(recovered.length, 1); assert.equal(subject.router.store.deliveryRun(run.id).state, "interrupted");
     const historical = subject.router.store.getTask(task.id); assert.equal(historical.status, "interrupted"); assert.equal(historical.tokenUsed, 120550); assert.equal(historical.threadId, "historic-thread"); assert.equal(historical.turnId, "historic-turn");
   } finally { subject.dispose(); }

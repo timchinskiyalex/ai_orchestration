@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, existsSync, mkdirSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
@@ -40,4 +40,29 @@ test("read-only manager construction does not create runtime directories", () =>
   const root = repository(); const runtime = join(root, "absent-runtime");
   try { new WorktreeManager({ repository: root, runtimeDir: runtime, baseRef: "main", readOnly: true }); assert.equal(existsSync(runtime), false); }
   finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("bidirectional inventory preserves Git-only managed-root and external registrations as observations", async () => {
+  const root = repository(); const runtime = join(root, "runtime"); const outside = mkdtempSync(join(tmpdir(), "managed-external-")); const store = new StateStore(join(runtime, "swarm.sqlite"));
+  try {
+    const manager = new WorktreeManager({ repository: root, runtimeDir: runtime, baseRef: "main", store }); const base = git(root, ["rev-parse", "HEAD"]);
+    const unmanaged = join(runtime, "worktrees", "git-only"); mkdirSync(join(runtime, "worktrees"), { recursive: true }); git(root, ["worktree", "add", "-b", "foreign/managed-root", unmanaged, base]);
+    git(root, ["worktree", "add", "-b", "foreign/external", outside, base]);
+    const result = await manager.reconcile();
+    assert.equal(store.listManagedWorktrees().length, 0, "Git observations never become ownership records");
+    assert.equal(result.observations.find((item) => item.path === unmanaged)?.classification, "unregistered-foreign-preserved");
+    assert.equal(result.observations.find((item) => item.path === outside)?.classification, "foreign-legacy-observation");
+  } finally { store.close(); rmSync(root, { recursive: true, force: true }); rmSync(outside, { recursive: true, force: true }); }
+});
+
+test("read-only inventory reports current missing records without SQLite or runtime writes", async () => {
+  const root = repository(); const runtime = join(root, "runtime"); let store = new StateStore(join(runtime, "swarm.sqlite"));
+  try {
+    const manager = new WorktreeManager({ repository: root, runtimeDir: runtime, baseRef: "main", store }); const identity = await manager.repositoryIdentity(); const base = git(root, ["rev-parse", "HEAD"]);
+    store.recordManagedWorktreeIntent({ recordId: "db-only", kind: "worker", ...identity, intendedPath: join(runtime, "worktrees", "absent"), branch: "swarm/v2/worker/db-only", intendedBaseSha: base, creationSessionId: "test-session" });
+    store.close(); const before = statSync(join(runtime, "swarm.sqlite")).mtimeMs;
+    store = new StateStore(join(runtime, "swarm.sqlite"), { readOnly: true }); const readonly = new WorktreeManager({ repository: root, runtimeDir: runtime, baseRef: "main", store, readOnly: true });
+    const view = readonly.inventoryViewSync();
+    assert.equal(view.current.get("db-only").classification, "missing"); assert.equal(statSync(join(runtime, "swarm.sqlite")).mtimeMs, before); assert.equal(existsSync(join(runtime, "integrations")), false);
+  } finally { store.close(); rmSync(root, { recursive: true, force: true }); }
 });

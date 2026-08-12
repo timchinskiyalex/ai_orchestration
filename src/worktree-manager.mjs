@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, realpathSync } from "node:fs";
 import { resolve, relative, sep, isAbsolute, join } from "node:path";
 import { randomUUID } from "node:crypto";
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
 
 const exec = promisify(execFile);
@@ -29,7 +29,7 @@ export function parseWorktreePorcelainZ(buffer) {
 }
 
 export class WorktreeManager {
-  constructor({ repository, runtimeDir, baseRef, project = {}, store = null, readOnly = false }) {
+  constructor({ repository, runtimeDir, baseRef, project = {}, store = null, readOnly = false, faultHooks = {} }) {
     this.repository = resolve(repository);
     this.runtimeDir = resolve(runtimeDir);
     this.root = resolve(runtimeDir, "worktrees");
@@ -38,6 +38,7 @@ export class WorktreeManager {
     this.store = store;
     this.project = project;
     this.readOnly = readOnly;
+    this.faultHooks = faultHooks;
     // Legacy direct manager users are execution-capable. Read-only router
     // construction deliberately passes readOnly and never touches runtime.
     if (!readOnly) mkdirSync(this.root, { recursive: true });
@@ -53,6 +54,69 @@ export class WorktreeManager {
     const { stdout } = await exec("git", ["-C", this.repository, "worktree", "list", "--porcelain", "-z"], { encoding: "buffer", maxBuffer: 2_000_000 });
     return parseWorktreePorcelainZ(stdout).map((item) => ({ ...item, canonicalPath: existsSync(item.path) ? realpathSync(item.path) : null }));
   }
+
+  registeredWorktreesSync() {
+    const stdout = execFileSync("git", ["-C", this.repository, "worktree", "list", "--porcelain", "-z"], { encoding: "buffer", maxBuffer: 2_000_000 });
+    return parseWorktreePorcelainZ(stdout).map((item) => ({ ...item, canonicalPath: existsSync(item.path) ? realpathSync(item.path) : null }));
+  }
+
+  #trusted(record) { return record?.schemaVersion === 2 && record.protocolVersion === 2 && record.ownerVersion === "managed-worktree/v2"; }
+  #underManagedRoot(path) {
+    if (!path) return false;
+    try {
+      const canonical = existsSync(path) ? realpathSync(path) : resolve(path);
+      for (const root of [this.root, this.integrationRoot]) if (existsSync(root) && (canonical === realpathSync(root) || within(realpathSync(root), canonical))) return true;
+    } catch { /* observations must never make inventory destructive */ }
+    return false;
+  }
+  #observe(inventory, records) {
+    const owned = new Set();
+    for (const record of records.filter((record) => this.#trusted(record))) {
+      for (const path of [record.canonicalPath, record.intendedPath]) {
+        if (!path) continue;
+        try { owned.add(existsSync(path) ? realpathSync(path) : resolve(path)); } catch { /* record verification reports an unsafe path separately */ }
+      }
+    }
+    return inventory.filter((item) => !item.canonicalPath || !owned.has(item.canonicalPath)).slice(0, 100).map((item) => ({
+      path: item.canonicalPath ?? item.path, branch: item.branch ?? null, head: item.head ?? null,
+      classification: this.#underManagedRoot(item.canonicalPath ?? item.path) ? "unregistered-foreign-preserved" : "foreign-legacy-observation",
+      owned: false
+    }));
+  }
+
+  inventoryViewSync({ records = this.store?.listManagedWorktrees({ limit: 100 }) ?? [] } = {}) {
+    try {
+      const inventory = this.registeredWorktreesSync();
+      const current = new Map(records.map((record) => [record.recordId, this.#verifyRecordSync(record, inventory)]));
+      return { records, current, observations: this.#observe(inventory, records), inventoryCount: inventory.length, truncated: inventory.length > 100, error: null };
+    } catch (error) {
+      return { records, current: new Map(), observations: [], inventoryCount: 0, truncated: false, error: String(error.message).slice(0, 300) };
+    }
+  }
+
+  #verifyRecordSync(record, inventory) {
+    if (!this.#trusted(record)) return { classification: "foreign-legacy-observation", reason: "untrusted durable record" };
+    try {
+      const repositoryRoot = realpathSync(this.repository);
+      const common = realpathSync(resolve(repositoryRoot, execFileSync("git", ["-C", repositoryRoot, "rev-parse", "--git-common-dir"], { encoding: "utf8" }).trim()));
+      if (repositoryRoot !== record.repositoryRoot || common !== record.repositoryCommonDir) return { classification: "integrity-blocked", reason: "repository identity mismatch" };
+      if (!existsSync(record.intendedPath)) return { classification: "missing", reason: "path missing" };
+      const canonicalPath = realpathSync(record.intendedPath); const allowedRoot = record.kind === "worker" ? this.root : this.integrationRoot;
+      if (!existsSync(allowedRoot) || !within(realpathSync(allowedRoot), canonicalPath)) return { classification: "integrity-blocked", reason: "path escapes managed runtime" };
+      const matches = inventory.filter((item) => item.canonicalPath === canonicalPath);
+      if (matches.length !== 1) return { classification: "integrity-blocked", reason: "registration mismatch" };
+      const item = matches[0]; const top = realpathSync(execFileSync("git", ["-C", canonicalPath, "rev-parse", "--show-toplevel"], { encoding: "utf8" }).trim());
+      const worktreeCommon = realpathSync(resolve(top, execFileSync("git", ["-C", canonicalPath, "rev-parse", "--git-common-dir"], { encoding: "utf8" }).trim()));
+      if (top !== canonicalPath || worktreeCommon !== common || item.branch !== record.branch) return { classification: "integrity-blocked", reason: "registered root, common dir, or branch mismatch" };
+      const head = execFileSync("git", ["-C", canonicalPath, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+      const base = execFileSync("git", ["-C", canonicalPath, "merge-base", record.intendedBaseSha, head], { encoding: "utf8" }).trim();
+      if (base !== record.intendedBaseSha) return { classification: "integrity-blocked", reason: "base ancestry mismatch" };
+      const clean = !execFileSync("git", ["-C", canonicalPath, "status", "--porcelain=v1", "-z", "--untracked-files=all"], { encoding: "buffer" }).length;
+      return { classification: record.phase === "finalized" ? (clean ? "finalized-reclaimable" : "preserved-failure") : (clean ? "active" : "preserved-failure"), head, clean };
+    } catch (error) { return { classification: "integrity-blocked", reason: String(error.message).slice(0, 300) }; }
+  }
+
+  async #boundary(name, details = {}) { await this.faultHooks?.[name]?.(details); }
 
   async verifyRepository() {
     const inside = await git(this.repository, ["rev-parse", "--is-inside-work-tree"]);
@@ -94,8 +158,10 @@ export class WorktreeManager {
     const branch = `swarm/v2/${kind}/${token()}`;
     const intent = this.store.recordManagedWorktreeIntent({ recordId, kind, ...identity, intendedPath, taskId, deliveryRunId, planBatchId, barrierId, candidateId, branch, intendedBaseSha: baseSha, creationSessionId: sessionId ?? randomUUID(), attempt, ownerVersion: "managed-worktree/v2" });
     // Only after the durable intent exists may Git create a directory.
+    await this.#boundary("managed_worktree_intent_persisted", { recordId, kind, intendedPath });
     mkdirSync(kind === "worker" ? this.root : this.integrationRoot, { recursive: true });
     await exec("git", ["-C", this.repository, "worktree", "add", "-b", branch, intendedPath, baseSha]);
+    await this.#boundary("managed_worktree_git_created", { recordId, kind, intendedPath });
     this.store.updateManagedWorktree(recordId, { phase: "git_created" });
     const verified = await this.verifyRecord(intent.recordId);
     if (!verified.ok) { this.store.updateManagedWorktree(recordId, { phase: "preserved", classification: verified.classification, verification: verified.safe }); throw new Error(`Managed worktree integrity blocked: ${verified.classification}`); }
@@ -107,22 +173,22 @@ export class WorktreeManager {
     return { worktree: record.canonicalPath, branch: record.branch, recordId: record.recordId };
   }
 
-  async verifyRecord(recordId) {
+  async verifyRecord(recordId, { inventory = null, identity = null } = {}) {
     const record = this.store?.managedWorktree(recordId); if (!record) return { ok: false, classification: "foreign", safe: { reason: "missing durable record" } };
     try {
-      const identity = await this.repositoryIdentity();
-      if (identity.repositoryRoot !== record.repositoryRoot || identity.repositoryCommonDir !== record.repositoryCommonDir) return { ok: false, classification: "integrity-blocked", safe: { reason: "repository identity mismatch" } };
+      const currentIdentity = identity ?? await this.repositoryIdentity();
+      if (currentIdentity.repositoryRoot !== record.repositoryRoot || currentIdentity.repositoryCommonDir !== record.repositoryCommonDir) return { ok: false, classification: "integrity-blocked", safe: { reason: "repository identity mismatch" } };
       if (!existsSync(record.intendedPath)) return { ok: false, classification: "missing", safe: { reason: "path missing" } };
       const canonicalPath = realpathSync(record.intendedPath);
       const allowedRoot = record.kind === "worker" ? this.root : this.integrationRoot;
       if (!existsSync(allowedRoot) || !within(realpathSync(allowedRoot), canonicalPath)) return { ok: false, classification: "integrity-blocked", safe: { reason: "path escapes managed runtime" } };
       const duplicate = this.store.listManagedWorktrees().find((other) => other.recordId !== record.recordId && (other.canonicalPath === canonicalPath || other.intendedPath === record.intendedPath));
       if (duplicate) return { ok: false, classification: "integrity-blocked", safe: { reason: "duplicate managed canonical path" } };
-      const inventory = await this.registeredWorktrees(); const matches = inventory.filter((item) => item.canonicalPath === canonicalPath);
+      const currentInventory = inventory ?? await this.registeredWorktrees(); const matches = currentInventory.filter((item) => item.canonicalPath === canonicalPath);
       if (matches.length !== 1) return { ok: false, classification: matches.length ? "integrity-blocked" : "foreign", safe: { reason: "unsafe or absent worktree registration" } };
       const item = matches[0]; const top = realpathSync(await git(canonicalPath, ["rev-parse", "--show-toplevel"]));
       const common = realpathSync(resolve(top, await git(canonicalPath, ["rev-parse", "--git-common-dir"])));
-      if (top !== canonicalPath || common !== identity.repositoryCommonDir || item.branch !== record.branch) return { ok: false, classification: "integrity-blocked", safe: { reason: "registered root, common dir, or branch mismatch" } };
+      if (top !== canonicalPath || common !== currentIdentity.repositoryCommonDir || item.branch !== record.branch) return { ok: false, classification: "integrity-blocked", safe: { reason: "registered root, common dir, or branch mismatch" } };
       const head = await git(canonicalPath, ["rev-parse", "HEAD"]); const mergeBase = await git(canonicalPath, ["merge-base", record.intendedBaseSha, head]);
       if (mergeBase !== record.intendedBaseSha) return { ok: false, classification: "integrity-blocked", safe: { reason: "base ancestry mismatch" } };
       const clean = await cleanStatus(canonicalPath);
@@ -131,10 +197,12 @@ export class WorktreeManager {
   }
 
   async reconcile({ taskForRecord = () => null } = {}) {
-    if (!this.store) return [];
+    if (!this.store) return { records: [], observations: [], inventoryCount: 0, truncated: false };
+    const records = this.store.listManagedWorktrees({ limit: 100 });
+    const [identity, inventory] = await Promise.all([this.repositoryIdentity(), this.registeredWorktrees()]);
     const outcomes = [];
-    for (const record of this.store.listManagedWorktrees()) {
-      const verified = await this.verifyRecord(record.recordId);
+    for (const record of records) {
+      const verified = await this.verifyRecord(record.recordId, { inventory, identity });
       let classification = verified.classification ?? "active"; let phase = record.phase;
       if (verified.ok) {
         const task = taskForRecord(record);
@@ -146,7 +214,7 @@ export class WorktreeManager {
       } else this.store.updateManagedWorktree(record.recordId, { phase: "preserved", classification, verification: verified.safe });
       outcomes.push({ recordId: record.recordId, kind: record.kind, phase, classification });
     }
-    return outcomes;
+    return { records: outcomes, observations: this.#observe(inventory, records), inventoryCount: inventory.length, truncated: inventory.length > 100 };
   }
 
   async adoptPreparedWorker(task) {

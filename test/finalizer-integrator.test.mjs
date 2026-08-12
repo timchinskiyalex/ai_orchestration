@@ -28,9 +28,9 @@ test("finalizer produces a clean, committed artifact and integrator creates a ca
     git(root, ["worktree", "add", "-b", "swarm/writer", worktree, overlay.repository.baseSha]);
     assert.equal(existsSync(join(worktree, "docs", "orchestration-generated", "project-overlay.v1.json")), false, "untracked controller Overlay must not be copied into a fresh writer worktree");
     writeFileSync(join(worktree, "src", "value.mjs"), "export const value = 2;\n", "utf8");
-    const finalizer = new WorktreeFinalizer({ repository: root, generatedDir: "docs/orchestration-generated" });
+    const boundaries = []; const finalizer = new WorktreeFinalizer({ repository: root, generatedDir: "docs/orchestration-generated", faultHooks: { finalizer_git_committed: () => boundaries.push("git-commit"), finalizer_artifact_file_written: () => boundaries.push("artifact-file") } });
     const finalized = await finalizer.finalize({ task: { id: "writer", role: "backend", allowedPaths: ["src"], dependencies: [] }, worktree, branch: "swarm/writer", overlay, overlayPath: path });
-    assert.equal(finalized.artifact.verificationResults[0].status, "passed");
+    assert.equal(finalized.artifact.verificationResults[0].status, "passed"); assert.deepEqual(boundaries, ["git-commit", "artifact-file"]);
     assert.equal(git(worktree, ["status", "--porcelain"]), "");
     const integration = await new Integrator({ repository: root, runtimeDir: join(root, "runtime"), generatedDir: "docs/orchestration-generated" }).integrate({ artifacts: [finalized.artifact], overlay });
     assert.equal(integration.manifest.status, "candidate_ready");

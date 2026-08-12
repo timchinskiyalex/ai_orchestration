@@ -20,7 +20,7 @@ export class DeliveryCoordinator {
   constructor(router) { this.router = router; }
 
   async begin({ source, ...adapters }) {
-    this.router.recoverStaleDeliveries();
+    await this.router.recoverStaleDeliveries();
     const current = this.router.store.currentDeliveryRun();
     if (current && (["running", "awaiting_human", "awaiting_human_remote_handoff"].includes(current.state) || (this.router.store.activeScopedReplans?.(current.id).length ?? 0))) throw new Error(`A delivery run is already active or recovering: ${current.id}. Use npm run deliver -- --resume.`);
     if (current && ["interrupted", "blocked_credentials", "blocked_ci", "blocked_branch_protection", "failed"].includes(current.state)) throw new Error(`A persisted delivery run is resumable: ${current.id}. Use npm run deliver -- --resume instead of creating a new Bootstrap/DAG.`);
@@ -57,7 +57,7 @@ export class DeliveryCoordinator {
   }
 
   async resume(adapters = {}) {
-    this.router.recoverStaleDeliveries();
+    await this.router.recoverStaleDeliveries();
     const run = this.router.store.currentDeliveryRun();
     if (!run) throw new Error("No delivery run exists; start with npm run deliver -- --source <docs-dir>");
     if (typeof this.router.assertRepositoryBaseline === "function") {
@@ -76,6 +76,8 @@ export class DeliveryCoordinator {
       } catch (error) { return this.router.blockRunForSourceCompleteness(resumed, error); }
     }
     if (resumed.integrationPath) return this.#publishPersisted(resumed, adapters);
+    // Reconciliation above is the admission barrier: interrupted tasks cannot
+    // be requeued before their durable worktree ownership is classified.
     if (run.state === "interrupted") this.router.store.resumeInterruptedTasks(resumed.id);
     return this.#advance(resumed, adapters);
   }

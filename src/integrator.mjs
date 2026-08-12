@@ -20,7 +20,7 @@ const sensitiveArea = (path) => /(^|\/)(migrations?|infra|terraform|k8s|helm|\.g
 const checksum = (value) => createHash("sha256").update(value).digest("hex");
 
 export class Integrator {
-  constructor({ repository, runtimeDir, generatedDir, project = {}, integration = {}, runtimeIdentity = RUNTIME_GIT_IDENTITY, processRunner = runManagedProcess, worktrees = null, deliveryRunId = null }) {
+  constructor({ repository, runtimeDir, generatedDir, project = {}, integration = {}, runtimeIdentity = RUNTIME_GIT_IDENTITY, processRunner = runManagedProcess, worktrees = null, deliveryRunId = null, faultHooks = {} }) {
     this.repository = repository;
     this.runtimeDir = runtimeDir;
     // Router owns generatedDir under the project contract, while direct callers
@@ -33,6 +33,7 @@ export class Integrator {
     this.processRunner = processRunner;
     this.worktrees = worktrees;
     this.deliveryRunId = deliveryRunId;
+    this.faultHooks = faultHooks;
   }
 
   async integrate({ artifacts, overlay, baseSha = overlay.repository.baseSha, allowedBaseShas = [], lineage = null }) {
@@ -60,7 +61,7 @@ export class Integrator {
     const root = resolve(this.runtimeDir, "integrations"); const id = barrier.id;
     let worktree = join(root, `barrier-${id}`), branch = `swarm/barrier/${id}`, managed = null;
     try {
-      if (this.worktrees) { managed = await this.worktrees.createManaged({ kind: "integration_barrier", barrierId: id, deliveryRunId: barrier.deliveryRunId, planBatchId: barrier.planBatchId ?? null, baseSha: barrier.baseSha }); worktree = managed.canonicalPath; branch = managed.branch; }
+      if (this.worktrees) { managed = await this.worktrees.createManaged({ kind: "integration_barrier", barrierId: id, deliveryRunId: barrier.deliveryRunId, planBatchId: barrier.planBatchId ?? null, baseSha: barrier.baseSha }); worktree = managed.canonicalPath; branch = managed.branch; await this.faultHooks?.integration_barrier_worktree_created?.({ barrierId: id, recordId: managed.recordId, worktree }); }
       else { mkdirSync(root, { recursive: true }); const existing = await git(this.repository, ["branch", "--list", branch]); if (!existing) await exec("git", ["-C", this.repository, "worktree", "add", "-b", branch, worktree, barrier.baseSha]); else await exec("git", ["-C", this.repository, "worktree", "add", worktree, branch]); }
       for (const artifact of effective) await this.#gitWithRuntimeIdentity(worktree, ["cherry-pick", artifact.headSha]);
       const verificationResults = [], verificationPlan = commandsForPaths(overlay, (overlay.components ?? []).filter((component) => component.state === "scaffolded").map((component) => component.root));
@@ -90,7 +91,7 @@ export class Integrator {
     let worktree = join(root, id);
     let branch = `swarm/candidate/${id}`;
     let managed = null;
-    if (this.worktrees) { managed = await this.worktrees.createManaged({ kind: "candidate_integration", candidateId: id, deliveryRunId: this.deliveryRunId, baseSha }); worktree = managed.canonicalPath; branch = managed.branch; }
+    if (this.worktrees) { managed = await this.worktrees.createManaged({ kind: "candidate_integration", candidateId: id, deliveryRunId: this.deliveryRunId, baseSha }); worktree = managed.canonicalPath; branch = managed.branch; await this.faultHooks?.candidate_integration_worktree_created?.({ candidateId: id, recordId: managed.recordId, worktree }); }
     else { mkdirSync(root, { recursive: true }); await exec("git", ["-C", this.repository, "worktree", "add", "-b", branch, worktree, baseSha]); }
     const applied = [];
     try {

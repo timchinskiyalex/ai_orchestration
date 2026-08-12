@@ -75,13 +75,13 @@ export class SwarmRouter extends EventEmitter {
   constructor(config, { readOnly = false } = {}) {
     super();
     this.config = config;
-    this.store = new StateStore(join(config.runtimeDir, "swarm.sqlite"), { readOnly });
+    this.store = new StateStore(join(config.runtimeDir, "swarm.sqlite"), { readOnly, faultHooks: config.faultHooks });
     this.governor = new BudgetGovernor(config.router);
     this.worktrees = new WorktreeManager({ ...config, store: this.store, readOnly });
     this.threadTasks = new Map();
     this.account = new BudgetAccountAdapter(this.store);
     this.processRunner = config.processRunner ?? runManagedProcess;
-    this.finalizer = new WorktreeFinalizer({ repository: config.repository, generatedDir: config.project.generatedDir, autonomy: config.autonomy, runtimeIdentity: config.runtimeIdentity, processRunner: this.processRunner });
+    this.finalizer = new WorktreeFinalizer({ repository: config.repository, generatedDir: config.project.generatedDir, autonomy: config.autonomy, runtimeIdentity: config.runtimeIdentity, processRunner: this.processRunner, faultHooks: config.faultHooks });
     this.lifecycleTrace = [];
     this.lastAppServerDiagnostics = null;
     this.lifecyclePath = join(config.runtimeDir, "lifecycle.jsonl");
@@ -93,6 +93,8 @@ export class SwarmRouter extends EventEmitter {
     this.pendingBudgetWatchdogs = new Set();
     this.activeTurns = new Map();
     this.closed = false;
+    this.reconciliationBarrier = null;
+    this.reconciliationState = { state: "not-run", outcome: null };
   }
 
   init() {
@@ -137,16 +139,31 @@ export class SwarmRouter extends EventEmitter {
     return run;
   }
 
-  recoverStaleDeliveries() {
+  async recoverStaleDeliveries() {
+    if (this.reconciliationBarrier) return await this.reconciliationBarrier;
+    this.reconciliationBarrier = this.#recoverStaleDeliveries();
+    return await this.reconciliationBarrier;
+  }
+
+  async #recoverStaleDeliveries() {
     const staleAfterMs = this.config.delivery?.staleLeaseMs ?? 30_000;
     const recovered = this.store.recoverStaleDeliveryRuns({ staleAfterMs, isProcessAlive: (pid) => {
       try { process.kill(pid, 0); return true; } catch { return false; }
     } });
     for (const run of recovered) this.#lifecycle("stale delivery recovered", { deliveryRunId: run.id, state: run.state, recovery: run.recovery });
-    // Git/filesystem facts are authoritative. This only classifies and
-    // preserves records; it never prunes, resets, or recreates a worktree.
-    this.worktrees.reconcile({ taskForRecord: (record) => record.taskId ? this.store.getTask(record.taskId) : null }).catch((error) => this.#lifecycle("managed worktree reconciliation failed", { error: String(error.message).slice(0, 300) }));
-    return recovered;
+    try {
+      // Git/filesystem facts are authoritative. This only classifies and
+      // preserves records; it never prunes, resets, or recreates a worktree.
+      const result = await this.worktrees.reconcile({ taskForRecord: (record) => record.taskId ? this.store.getTask(record.taskId) : null });
+      const reconciliation = { state: "completed", records: result.records.slice(0, 100), observations: result.observations.slice(0, 100), inventoryCount: result.inventoryCount, truncated: result.truncated };
+      this.reconciliationState = { state: "completed", outcome: reconciliation };
+      return Object.assign(recovered, { reconciliation });
+    } catch (error) {
+      const reconciliation = { state: "integrity-blocked", error: String(error.message).slice(0, 300) };
+      this.reconciliationState = { state: "integrity-blocked", outcome: reconciliation };
+      this.#lifecycle("managed worktree reconciliation failed", { error: reconciliation.error });
+      throw Object.assign(new Error(`Managed worktree reconciliation blocked execution: ${reconciliation.error}`), { reconciliation });
+    }
   }
 
   activateDeliveryRun(runId, sessionId = undefined) {
@@ -243,6 +260,7 @@ export class SwarmRouter extends EventEmitter {
     const tasks = this.list();
     const reports = tasks.filter((task) => task.role === "qa").map((task) => ({ taskId: task.id, ...this.store.qualityReport(task.id) })).filter((item) => item.report);
     const securityReports = tasks.filter((task) => task.role === "security").map((task) => ({ taskId: task.id, ...this.store.securityReport(task.id) })).filter((item) => item.report);
+    const worktreeInventory = this.worktrees.inventoryViewSync();
     return {
       schemaVersion: 1,
       generatedAt: new Date().toISOString(),
@@ -259,7 +277,9 @@ export class SwarmRouter extends EventEmitter {
       deliveryRun: this.store.currentDeliveryRun(),
       repositoryBaseline: repositoryBaselineStatus(this.store.currentDeliveryRun() ? this.store.repositoryBaselineForRun(this.store.currentDeliveryRun().id) : null),
       finalAcceptance: this.store.currentDeliveryRun() ? this.store.productAcceptanceForRun(this.store.currentDeliveryRun().id) : null,
-      managedWorktrees: this.store.listManagedWorktrees({ limit: 50 }).map((record) => ({ recordId: record.recordId, kind: record.kind, phase: record.phase, classification: record.classification, taskId: record.taskId, deliveryRunId: record.deliveryRunId, barrierId: record.barrierId, candidateId: record.candidateId, branch: record.branch, lastVerifiedHead: record.lastVerifiedHead, updatedAt: record.updatedAt })),
+      managedWorktrees: this.store.listManagedWorktrees({ limit: 50 }).map((record) => ({ recordId: record.recordId, kind: record.kind, phase: record.phase, classification: worktreeInventory.current.get(record.recordId)?.classification ?? record.classification, persistedClassification: record.classification, currentVerification: worktreeInventory.current.get(record.recordId) ?? null, taskId: record.taskId, deliveryRunId: record.deliveryRunId, barrierId: record.barrierId, candidateId: record.candidateId, branch: record.branch, lastVerifiedHead: record.lastVerifiedHead, updatedAt: record.updatedAt })),
+      managedWorktreeObservations: worktreeInventory.observations,
+      managedWorktreeInventory: { inventoryCount: worktreeInventory.inventoryCount, truncated: worktreeInventory.truncated, error: worktreeInventory.error, readOnly: true },
       lifecycle: this.store.recentEvents(20)
     };
   }
@@ -487,6 +507,10 @@ export class SwarmRouter extends EventEmitter {
   }
 
   async runUntilIdle({ deliveryRunId = this.activeDeliveryRunId } = {}) {
+    // No scheduler admission may race startup reconciliation. This includes
+    // direct `run` callers that did not go through DeliveryCoordinator.
+    try { await this.recoverStaleDeliveries(); }
+    catch (error) { return { blockedQuota: false, blockedBudget: false, failed: true, interrupted: false, integrityBlocked: true, reconciliation: error.reconciliation ?? this.reconciliationState.outcome, quota: this.quotaThrottleStatus() }; }
     // Ownership is the first operation: a second controller must fail before
     // repository preflight, App Server launch, thread creation, or turn start.
     const sessionId = deliveryRunId && this.activeDeliveryRunId === deliveryRunId && this.activeDeliverySessionId ? this.activeDeliverySessionId : (deliveryRunId ? randomUUID() : null);
@@ -770,7 +794,9 @@ export class SwarmRouter extends EventEmitter {
         this.store.setResultPath(task.id, resultPath);
         ({ overlayContext, resultText, finalized: finalizedArtifact } = await this.#finalizeWriterWithRepair(client, task, threadId, worktree, branch, overlayContext, resultText));
         const finalized = finalizedArtifact;
+        await this.config.faultHooks?.artifact_file_before_db_persistence?.({ taskId: task.id, path: finalized.path, artifact: finalized.artifact });
         this.store.recordWorkerArtifact(task.id, finalized.path, finalized.artifact);
+        await this.config.faultHooks?.artifact_db_persisted_before_task_completion?.({ taskId: task.id, path: finalized.path, artifact: finalized.artifact });
         this.#finalizeManagedWorker(task.id, finalized.artifact.headSha);
         this.#connectArtifactDependents(task, finalized.artifact);
       }
@@ -914,7 +940,9 @@ export class SwarmRouter extends EventEmitter {
     const resultPath = this.#saveAgentResult(task, resultText);
     this.store.setResultPath(task.id, resultPath);
     const finalized = await this.finalizer.finalize({ task, worktree, branch, overlay: refreshed.overlay, overlayPath: refreshed.path });
+    await this.config.faultHooks?.artifact_file_before_db_persistence?.({ taskId: task.id, path: finalized.path, artifact: finalized.artifact });
     this.store.recordWorkerArtifact(task.id, finalized.path, finalized.artifact);
+    await this.config.faultHooks?.artifact_db_persisted_before_task_completion?.({ taskId: task.id, path: finalized.path, artifact: finalized.artifact });
     this.#finalizeManagedWorker(task.id, finalized.artifact.headSha);
     this.#connectArtifactDependents(task, finalized.artifact);
     this.store.transition(task.id, finalStatusForRole(task.role, { autonomous: this.isAutonomous() }));

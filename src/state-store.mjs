@@ -10,7 +10,8 @@ const json = (value) => JSON.stringify(value ?? []);
 const parse = (value, fallback) => (value ? JSON.parse(value) : fallback);
 
 export class StateStore {
-  constructor(filePath, { readOnly = false } = {}) {
+  constructor(filePath, { readOnly = false, faultHooks = {} } = {}) {
+    this.faultHooks = faultHooks;
     const isNewDatabase = !existsSync(filePath);
     if (!readOnly) mkdirSync(dirname(filePath), { recursive: true });
     this.db = new DatabaseSync(filePath, { readOnly });
@@ -418,9 +419,11 @@ export class StateStore {
     try {
       this.db.prepare("UPDATE managed_worktrees SET canonical_path = ?, last_verified_head = ?, verification_json = ?, phase = ?, classification = ?, linked_at = COALESCE(linked_at, ?), updated_at = ? WHERE record_id = ?")
         .run(canonicalPath ?? current.canonicalPath, lastVerifiedHead ?? current.lastVerifiedHead, json(verification), phase, classification, timestamp, timestamp, recordId);
+      this.faultHooks?.managed_worktree_record_linked_before_task_linkage?.({ recordId, taskId: taskId === undefined ? current.taskId : taskId });
       const effectiveTaskId = taskId === undefined ? current.taskId : taskId;
       if (effectiveTaskId) this.db.prepare("UPDATE tasks SET worktree = ?, branch = ?, updated_at = ? WHERE id = ?").run(canonicalPath ?? current.canonicalPath, current.branch, timestamp, effectiveTaskId);
       this.db.exec("COMMIT");
+      this.faultHooks?.managed_worktree_task_linked?.({ recordId, taskId: effectiveTaskId });
     } catch (error) { this.db.exec("ROLLBACK"); throw error; }
     return this.managedWorktree(recordId);
   }
