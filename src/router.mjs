@@ -674,7 +674,7 @@ export class SwarmRouter extends EventEmitter {
     // expose any server-side max-token field for turn/start.
     if (["bootstrap", "planner"].includes(task.role)) turnOptions.effort = "low";
     // Establish controller ownership before the adapter can accept a
-    // task-scoped notification. The same opaque correlation binds all turn
+    // task-scoped lifecycle signal. The same opaque correlation binds all turn
     // lifecycle aliases, usage, approval, and terminal observations.
     const turnCorrelationId = randomUUID();
     this.activeTurns.set(task.id, { taskId: task.id, threadId, turnId: null, requestedTurnId: null, correlationId: turnCorrelationId, permittedTurnIds: new Set(), completion: null });
@@ -693,7 +693,10 @@ export class SwarmRouter extends EventEmitter {
     this.activeTurns.delete(task.id);
     const current = this.store.getTask(task.id);
     if (this.budgetInterruptedTasks.has(task.id) && current.status === "running") this.store.transition(task.id, "blocked_budget", { error: "budget_interrupt confirmed before result processing" });
-    if (["awaiting_approval", "blocked_budget", "interrupted"].includes(this.store.getTask(task.id).status)) return;
+    // Lifecycle policy may already have made this turn terminal (for example,
+    // an approval request or a task-scoped protocol violation).  A late,
+    // otherwise valid terminal result must never re-enter normal finalization.
+    if (["awaiting_approval", "blocked_budget", "interrupted", "failed", "cancelled"].includes(this.store.getTask(task.id).status)) return;
     if (turn.status === "completed") {
       let resultText = watched.resultText ?? await this.#readAgentResult(client, threadId, resolvedTurnId);
       if (watched.overlayContext) overlayContext = watched.overlayContext;
@@ -1689,18 +1692,30 @@ export class SwarmRouter extends EventEmitter {
       return;
     }
     const data = normalized.data;
-    const taskId = this.threadTasks.get(data.threadId);
-    const active = taskId ? this.activeTurns.get(taskId) : null;
+    const mappedTaskId = this.threadTasks.get(data.threadId);
+    const mappedActive = mappedTaskId ? this.activeTurns.get(mappedTaskId) : null;
+    // A mismatched thread cannot be looked up through threadTasks.  Correlation
+    // is nevertheless controller-issued and identifies the active turn that
+    // must be stopped.  This is deliberately only used for active ownership;
+    // unknown/stale events remain diagnostics-only.
+    const correlatedActive = [...this.activeTurns.values()].find((candidate) => candidate.correlationId === normalized.correlationId) ?? null;
+    const active = mappedActive ?? correlatedActive;
+    const taskId = mappedTaskId ?? active?.taskId ?? null;
     const task = taskId ? this.store.getTask(taskId) : null;
     const permitted = normalized.kind === "turn_alias"
       ? active?.permittedTurnIds?.has(data.requestedTurnId)
       : active?.permittedTurnIds?.has(data.turnId) || active?.turnId === data.turnId;
-    if (!taskId || !active || !task || task.status !== "running" || active.correlationId !== normalized.correlationId || active.threadId !== data.threadId || !permitted) {
-      this.#lifecycle("execution provider protocol violation", { errorCode: "protocol_violation" });
+    const validActiveEvent = Boolean(taskId && active && task?.status === "running" && active.correlationId === normalized.correlationId && active.threadId === data.threadId && permitted);
+    if (!validActiveEvent) {
+      if (active && task?.status === "running") this.#handleActiveProtocolViolation(active);
+      else {
+        this.#lifecycle("execution provider protocol violation", { errorCode: "protocol_violation" });
+        if (normalized.kind === "approval_requested" && !taskId) this.#settleUnownedApproval(data);
+      }
       return;
     }
     if (normalized.kind === "turn_alias") {
-      if (!active.permittedTurnIds.has(data.requestedTurnId) || data.turnId !== data.resolvedTurnId) { this.#lifecycle("execution provider protocol violation", { errorCode: "protocol_violation" }); return; }
+      if (!active.permittedTurnIds.has(data.requestedTurnId) || data.turnId !== data.resolvedTurnId) { this.#handleActiveProtocolViolation(active); return; }
       active.permittedTurnIds.add(data.resolvedTurnId);
       this.activeTurns.set(taskId, { ...active, turnId: data.resolvedTurnId, permittedTurnIds: active.permittedTurnIds });
       this.#adoptResolvedTurnId(taskId, data.threadId, data.resolvedTurnId);
@@ -1721,15 +1736,47 @@ export class SwarmRouter extends EventEmitter {
     if (["item_started", "item_completed", "turn_completed"].includes(normalized.kind)) this.#lifecycle(normalized.kind.replace("_", " "), { taskId, threadId: data.threadId, turnId: data.turnId, itemType: data.itemType ?? null, itemStatus: data.itemStatus ?? data.terminalClass ?? null });
   }
 
+  #handleActiveProtocolViolation(active) {
+    const task = this.store.getTask(active.taskId);
+    if (!task || task.status !== "running" || active.protocolViolationHandled) return;
+    // Transition before awaiting provider work so a racing completion cannot
+    // persist output, gate evidence, artifacts, or a final task success.
+    active.protocolViolationHandled = true;
+    this.activeTurns.set(active.taskId, active);
+    this.store.transition(active.taskId, "interrupted", { error: "protocol_violation: task lifecycle identity mismatch" });
+    this.#lifecycle("execution provider protocol violation", { taskId: active.taskId, errorCode: "protocol_violation" });
+    this.#interruptAndAwaitTurn(this.activeClient, active, "protocol_violation", { timeoutMs: this.config.delivery?.shutdownGraceMs ?? 3_000 }).catch(() => {});
+  }
+
+  #settleUnownedApproval(data) {
+    // The controller owns no task for this request.  Still settle the
+    // provider-side request and stop the identifiable orphan without creating
+    // a task or storing any raw approval payload.
+    const client = this.activeClient;
+    if (!client || typeof data?.requestId !== "string") return;
+    this.#provider(client, "approval_response", { requestId: data.requestId, response: { decision: "cancel" } }, ["requestId"])
+      .catch(() => {})
+      .finally(() => this.#interruptAndAwaitTurn(client, { taskId: null, threadId: data.threadId, turnId: data.turnId }, "unowned_approval", { timeoutMs: this.config.delivery?.shutdownGraceMs ?? 3_000 }).catch(() => {}));
+  }
+
   async #handleApprovalRequest(taskId, data, correlationId) {
     const task = this.store.getTask(taskId); if (!task || task.status !== "running") return;
     const method = data.approvalKind ?? "unknown";
     this.store.recordApproval({ requestId: data.requestId, taskId, method, payload: { threadId: data.threadId, turnId: data.turnId, kind: method }, decision: "deny" });
     this.#lifecycle("approval requested", { taskId, threadId: data.threadId, turnId: data.turnId, method });
     const response = method === "permissions" ? { permissions: {}, scope: "turn" } : { decision: "cancel" };
-    await this.#provider(this.activeClient, "approval_response", { requestId: data.requestId, response }, ["requestId"]);
-    if (task.status === "running") this.store.transition(taskId, this.isAutonomous() ? "failed" : "awaiting_approval", { error: this.isAutonomous() ? "Unexpected execution approval request in autonomous mode" : "Approval requested by execution provider" });
-    if (method === "unknown") this.#interruptAndAwaitTurn(this.activeClient, { taskId, threadId: data.threadId, turnId: data.turnId }, "unexpected_approval", { timeoutMs: this.config.delivery?.shutdownGraceMs ?? 3_000 }).catch(() => {});
+    // Close the controller success path before provider I/O.  A terminal that
+    // races a delayed approval response is therefore unable to finalize this
+    // task, while the normalized response/interrupt still settle the turn.
+    if (this.store.getTask(taskId)?.status === "running") this.store.transition(taskId, this.isAutonomous() ? "failed" : "awaiting_approval", { error: this.isAutonomous() ? "Unexpected execution approval request in autonomous mode" : "Approval requested by execution provider" });
+    let responseError = null;
+    try { await this.#provider(this.activeClient, "approval_response", { requestId: data.requestId, response }, ["requestId"]); }
+    catch (error) { responseError = error; }
+    // A denied request ends this concrete turn in both modes.  Non-autonomous
+    // mode remains resumable through approveHumanGate(), which starts a fresh
+    // controlled turn; autonomous mode is terminally failed.
+    this.#interruptAndAwaitTurn(this.activeClient, { taskId, threadId: data.threadId, turnId: data.turnId }, "approval_denied", { timeoutMs: this.config.delivery?.shutdownGraceMs ?? 3_000 }).catch(() => {});
+    if (responseError) throw responseError;
   }
 
   #adoptResolvedTurnId(taskId, threadId, resolvedTurnId) {
