@@ -710,16 +710,40 @@ export class SwarmRouter extends EventEmitter {
       const reviewed = qa.length && security.length && qa.every((item) => writerIds.has(item.writerTaskId) && applied.has(item.writerTaskId) && item.report.verdict === "pass") && security.every((item) => writerIds.has(item.writerTaskId) && applied.has(item.writerTaskId) && item.report.verdict === "pass");
       return linked && reviewed ? "pass" : linked ? "partial" : "missing";
     };
-    const product = productEvidence && productEvidence.status === "pass" && productEvidence.candidateSha?.toLowerCase() === manifest.candidateSha.toLowerCase()
-      ? { status: "pass", reference: productEvidence.reference ?? "product-e2e-adapter", candidateSha: manifest.candidateSha, kind: "product-e2e" }
-      : { status: "not_verified", reference: productEvidence?.reference ?? "product-e2e-unavailable", candidateSha: manifest.candidateSha, kind: "product-e2e" };
+    const criteria = stored.blueprint.requirements.flatMap((requirement) => requirement.acceptanceCriteria.map((criterion) => ({ requirementId: requirement.requirementId, criterionId: criterion.criterionId })));
+    const knownCriteria = new Set(criteria.map((criterion) => `${criterion.requirementId}:${criterion.criterionId}`));
+    const exactCandidate = (value) => typeof value === "string" && value.toLowerCase() === manifest.candidateSha.toLowerCase();
+    const stable = (value) => typeof value === "string" && value.trim().length > 0;
+    const productStatuses = new Set(["pass", "failed", "not_verified"]);
+    const evidenceByCriterion = new Map();
+    let productEvidenceValid = Boolean(productEvidence && typeof productEvidence === "object" && exactCandidate(productEvidence.candidateSha) && Array.isArray(productEvidence.results));
+    if (productEvidenceValid) {
+      for (const item of productEvidence.results) {
+        const key = `${item?.requirementId}:${item?.criterionId}`;
+        if (!item || typeof item !== "object" || !knownCriteria.has(key) || evidenceByCriterion.has(key) || !productStatuses.has(item.status) || !stable(item.testId) || !stable(item.reference) || !exactCandidate(item.candidateSha)) { productEvidenceValid = false; break; }
+        evidenceByCriterion.set(key, item);
+      }
+    }
+    if (!productEvidenceValid || criteria.some((criterion) => !evidenceByCriterion.has(`${criterion.requirementId}:${criterion.criterionId}`))) productEvidenceValid = false;
+    const productStatus = !productEvidenceValid ? "not_verified" : criteria.every((criterion) => evidenceByCriterion.get(`${criterion.requirementId}:${criterion.criterionId}`).status === "pass") ? "pass" : criteria.some((criterion) => evidenceByCriterion.get(`${criterion.requirementId}:${criterion.criterionId}`).status === "failed") ? "failed" : "not_verified";
+    const product = { status: productStatus, reference: productEvidenceValid ? `criterion-evidence:${criteria.length}` : "criterion-evidence-incomplete", candidateSha: manifest.candidateSha, kind: "product-e2e-summary" };
     const qaPass = tasks.filter((task) => task.role === "qa").every((task) => this.store.qualityReport(task.id)?.report?.verdict === "pass");
     const securityPass = tasks.filter((task) => task.role === "security").every((task) => this.store.securityReport(task.id)?.report?.verdict === "pass");
     const report = { schemaVersion: PRODUCT_ACCEPTANCE_SCHEMA_VERSION, kind: PRODUCT_ACCEPTANCE_KIND, deliveryRunId: run.id, blueprintId: stored.blueprint.blueprintId, blueprintDigest: stored.digest, documentSetDigest: stored.documentSetDigest, integrationManifestPath: integration.path, integrationManifestId: manifest.id, candidateSha: manifest.candidateSha, generatedAt: new Date().toISOString(), evidence: { integration: { status: manifest.localVerification?.status === "passed" ? "pass" : "missing", reference: integration.path, candidateSha: manifest.candidateSha, kind: "integration-manifest" }, qa: { status: qaPass ? "pass" : "missing", reference: "quality_reports", candidateSha: manifest.candidateSha, kind: "qa-lineage" }, security: { status: securityPass ? "pass" : "missing", reference: "security_reports", candidateSha: manifest.candidateSha, kind: "security-lineage" }, productE2e: product, ci: { status: remoteCi?.status === "passed" && remoteCi?.candidateSha?.toLowerCase() === manifest.candidateSha.toLowerCase() ? "pass" : "not_verified", reference: remoteCi?.idempotencyKey ?? "remote-ci", candidateSha: manifest.candidateSha, kind: "remote-ci" } }, results: [] };
     for (const requirement of stored.blueprint.requirements) {
-      const status = statusFor(requirement.requirementId); const evidence = [{ kind: "artifact-lineage", reference: `requirement:${requirement.requirementId}`, status, candidateSha: manifest.candidateSha }];
+      const lineageStatus = statusFor(requirement.requirementId); const evidence = [{ kind: "artifact-lineage", reference: `requirement:${requirement.requirementId}`, status: lineageStatus, candidateSha: manifest.candidateSha }];
+      const criterionResults = requirement.acceptanceCriteria.map((criterion) => {
+        const item = productEvidenceValid ? evidenceByCriterion.get(`${requirement.requirementId}:${criterion.criterionId}`) : null;
+        const criterionEvidence = item
+          ? { kind: "product-e2e", requirementId: item.requirementId, criterionId: item.criterionId, status: item.status, testId: item.testId, reference: item.reference, candidateSha: manifest.candidateSha }
+          : { kind: "product-e2e", requirementId: requirement.requirementId, criterionId: criterion.criterionId, status: "not_verified", testId: "product-e2e-unavailable", reference: "criterion-evidence-incomplete", candidateSha: manifest.candidateSha };
+        const status = lineageStatus === "pass" ? criterionEvidence.status : lineageStatus;
+        return { requirementId: requirement.requirementId, criterionId: criterion.criterionId, status, evidence: [...evidence, criterionEvidence] };
+      });
+      const criterionStatuses = criterionResults.map((result) => result.status);
+      const status = lineageStatus !== "pass" ? lineageStatus : criterionStatuses.every((value) => value === "pass") ? "pass" : criterionStatuses.includes("failed") ? "failed" : criterionStatuses.includes("not_verified") ? "not_verified" : "partial";
       report.results.push({ requirementId: requirement.requirementId, criterionId: null, status, evidence });
-      for (const criterion of requirement.acceptanceCriteria) report.results.push({ requirementId: requirement.requirementId, criterionId: criterion.criterionId, status: product.status === "pass" ? status : product.status, evidence: [...evidence, product] });
+      report.results.push(...criterionResults);
     }
     return report;
   }
