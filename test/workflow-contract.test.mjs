@@ -1,14 +1,25 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { extractOrchestrationJson, validateBootstrap, validatePlan, validateWorkerArtifactContract } from "../src/workflow-contract.mjs";
-import { documentSetDigest } from "../src/product-blueprint.mjs";
+import { documentIdForPath, documentSetDigest } from "../src/product-blueprint.mjs";
+import { createImportedSourceResolver, sourceFragmentDigest } from "../src/source-evidence.mjs";
 
 const docs = [{ documentId: "doc-input", path: "input.md", sha256: "a".repeat(64) }];
 const blueprint = { schemaVersion: 1, kind: "ProductBlueprint", blueprintId: "pb-test", createdAt: "2026-01-01T00:00:00.000Z", documentSetDigest: documentSetDigest(docs), sourceDocuments: docs, requirements: [{ requirementId: "req-one", type: "functional", priority: "must", mandatory: true, description: "Do the thing.", sourceRefs: [{ documentId: "doc-input", locator: "# thing", excerptDigest: "b".repeat(64) }], acceptanceCriteria: [{ criterionId: "criterion-one", description: "It works." }], constraints: [] }], nfrs: [], modules: [], integrations: [], dataModel: {}, constraints: [], assumptions: [], decisions: [], unresolvedQuestions: [], contradictions: [] };
 
 test("bootstrap contract accepts one source-backed ProductBlueprint", () => {
-  const value = extractOrchestrationJson(`\`\`\`json\n${JSON.stringify(blueprint)}\n\`\`\``);
-  assert.equal(validateBootstrap(value).kind, "ProductBlueprint");
+  const root = mkdtempSync(join(tmpdir(), "workflow-source-")); const documentationDir = "docs/orchestration-input"; const path = "input.md"; const text = "Do the thing.\n";
+  const source = { documentId: documentIdForPath(path), path, sha256: createHash("sha256").update(text).digest("hex") };
+  try {
+    mkdirSync(join(root, documentationDir), { recursive: true }); writeFileSync(join(root, documentationDir, path), text); writeFileSync(join(root, documentationDir, "inventory.json"), JSON.stringify({ files: [source], documentSetDigest: documentSetDigest([source]) }));
+    const valid = structuredClone(blueprint); valid.sourceDocuments = [source]; valid.documentSetDigest = documentSetDigest([source]); valid.requirements[0].sourceRefs = [{ documentId: source.documentId, startLine: 1, endLine: 1, excerptDigest: sourceFragmentDigest(text, 1, 1) }];
+    const value = extractOrchestrationJson(`\`\`\`json\n${JSON.stringify(valid)}\n\`\`\``);
+    assert.equal(validateBootstrap(value, { sourceResolver: createImportedSourceResolver({ repository: root, documentationDir }) }).kind, "ProductBlueprint");
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 test("plan contract validates a dependency DAG", () => {

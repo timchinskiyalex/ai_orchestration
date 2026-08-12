@@ -2,6 +2,7 @@ import { copyFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSy
 import { createHash } from "node:crypto";
 import { relative, resolve, sep, join } from "node:path";
 import { documentIdForPath, documentSetDigest } from "./product-blueprint.mjs";
+import { normalizeSourceText } from "./source-evidence.mjs";
 
 const digest = (value) => createHash("sha256").update(value).digest("hex");
 
@@ -45,7 +46,7 @@ export function ingestDocumentation({ source, repository, destinationRelative })
     source: "imported-local-documentation",
     files: files.map((file) => {
       const path = relative(sourceRoot, file).split("\\").join("/");
-      return { documentId: documentIdForPath(path), path, sha256: digest(readFileSync(file)) };
+      return { documentId: documentIdForPath(path), path, sha256: digest(normalizeSourceText(readFileSync(file, "utf8"))) };
     })
   };
   inventory.documentSetDigest = documentSetDigest(inventory.files);

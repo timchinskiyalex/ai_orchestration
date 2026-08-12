@@ -16,7 +16,7 @@ export function documentSetDigest(sourceDocuments) {
   return sha256(canonical([...sourceDocuments].sort((left, right) => left.path.localeCompare(right.path))));
 }
 
-export function validateProductBlueprint(value, { sourceDocuments = null } = {}) {
+export function validateProductBlueprint(value, { sourceDocuments = null, sourceResolver = null } = {}) {
   if (!value || typeof value !== "object" || Array.isArray(value)) fail("must be an object");
   for (const key of ["schemaVersion", "kind", "blueprintId", "createdAt", "documentSetDigest", "sourceDocuments", "requirements", "nfrs", "modules", "integrations", "dataModel", "constraints", "assumptions", "decisions", "unresolvedQuestions", "contradictions"]) if (!(key in value)) fail(`missing '${key}'`);
   if (value.schemaVersion !== 1 || value.kind !== "ProductBlueprint") fail("schemaVersion must be 1 and kind must be ProductBlueprint");
@@ -33,8 +33,9 @@ export function validateProductBlueprint(value, { sourceDocuments = null } = {})
     documents.set(document.documentId, document);
   }
   if (!documents.size) fail("must contain at least one source document");
-  if (sourceDocuments) {
-    const expected = new Map(sourceDocuments.map((document) => [document.documentId, document]));
+  const authoritativeDocuments = sourceResolver?.sourceDocuments ?? sourceDocuments;
+  if (authoritativeDocuments) {
+    const expected = new Map(authoritativeDocuments.map((document) => [document.documentId, document]));
     if (expected.size !== documents.size || [...documents].some(([key, document]) => canonical(document) !== canonical(expected.get(key)))) fail("sourceDocuments must exactly match the imported document inventory");
   }
   if (value.documentSetDigest !== documentSetDigest(value.sourceDocuments)) fail("documentSetDigest does not match sourceDocuments");
@@ -54,14 +55,13 @@ export function validateProductBlueprint(value, { sourceDocuments = null } = {})
       if (criteria.has(criterion.criterionId) || typeof criterion.description !== "string" || !criterion.description.trim() || (criterion.verificationHint !== undefined && typeof criterion.verificationHint !== "string")) fail(`requirement '${requirement.requirementId}' has invalid acceptance criterion`);
       criteria.add(criterion.criterionId);
     }
-    for (const ref of requirement.sourceRefs) {
-      if (!ref || typeof ref !== "object" || !documents.has(ref.documentId) || typeof ref.locator !== "string" || !ref.locator || !/^[a-f0-9]{64}$/.test(ref.excerptDigest ?? "")) fail(`requirement '${requirement.requirementId}' has invalid source reference`);
-    }
+    verifySourceRefs(requirement.sourceRefs, `requirement '${requirement.requirementId}'`, sourceResolver, documents);
   }
   for (const decision of value.decisions) {
     if (!decision || typeof decision !== "object") fail("invalid decision");
     id(decision.adrId, "adrId");
     if (typeof decision.decision !== "string" || typeof decision.rationale !== "string" || !Array.isArray(decision.sourceRefs)) fail("invalid decision");
+    verifySourceRefs(decision.sourceRefs, `decision '${decision.adrId}'`, sourceResolver, documents);
   }
   for (const question of value.unresolvedQuestions) {
     if (!question || typeof question !== "object") fail("invalid unresolved question");
@@ -74,8 +74,18 @@ export function validateProductBlueprint(value, { sourceDocuments = null } = {})
     id(contradiction.contradictionId, "contradictionId");
     if (!Array.isArray(contradiction.requirementIds) || !contradiction.requirementIds.every((requirementId) => requirementIds.has(requirementId)) || !Array.isArray(contradiction.sourceRefs) || typeof contradiction.description !== "string" || !["resolved", "unresolved"].includes(contradiction.status)) fail(`invalid contradiction '${contradiction.contradictionId}'`);
     if (contradiction.status === "resolved" && typeof contradiction.resolution !== "string") fail(`resolved contradiction '${contradiction.contradictionId}' needs resolution`);
+    verifySourceRefs(contradiction.sourceRefs, `contradiction '${contradiction.contradictionId}'`, sourceResolver, documents);
   }
   return structuredClone(value);
+}
+
+function verifySourceRefs(refs, label, sourceResolver, documents) {
+  if (!sourceResolver || typeof sourceResolver.verify !== "function") fail(`${label} requires a controller source resolver`);
+  for (const ref of refs) {
+    if (!ref || typeof ref !== "object" || Array.isArray(ref) || !documents.has(ref.documentId)) fail(`${label} has invalid source reference`);
+    try { sourceResolver.verify(ref, label); }
+    catch (error) { fail(error.message); }
+  }
 }
 
 // A declared policyDefault is the only autonomous resolution mechanism. The

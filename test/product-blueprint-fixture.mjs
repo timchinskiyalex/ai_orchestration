@@ -9,9 +9,10 @@ export function fakeBlueprint(repository, { question = null, contradiction = nul
   const inventory = JSON.parse(readFileSync(join(repository, "docs", "orchestration-input", "inventory.json"), "utf8"));
   const sourceDocuments = inventory.files.map(({ documentId, path, sha256 }) => ({ documentId, path, sha256 }));
   const source = sourceDocuments[0];
+  const firstLine = readFileSync(join(repository, "docs", "orchestration-input", source.path), "utf8").replace(/\r\n?/g, "\n").split("\n")[0];
   return {
     schemaVersion: 1, kind: "ProductBlueprint", blueprintId: "pb-test", createdAt: "2026-01-01T00:00:00.000Z", documentSetDigest: documentSetDigest(sourceDocuments), sourceDocuments,
-    requirements: [{ requirementId: "fix-value", type: "functional", priority: "must", mandatory: true, description: "Fix the value.", sourceRefs: [{ documentId: source.documentId, locator: "# Requirement", excerptDigest: digest("Fix value.") }], acceptanceCriteria: [{ criterionId: "value-test", description: "The value test passes.", verificationHint: "npm test" }], constraints: [] }],
+    requirements: [{ requirementId: "fix-value", type: "functional", priority: "must", mandatory: true, description: "Fix the value.", sourceRefs: [{ documentId: source.documentId, startLine: 1, endLine: 1, excerptDigest: digest(firstLine) }], acceptanceCriteria: [{ criterionId: "value-test", description: "The value test passes.", verificationHint: "npm test" }], constraints: [] }],
     nfrs: [], modules: [], integrations: [], dataModel: {}, constraints: [], assumptions: [], decisions: [], unresolvedQuestions: question ? [question] : [], contradictions: contradiction ? [contradiction] : []
   };
 }

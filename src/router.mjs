@@ -20,6 +20,7 @@ import { GitHubCiAdapter, GitHubMergeAdapter, GitHubPullRequestAdapter, RemoteAd
 import { runManagedProcess } from "./managed-process-runner.mjs";
 import { provisionDeterministicScaffold } from "./deterministic-scaffold.mjs";
 import { specificationBlockers } from "./product-blueprint.mjs";
+import { createImportedSourceResolver } from "./source-evidence.mjs";
 import { PRODUCT_ACCEPTANCE_KIND, PRODUCT_ACCEPTANCE_SCHEMA_VERSION, productAcceptancePasses } from "./final-acceptance.mjs";
 
 const gitSha = (repository, ref) => execFileSync("git", ["-C", repository, "rev-parse", "--verify", `${ref}^{commit}`], { encoding: "utf8" }).trim();
@@ -518,7 +519,7 @@ export class SwarmRouter extends EventEmitter {
             catch { recovery = null; }
           }
           const detail = recovery ? `${error.message} Recovery worktree: ${recovery.worktree} (${recovery.clean ? "clean" : "dirty"}). ${recovery.action}` : error.message;
-          if (/specification_gap/i.test(detail)) {
+          if (/(?:specification_gap|source_provenance)/i.test(detail)) {
             this.store.transition(task.id, "blocked_specification", { error: detail });
             if (task.deliveryRunId) this.store.updateDeliveryRun(task.deliveryRunId, { state: "blocked_specification", publish: { reason: detail } });
             const replan = this.store.scopedReplans(task.deliveryRunId).find((item) => item.plannerTaskId === task.id);
@@ -632,7 +633,8 @@ export class SwarmRouter extends EventEmitter {
           resultPath = this.#saveAgentResult(task, resultText);
           this.store.setResultPath(task.id, resultPath);
         } else {
-        const blueprint = validateBootstrap(extractOrchestrationJson(resultText), { sourceDocuments: this.#importedSourceDocuments() });
+        const sourceResolver = this.#sourceEvidenceResolver();
+        const blueprint = validateBootstrap(extractOrchestrationJson(resultText), { sourceResolver });
         const persisted = this.#persistBlueprint(task, blueprint);
         this.store.setResultPath(task.id, persisted.artifactPath);
         if (task.deliveryRunId) this.store.linkBlueprintToDelivery(task.deliveryRunId, blueprint.blueprintId);
@@ -812,6 +814,7 @@ export class SwarmRouter extends EventEmitter {
     if (existing) return existing;
     const stored = this.store.productBlueprintForBootstrap(bootstrapTask.id);
     if (!stored) throw new Error(`Bootstrap task ${bootstrapTask.id} has no persisted ProductBlueprint`);
+    this.#assertStoredBlueprintSourceIntegrity(stored);
     const prior = bootstrapTask.deliveryRunId ? this.store.currentCheckpoint(bootstrapTask.deliveryRunId) : null;
     const wave = prior ? prior.wave + 1 : 1;
     const baseSha = prior?.outputSha ?? gitSha(this.config.repository, this.config.baseRef);
@@ -1049,7 +1052,7 @@ export class SwarmRouter extends EventEmitter {
   }
 
   #structuredOutputContract(role) {
-    if (role === "bootstrap") return `Return only one fenced JSON ProductBlueprint v1. Required exact top-level fields: {"schemaVersion":1,"kind":"ProductBlueprint","blueprintId":"stable-kebab-id","createdAt":"ISO-8601","documentSetDigest":"sha256","sourceDocuments":[{"documentId":"doc-id","path":"path","sha256":"sha256"}],"requirements":[{"requirementId":"stable-kebab-id","type":"functional|nfr|data|integration|constraint","priority":"must|should|could","mandatory":true,"description":"string","sourceRefs":[{"documentId":"doc-id","locator":"line/heading locator","excerptDigest":"sha256"}],"acceptanceCriteria":[{"criterionId":"stable-kebab-id","description":"string","verificationHint":"optional"}],"constraints":[]}],"nfrs":[],"modules":[],"integrations":[],"dataModel":{},"constraints":[],"assumptions":[],"decisions":[{"adrId":"stable-kebab-id","decision":"string","rationale":"string","sourceRefs":[]}],"unresolvedQuestions":[{"questionId":"stable-kebab-id","description":"string","requiredForRequirementIds":["requirement-id"],"policyDefault":"only an explicitly declared source-policy default","status":"resolved_by_policy|unresolved"}],"contradictions":[{"contradictionId":"stable-kebab-id","requirementIds":["requirement-id"],"sourceRefs":[],"description":"string","status":"resolved|unresolved","resolution":"required when resolved"}]}. sourceDocuments must exactly match inventory.json. Do not invent resolutions: a missing mandatory fact or unresolved contradiction stays unresolved.`;
+    if (role === "bootstrap") return `Return only one fenced JSON ProductBlueprint v1. Required exact top-level fields: {"schemaVersion":1,"kind":"ProductBlueprint","blueprintId":"stable-kebab-id","createdAt":"ISO-8601","documentSetDigest":"sha256","sourceDocuments":[{"documentId":"doc-id","path":"path","sha256":"sha256"}],"requirements":[{"requirementId":"stable-kebab-id","type":"functional|nfr|data|integration|constraint","priority":"must|should|could","mandatory":true,"description":"string","sourceRefs":[{"documentId":"doc-id","startLine":120,"endLine":127,"excerptDigest":"lowercase-sha256"}],"acceptanceCriteria":[{"criterionId":"stable-kebab-id","description":"string","verificationHint":"optional"}],"constraints":[]}],"nfrs":[],"modules":[],"integrations":[],"dataModel":{},"constraints":[],"assumptions":[],"decisions":[{"adrId":"stable-kebab-id","decision":"string","rationale":"string","sourceRefs":[{"documentId":"doc-id","startLine":120,"endLine":127,"excerptDigest":"lowercase-sha256"}]}],"unresolvedQuestions":[{"questionId":"stable-kebab-id","description":"string","requiredForRequirementIds":["requirement-id"],"policyDefault":"only an explicitly declared source-policy default","status":"resolved_by_policy|unresolved"}],"contradictions":[{"contradictionId":"stable-kebab-id","requirementIds":["requirement-id"],"sourceRefs":[{"documentId":"doc-id","startLine":120,"endLine":127,"excerptDigest":"lowercase-sha256"}],"description":"string","status":"resolved|unresolved","resolution":"required when resolved"}]}. sourceDocuments must exactly match inventory.json. A SourceRef is controller-verified evidence only: read imported UTF-8 source, normalize CRLF/CR to LF, use inclusive 1-based lines, join the selected lines with LF, and hash that exact fragment with SHA-256. Do not use locator fields; do not invent ranges or digests. Do not invent resolutions: a missing mandatory fact or unresolved contradiction stays unresolved.`;
     if (role === "planner") return `Return only one fenced JSON PlanBatch v1 with exact fields {"schemaVersion":1,"kind":"PlanBatch","id":"new-immutable-id","deliveryRunId":"controller-provided-run-id","blueprintId":"persisted-blueprint-id","wave":1,"basedOnCheckpointSha":"controller-provided-verified-git-sha","tasks":[{"id":"safe-kebab-id","title":"string","prompt":"specific implementation instruction","primaryDomain":"backend|frontend|database|qa|security|devops","supportingDomains":["qa","security"],"riskFlags":["public_api_change"],"humanApprovalRequired":false,"estimatedTokens":8000,"dependsOn":["other-task-id"],"allowedPaths":["path"],"acceptanceChecks":["test or check"],"requirementIds":["ProductBlueprint requirement id"]}],"createdAt":"ISO-8601"}. The controller-provided id/run/wave/base are authoritative. Every implementation task must have non-empty requirementIds from the immutable ProductBlueprint; every mandatory requirement must be covered. A writer with two writer predecessors is valid: the controller creates the fan-in barrier. Do not create implementation tasks for ambiguity; return {"outcome":"specification_gap","reason":"..."} instead.`;
     if (role === "qa") return `Return only one fenced JSON QualityGateReport: {"verdict":"pass|remediation_required|blocked","summary":"string","findings":[{"id":"stable-id","severity":"low|medium|high|critical","path":"relative/path","evidence":"concrete safe evidence","requiredFix":"specific fix","verification":"specific verification"}],"executedChecks":[],"notRunChecks":[]}. Never include secrets or raw command output. A pass requires no findings.`;
     if (role === "security") return `Return only one fenced JSON SecurityGateReport: {"verdict":"pass|remediation_required|blocked","summary":"string","findings":[{"id":"stable-id","severity":"low|medium|high|critical","path":"relative/path","evidence":"concrete safe evidence","requiredFix":"specific fix","verification":"specific verification"}],"executedChecks":[],"notRunChecks":[]}. Never include secrets or raw command output. A pass requires no findings.`;
@@ -1075,10 +1078,13 @@ export class SwarmRouter extends EventEmitter {
     return relative(this.config.repository, absolutePath).split("\\").join("/");
   }
 
-  #importedSourceDocuments() {
-    const inventory = JSON.parse(readFileSync(join(this.config.repository, this.config.project.documentationDir, "inventory.json"), "utf8"));
-    if (!Array.isArray(inventory.files) || inventory.files.some((file) => !file.documentId || !file.sha256)) throw new Error("Documentation inventory is missing ProductBlueprint source hashes; re-import documentation before Bootstrap.");
-    return inventory.files.map(({ documentId, path, sha256 }) => ({ documentId, path, sha256 }));
+  #sourceEvidenceResolver() {
+    return createImportedSourceResolver({ repository: this.config.repository, documentationDir: this.config.project.documentationDir });
+  }
+
+  #assertStoredBlueprintSourceIntegrity(stored) {
+    try { return validateBootstrap(stored.blueprint, { sourceResolver: this.#sourceEvidenceResolver() }); }
+    catch (error) { throw new Error(`source_provenance: persisted ProductBlueprint '${stored.blueprint?.blueprintId ?? "unknown"}' cannot continue autonomous delivery; re-run Bootstrap after correcting imported documentation. ${error.message.replace(/^Invalid orchestration JSON: /, "")}`); }
   }
 
   #persistBlueprint(task, blueprint) {
@@ -1096,6 +1102,7 @@ export class SwarmRouter extends EventEmitter {
   #materializePlan(plannerTask, parsedPlan) {
     const stored = this.store.productBlueprint(plannerTask.blueprintId);
     if (!stored) throw new Error(`Planner task ${plannerTask.id} has no persisted ProductBlueprint`);
+    this.#assertStoredBlueprintSourceIntegrity(stored);
     const planRunId = plannerTask.deliveryRunId ?? `standalone:${plannerTask.id}`;
     const scopedReplan = this.store.scopedReplans(planRunId).find((item) => item.plannerTaskId === plannerTask.id);
     const previous = this.store.currentCheckpoint(planRunId);
