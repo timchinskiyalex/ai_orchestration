@@ -85,7 +85,7 @@ export class SwarmRouter extends EventEmitter {
     this.threadTasks = new Map();
     this.account = new BudgetAccountAdapter(this.store);
     this.processRunner = config.processRunner ?? runManagedProcess;
-    this.finalizer = new WorktreeFinalizer({ repository: config.repository, generatedDir: config.project.generatedDir, autonomy: config.autonomy, processRunner: this.processRunner });
+    this.finalizer = new WorktreeFinalizer({ repository: config.repository, generatedDir: config.project.generatedDir, autonomy: config.autonomy, runtimeIdentity: config.runtimeIdentity, processRunner: this.processRunner });
     this.lifecycleTrace = [];
     this.lastAppServerDiagnostics = null;
     this.lifecyclePath = join(config.runtimeDir, "lifecycle.jsonl");
@@ -797,7 +797,7 @@ export class SwarmRouter extends EventEmitter {
     for (const missing of plan.missing) failed.push({ id: `${missing.component}:declared-verification`, source: "controller", status: "failed", error: missing.reason });
     for (const command of plan.commands) {
       try {
-        const result = await runManagedProcess({ executable: command.executable, args: command.args, cwd: commandCwd(worktree, command), timeoutMs: command.timeoutMs ?? 120_000 });
+        const result = await this.processRunner({ executable: command.executable, args: command.args, cwd: commandCwd(worktree, command), timeoutMs: command.timeoutMs ?? 120_000 });
         passed.push({ id: command.id, source: "controller", status: "passed", pid: result.pid, stdout: result.stdout.slice(-4000), stderr: result.stderr.slice(-4000) });
       } catch (error) {
         failed.push({ id: command.id, source: "controller", status: "failed", error: String(error.message).slice(0, 500), pid: error.pid ?? null, stdout: String(error.stdout ?? "").slice(-4000), stderr: String(error.stderr ?? "").slice(-4000), timedOut: Boolean(error.timedOut) });

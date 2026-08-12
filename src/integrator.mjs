@@ -8,6 +8,7 @@ import { validateWorkerArtifact } from "./worktree-finalizer.mjs";
 import { commandCwd, commandsForPaths } from "./project-overlay.mjs";
 import { runManagedProcess } from "./managed-process-runner.mjs";
 import { validateIntegrationBarrier } from "./workflow-contract.mjs";
+import { RUNTIME_GIT_IDENTITY, runtimeGitIdentityArgs } from "./runtime-git-identity.mjs";
 
 const exec = promisify(execFile);
 const toPosix = (value) => value.replace(/\\/g, "/");
@@ -19,7 +20,7 @@ const sensitiveArea = (path) => /(^|\/)(migrations?|infra|terraform|k8s|helm|\.g
 const checksum = (value) => createHash("sha256").update(value).digest("hex");
 
 export class Integrator {
-  constructor({ repository, runtimeDir, generatedDir, project = {}, integration = {}, processRunner = runManagedProcess }) {
+  constructor({ repository, runtimeDir, generatedDir, project = {}, integration = {}, runtimeIdentity = RUNTIME_GIT_IDENTITY, processRunner = runManagedProcess }) {
     this.repository = repository;
     this.runtimeDir = runtimeDir;
     // Router owns generatedDir under the project contract, while direct callers
@@ -28,6 +29,7 @@ export class Integrator {
     this.generatedDir = generatedDir ?? project.generatedDir;
     if (!this.generatedDir) throw new Error("Integrator requires project.generatedDir");
     this.integration = integration;
+    this.runtimeIdentity = runtimeIdentity;
     this.processRunner = processRunner;
   }
 
@@ -52,7 +54,7 @@ export class Integrator {
     const root = resolve(this.runtimeDir, "integrations"); mkdirSync(root, { recursive: true }); const id = barrier.id, worktree = join(root, `barrier-${id}`), branch = `swarm/barrier/${id}`;
     try {
       const existing = await git(this.repository, ["branch", "--list", branch]); if (!existing) await exec("git", ["-C", this.repository, "worktree", "add", "-b", branch, worktree, barrier.baseSha]); else await exec("git", ["-C", this.repository, "worktree", "add", worktree, branch]);
-      for (const artifact of ordered) await git(worktree, ["cherry-pick", artifact.headSha]);
+      for (const artifact of ordered) await this.#gitWithRuntimeIdentity(worktree, ["cherry-pick", artifact.headSha]);
       const verificationResults = [], verificationPlan = commandsForPaths(overlay, (overlay.components ?? []).filter((component) => component.state === "scaffolded").map((component) => component.root));
       if (verificationPlan.missing.length) throw new Error("Barrier verification unavailable for a scaffolded component");
       for (const command of verificationPlan.commands) { try { const result = await this.processRunner({ executable: command.executable, args: command.args, cwd: commandCwd(worktree, command), timeoutMs: command.timeoutMs ?? 120_000 }); verificationResults.push({ id: command.id, status: "passed", pid: result.pid, stdout: result.stdout.slice(-4000), stderr: result.stderr.slice(-4000) }); } catch (error) { verificationResults.push({ id: command.id, status: "failed", error: error.message }); throw Object.assign(new Error(`Barrier verification failed: ${command.id}`), { verificationResults }); } }
@@ -88,7 +90,7 @@ export class Integrator {
     const applied = [];
     try {
       for (const artifact of sorted) {
-        try { await git(worktree, ["cherry-pick", artifact.headSha]); applied.push(artifact.taskId); }
+        try { await this.#gitWithRuntimeIdentity(worktree, ["cherry-pick", artifact.headSha]); applied.push(artifact.taskId); }
         catch { await git(worktree, ["cherry-pick", "--abort"]); return this.#blocked(overlay, sorted, `CONFLICT_BLOCKED: cherry-pick failed for ${artifact.taskId}`, { id, branch, worktree, applied }); }
       }
       const verificationResults = [];
@@ -119,6 +121,7 @@ export class Integrator {
     }
     return ordered;
   }
+  async #gitWithRuntimeIdentity(cwd, args) { return git(cwd, [...runtimeGitIdentityArgs(this.runtimeIdentity), ...args]); }
   async #verifyArtifactIntegrity(artifact) { const mergeBase = await git(this.repository, ["merge-base", artifact.baseSha, artifact.headSha]); if (mergeBase !== artifact.baseSha) throw new Error(`Artifact ${artifact.taskId} is not descended from its base SHA`); const [diff, names, treeSha] = await Promise.all([git(this.repository, ["diff", "--binary", "--no-ext-diff", artifact.baseSha, artifact.headSha, "--"]), gitRaw(this.repository, ["diff", "--name-status", "-z", artifact.baseSha, artifact.headSha, "--"]), git(this.repository, ["rev-parse", `${artifact.headSha}^{tree}`])]); if (checksum(diff) !== artifact.diffChecksum) throw new Error(`Artifact ${artifact.taskId} diff checksum mismatch`); if (treeSha !== artifact.treeSha) throw new Error(`Artifact ${artifact.taskId} tree SHA mismatch`); if (JSON.stringify(nameStatusPaths(names).sort()) !== JSON.stringify([...artifact.changedPaths].sort())) throw new Error(`Artifact ${artifact.taskId} changed paths mismatch`); }
 
   #writeManifest(manifest) {
