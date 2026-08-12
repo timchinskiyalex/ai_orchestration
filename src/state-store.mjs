@@ -415,6 +415,7 @@ export class StateStore {
   linkManagedWorktree(recordId, { canonicalPath, lastVerifiedHead, verification = {}, taskId = undefined, phase = "linked", classification = "active" } = {}) {
     const current = this.managedWorktree(recordId); if (!current) throw new Error("Managed worktree record not found");
     const timestamp = now();
+    let committed = false;
     this.db.exec("BEGIN IMMEDIATE");
     try {
       this.db.prepare("UPDATE managed_worktrees SET canonical_path = ?, last_verified_head = ?, verification_json = ?, phase = ?, classification = ?, linked_at = COALESCE(linked_at, ?), updated_at = ? WHERE record_id = ?")
@@ -423,8 +424,9 @@ export class StateStore {
       const effectiveTaskId = taskId === undefined ? current.taskId : taskId;
       if (effectiveTaskId) this.db.prepare("UPDATE tasks SET worktree = ?, branch = ?, updated_at = ? WHERE id = ?").run(canonicalPath ?? current.canonicalPath, current.branch, timestamp, effectiveTaskId);
       this.db.exec("COMMIT");
+      committed = true;
       this.faultHooks?.managed_worktree_task_linked?.({ recordId, taskId: effectiveTaskId });
-    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    } catch (error) { if (!committed) this.db.exec("ROLLBACK"); throw error; }
     return this.managedWorktree(recordId);
   }
 

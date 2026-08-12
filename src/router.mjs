@@ -155,6 +155,11 @@ export class SwarmRouter extends EventEmitter {
       // Git/filesystem facts are authoritative. This only classifies and
       // preserves records; it never prunes, resets, or recreates a worktree.
       const result = await this.worktrees.reconcile({ taskForRecord: (record) => record.taskId ? this.store.getTask(record.taskId) : null });
+      const integrityBlocked = result.records.filter((record) => record.classification === "integrity-blocked");
+      if (integrityBlocked.length) {
+        const recovery = integrityBlocked.slice(0, 5).map((record) => `${record.kind}:${record.recordId}`).join(", ");
+        throw new Error(`Managed worktree reconciliation requires recovery for ${recovery}`);
+      }
       const reconciliation = { state: "completed", records: result.records.slice(0, 100), observations: result.observations.slice(0, 100), inventoryCount: result.inventoryCount, truncated: result.truncated };
       this.reconciliationState = { state: "completed", outcome: reconciliation };
       return Object.assign(recovered, { reconciliation });
