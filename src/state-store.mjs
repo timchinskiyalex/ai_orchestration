@@ -19,6 +19,7 @@ export class StateStore {
     // column added by a newer controller.
     this.hasTokenUsageSource = this.#hasColumn("tasks", "token_usage_source");
     this.hasResolutionAuthorityEvidence = this.#hasTable("specification_resolution_evidence");
+    this.hasSourceClaimManifests = this.#hasTable("source_claim_manifests");
     if (readOnly) return;
     // Switching journal mode takes an exclusive SQLite lock. Do it once at
     // database creation, never in every short-lived status/watch reader.
@@ -189,6 +190,10 @@ export class StateStore {
         evidence_json TEXT NOT NULL,
         created_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS source_claim_manifests (
+        manifest_id TEXT PRIMARY KEY, schema_version INTEGER NOT NULL, digest TEXT NOT NULL,
+        document_set_digest TEXT NOT NULL, manifest_json TEXT NOT NULL, created_at TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS traceability_records (
         sequence INTEGER PRIMARY KEY AUTOINCREMENT,
         requirement_id TEXT NOT NULL,
@@ -244,6 +249,7 @@ export class StateStore {
       CREATE INDEX IF NOT EXISTS idx_events_task ON events(task_id, sequence);
     `);
     this.hasResolutionAuthorityEvidence = true;
+    this.hasSourceClaimManifests = true;
     this.#addColumnIfMissing("tasks", "dependencies_json", "TEXT NOT NULL DEFAULT '[]'");
     this.#addColumnIfMissing("tasks", "result_path", "TEXT");
     this.#addColumnIfMissing("tasks", "estimated_tokens", "INTEGER NOT NULL DEFAULT 0");
@@ -308,6 +314,8 @@ export class StateStore {
     this.#addColumnIfMissing("delivery_runs", "publication_checkpoint_json", "TEXT");
     this.#addColumnIfMissing("delivery_runs", "blueprint_id", "TEXT");
     this.#addColumnIfMissing("delivery_runs", "completion_contract_version", "INTEGER NOT NULL DEFAULT 0");
+    this.#addColumnIfMissing("delivery_runs", "source_claim_manifest_id", "TEXT");
+    this.#addColumnIfMissing("product_blueprints", "source_claim_manifest_id", "TEXT");
     // Older resumable runs have no immutable intake contract. Preserve every
     // row, but prevent them from silently continuing under the new semantics.
     this.#blockLegacyRunsWithoutBlueprint();
@@ -608,14 +616,14 @@ export class StateStore {
     return row ? { writerTaskId: row.writer_task_id, path: row.report_path, report: JSON.parse(row.report_json) } : null;
   }
 
-  createDeliveryRun({ id, source = null, bootstrapTaskId = null, confirmRemotePush = false, ownerPid, ownerSessionId }) {
+  createDeliveryRun({ id, source = null, bootstrapTaskId = null, confirmRemotePush = false, ownerPid, ownerSessionId, sourceClaimManifestId = null }) {
     if (!Number.isInteger(ownerPid) || ownerPid < 1 || typeof ownerSessionId !== "string" || !ownerSessionId) throw new Error("Delivery run requires an initial owner lease");
     const timestamp = now();
     this.db.exec("BEGIN IMMEDIATE");
     try {
       const active = this.db.prepare("SELECT id FROM delivery_runs WHERE state IN ('running','awaiting_human','awaiting_human_remote_handoff') LIMIT 1").get();
       if (active) throw new Error(`Delivery already owned by active run: ${active.id}`);
-      this.db.prepare("INSERT INTO delivery_runs(id, schema_version, state, source, bootstrap_task_id, confirm_remote_push, owner_pid, owner_session_id, heartbeat_at, completion_contract_version, created_at, updated_at) VALUES (?, 1, 'running', ?, ?, ?, ?, ?, ?, 1, ?, ?)").run(id, source, bootstrapTaskId, confirmRemotePush ? 1 : 0, ownerPid, ownerSessionId, timestamp, timestamp, timestamp);
+      this.db.prepare("INSERT INTO delivery_runs(id, schema_version, state, source, bootstrap_task_id, confirm_remote_push, owner_pid, owner_session_id, heartbeat_at, completion_contract_version, source_claim_manifest_id, created_at, updated_at) VALUES (?, 1, 'running', ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)").run(id, source, bootstrapTaskId, confirmRemotePush ? 1 : 0, ownerPid, ownerSessionId, timestamp, sourceClaimManifestId, timestamp, timestamp);
       this.#insertEvent(bootstrapTaskId, "delivery/created", { deliveryRunId: id, confirmRemotePush: Boolean(confirmRemotePush), ownerPid, ownerSessionId, heartbeatAt: timestamp });
       this.db.exec("COMMIT");
     } catch (error) { this.db.exec("ROLLBACK"); throw error; }
@@ -810,13 +818,27 @@ export class StateStore {
   isHistoricalInvalidatedTask(taskId) { return Boolean(this.db.prepare("SELECT 1 FROM task_replacements WHERE old_task_id = ? AND kind IN ('invalidated','task','barrier-consumer') LIMIT 1").get(taskId)); }
   isReplannedHistoricalTask(taskId) { return Boolean(this.db.prepare("SELECT 1 FROM task_replacements WHERE old_task_id = ? LIMIT 1").get(taskId)); }
 
-  recordProductBlueprint({ blueprint, artifactPath, digest, bootstrapTaskId = null, deliveryRunId = null }) {
+  recordSourceClaimManifest(manifest) {
+    if (!manifest?.manifestId || !manifest?.digest || !manifest?.documentSetDigest) throw new Error("SourceClaimManifest identity is invalid");
+    const existing = this.db.prepare("SELECT digest FROM source_claim_manifests WHERE manifest_id = ?").get(manifest.manifestId);
+    if (existing && existing.digest !== manifest.digest) throw new Error(`SourceClaimManifest '${manifest.manifestId}' is immutable and mismatched`);
+    if (!existing) this.db.prepare("INSERT INTO source_claim_manifests(manifest_id,schema_version,digest,document_set_digest,manifest_json,created_at) VALUES (?,?,?,?,?,?)").run(manifest.manifestId, manifest.schemaVersion, manifest.digest, manifest.documentSetDigest, JSON.stringify(manifest), now());
+    return this.sourceClaimManifest(manifest.manifestId);
+  }
+
+  sourceClaimManifest(manifestId) {
+    if (!this.hasSourceClaimManifests) return null;
+    const row = this.db.prepare("SELECT digest,document_set_digest,manifest_json,created_at FROM source_claim_manifests WHERE manifest_id = ?").get(manifestId);
+    return row ? { manifest: JSON.parse(row.manifest_json), digest: row.digest, documentSetDigest: row.document_set_digest, createdAt: row.created_at } : null;
+  }
+
+  recordProductBlueprint({ blueprint, artifactPath, digest, bootstrapTaskId = null, deliveryRunId = null, sourceClaimManifestId = null }) {
     const existing = this.db.prepare("SELECT artifact_path FROM product_blueprints WHERE blueprint_id = ?").get(blueprint.blueprintId);
     if (existing) throw new Error(`ProductBlueprint '${blueprint.blueprintId}' is immutable and already persisted at ${existing.artifact_path}`);
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      this.db.prepare(`INSERT INTO product_blueprints(blueprint_id, schema_version, artifact_path, digest, document_set_digest, bootstrap_task_id, delivery_run_id, blueprint_json, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(blueprint.blueprintId, blueprint.schemaVersion, artifactPath, digest, blueprint.documentSetDigest, bootstrapTaskId, deliveryRunId, JSON.stringify(blueprint), now());
+      this.db.prepare(`INSERT INTO product_blueprints(blueprint_id, schema_version, artifact_path, digest, document_set_digest, bootstrap_task_id, delivery_run_id, source_claim_manifest_id, blueprint_json, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(blueprint.blueprintId, blueprint.schemaVersion, artifactPath, digest, blueprint.documentSetDigest, bootstrapTaskId, deliveryRunId, sourceClaimManifestId, JSON.stringify(blueprint), now());
       if (blueprint.resolutionAuthority) this.db.prepare("INSERT INTO specification_resolution_evidence(blueprint_id, schema_version, evidence_json, created_at) VALUES (?, ?, ?, ?)").run(blueprint.blueprintId, blueprint.resolutionAuthority.schemaVersion, JSON.stringify(blueprint.resolutionAuthority), now());
       this.#insertEvent(bootstrapTaskId, "blueprint/persisted", { blueprintId: blueprint.blueprintId, artifactPath, digest, deliveryRunId });
       this.db.exec("COMMIT");
@@ -825,10 +847,10 @@ export class StateStore {
   }
 
   productBlueprint(blueprintId) {
-    const row = this.db.prepare("SELECT artifact_path, digest, document_set_digest, bootstrap_task_id, delivery_run_id, blueprint_json, created_at FROM product_blueprints WHERE blueprint_id = ?").get(blueprintId);
+    const row = this.db.prepare("SELECT artifact_path, digest, document_set_digest, bootstrap_task_id, delivery_run_id, source_claim_manifest_id, blueprint_json, created_at FROM product_blueprints WHERE blueprint_id = ?").get(blueprintId);
     if (!row) return null;
     const authority = this.hasResolutionAuthorityEvidence ? this.db.prepare("SELECT schema_version, evidence_json FROM specification_resolution_evidence WHERE blueprint_id = ?").get(blueprintId) : null;
-    return { blueprint: JSON.parse(row.blueprint_json), artifactPath: row.artifact_path, digest: row.digest, documentSetDigest: row.document_set_digest, bootstrapTaskId: row.bootstrap_task_id, deliveryRunId: row.delivery_run_id, createdAt: row.created_at, resolutionAuthority: authority ? { schemaVersion: authority.schema_version, ...JSON.parse(authority.evidence_json) } : null };
+    return { blueprint: JSON.parse(row.blueprint_json), artifactPath: row.artifact_path, digest: row.digest, documentSetDigest: row.document_set_digest, bootstrapTaskId: row.bootstrap_task_id, deliveryRunId: row.delivery_run_id, sourceClaimManifestId: row.source_claim_manifest_id ?? null, createdAt: row.created_at, resolutionAuthority: authority ? { schemaVersion: authority.schema_version, ...JSON.parse(authority.evidence_json) } : null };
   }
 
   productBlueprintForBootstrap(bootstrapTaskId) {
@@ -839,6 +861,12 @@ export class StateStore {
   linkBlueprintToDelivery(deliveryRunId, blueprintId) {
     if (!this.productBlueprint(blueprintId)) throw new Error(`ProductBlueprint '${blueprintId}' was not persisted`);
     this.#mutate(null, "delivery/blueprint-linked", { deliveryRunId, blueprintId }, () => this.db.prepare("UPDATE delivery_runs SET blueprint_id = ?, updated_at = ? WHERE id = ? AND blueprint_id IS NULL").run(blueprintId, now(), deliveryRunId));
+    return this.deliveryRun(deliveryRunId);
+  }
+
+  linkSourceClaimManifestToDelivery(deliveryRunId, manifestId) {
+    if (!this.sourceClaimManifest(manifestId)) throw new Error(`SourceClaimManifest '${manifestId}' was not persisted`);
+    this.db.prepare("UPDATE delivery_runs SET source_claim_manifest_id = ?, updated_at = ? WHERE id = ? AND source_claim_manifest_id IS NULL").run(manifestId, now(), deliveryRunId);
     return this.deliveryRun(deliveryRunId);
   }
 
@@ -996,7 +1024,7 @@ export class StateStore {
   }
 
   #mapDeliveryRun(row) {
-    return { id: row.id, schemaVersion: row.schema_version, state: row.state, source: row.source, bootstrapTaskId: row.bootstrap_task_id, blueprintId: row.blueprint_id, completionContractVersion: row.completion_contract_version ?? 0, integrationPath: row.integration_path, candidate: row.candidate_branch && row.candidate_sha ? { branch: row.candidate_branch, sha: row.candidate_sha } : null, publicationCheckpoint: parse(row.publication_checkpoint_json, null), publish: parse(row.publish_json, null), confirmRemotePush: Boolean(row.confirm_remote_push), ownerPid: row.owner_pid, ownerSessionId: row.owner_session_id, heartbeatAt: row.heartbeat_at, interruptedAt: row.interrupted_at, recovery: parse(row.recovery_json, null), createdAt: row.created_at, updatedAt: row.updated_at };
+    return { id: row.id, schemaVersion: row.schema_version, state: row.state, source: row.source, bootstrapTaskId: row.bootstrap_task_id, blueprintId: row.blueprint_id, sourceClaimManifestId: row.source_claim_manifest_id ?? null, completionContractVersion: row.completion_contract_version ?? 0, integrationPath: row.integration_path, candidate: row.candidate_branch && row.candidate_sha ? { branch: row.candidate_branch, sha: row.candidate_sha } : null, publicationCheckpoint: parse(row.publication_checkpoint_json, null), publish: parse(row.publish_json, null), confirmRemotePush: Boolean(row.confirm_remote_push), ownerPid: row.owner_pid, ownerSessionId: row.owner_session_id, heartbeatAt: row.heartbeat_at, interruptedAt: row.interrupted_at, recovery: parse(row.recovery_json, null), createdAt: row.created_at, updatedAt: row.updated_at };
   }
 
   #mapScopedReplan(row) {
@@ -1107,13 +1135,13 @@ export class StateStore {
   #blockLegacyRunsWithoutBlueprint() {
     this.db.prepare("UPDATE delivery_runs SET completion_contract_version = 0 WHERE state = 'completed_merged' AND completion_contract_version < 2 AND id NOT IN (SELECT delivery_run_id FROM product_acceptance_reports WHERE passing = 1)").run();
     const states = ["running", "awaiting_human", "awaiting_human_remote_handoff", "interrupted", "blocked_credentials", "blocked_ci", "blocked_branch_protection"];
-    const rows = this.db.prepare(`SELECT id, bootstrap_task_id FROM delivery_runs WHERE blueprint_id IS NULL AND completion_contract_version = 0 AND state IN (${states.map(() => "?").join(",")})`).all(...states);
+    const rows = this.db.prepare(`SELECT id, bootstrap_task_id FROM delivery_runs WHERE (blueprint_id IS NULL OR source_claim_manifest_id IS NULL) AND completion_contract_version = 0 AND state IN (${states.map(() => "?").join(",")})`).all(...states);
     if (!rows.length) return;
     const timestamp = now();
     this.db.exec("BEGIN IMMEDIATE");
     try {
       for (const row of rows) {
-        const reason = "legacy_contract_incomplete: persisted resumable/in-progress run has no ProductBlueprint";
+        const reason = "legacy_source_claim_manifest_incomplete: persisted resumable/in-progress run lacks a strict source claim manifest";
         this.db.prepare("UPDATE delivery_runs SET state = 'blocked_specification', publish_json = ?, owner_pid = NULL, owner_session_id = NULL, heartbeat_at = NULL, updated_at = ? WHERE id = ?").run(JSON.stringify({ reason, recovery: { action: "Start a fresh delivery from source documentation; historical artifacts and tasks remain retained." } }), timestamp, row.id);
         this.db.prepare("UPDATE tasks SET status = 'blocked_specification', error = ?, updated_at = ? WHERE delivery_run_id = ? AND status IN ('queued','preparing','running','awaiting_approval','awaiting_human','interrupted')").run(reason, timestamp, row.id);
         this.#insertEvent(row.bootstrap_task_id, "delivery/blocked_specification", { deliveryRunId: row.id, reason });

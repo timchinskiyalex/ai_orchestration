@@ -5,6 +5,11 @@ import { documentIdForPath } from "./product-blueprint.mjs";
 
 const sha256 = (value) => createHash("sha256").update(value).digest("hex");
 const digestPattern = /^[a-f0-9]{64}$/;
+const claimIdPattern = /^[a-z][a-z0-9-]{0,95}$/;
+const classifications = new Set(["mandatory", "non_mandatory", "ambiguous"]);
+const canonical = (value) => JSON.stringify(value, (_key, item) => item && typeof item === "object" && !Array.isArray(item)
+  ? Object.fromEntries(Object.keys(item).sort().map((key) => [key, item[key]])) : item);
+export const SOURCE_CLAIM_MANIFEST_SCHEMA_VERSION = 1;
 
 export function normalizeSourceText(text) {
   return String(text).replace(/\r\n?/g, "\n");
@@ -21,6 +26,7 @@ export function sourceFragmentDigest(text, startLine, endLine) {
 function provenanceError(message) {
   throw new Error(`source_provenance: ${message}`);
 }
+function claimContractError(message) { throw new Error(`source_claim_contract: ${message}`); }
 
 function isInside(root, candidate) {
   const relation = relative(root, candidate);
@@ -83,5 +89,71 @@ export function createImportedSourceResolver(context) {
     return { documentId: ref.documentId, startLine: ref.startLine, endLine: ref.endLine, excerptDigest: actualDigest };
   }
 
-  return Object.freeze({ sourceDocuments: Object.freeze(sourceDocuments), verify });
+  function lineCount(documentId) { const lines = sourceLines(readDocument(documentId)); return lines.at(-1) === "" ? lines.length - 1 : lines.length; }
+  return Object.freeze({ sourceDocuments: Object.freeze(sourceDocuments), verify, lineCount });
+}
+
+// This is deliberately a declaration compiler, not an extraction heuristic.
+// Every normalized source line belongs to exactly one declared claim range.
+export function compileImportedSourceClaimManifest(context) {
+  const resolver = createImportedSourceResolver(context);
+  const root = resolve(context.repository, context.documentationDir);
+  const declarationPath = join(root, "source-claims.json");
+  if (!existsSync(declarationPath) || lstatSync(declarationPath).isSymbolicLink()) claimContractError("missing_required_source_claims_declaration");
+  let declaration;
+  try { declaration = JSON.parse(readFileSync(declarationPath, "utf8")); }
+  catch { claimContractError("source_claims_declaration_invalid_json"); }
+  if (!declaration || typeof declaration !== "object" || Array.isArray(declaration) || declaration.schemaVersion !== SOURCE_CLAIM_MANIFEST_SCHEMA_VERSION || declaration.kind !== "SourceClaimsDeclaration") claimContractError("source_claims_declaration_schema_invalid");
+  const sourceDocuments = resolver.sourceDocuments;
+  const documentSetDigest = sha256(canonical([...sourceDocuments].sort((a, b) => a.path.localeCompare(b.path))));
+  if (declaration.documentSetDigest !== documentSetDigest) claimContractError("source_claims_document_set_digest_mismatch");
+  if (!Array.isArray(declaration.documents) || !Array.isArray(declaration.claims)) claimContractError("source_claims_declaration_collections_invalid");
+  const inventory = new Map(sourceDocuments.map((document) => [document.documentId, document]));
+  if (declaration.documents.length !== inventory.size) claimContractError("source_claims_document_coverage_incomplete");
+  const claims = new Map();
+  for (const claim of declaration.claims) {
+    if (!claim || typeof claim !== "object" || Array.isArray(claim) || !claimIdPattern.test(claim.claimId ?? "") || claims.has(claim.claimId) || !classifications.has(claim.classification) || !Array.isArray(claim.sourceRefs) || !claim.sourceRefs.length) claimContractError("source_claim_invalid_or_duplicate_id");
+    const refs = claim.sourceRefs.map((ref) => {
+      try { return resolver.verify(ref, `source claim '${claim.claimId}'`); }
+      catch (error) { claimContractError(error.message.replace(/^source_provenance: /, "")); }
+    });
+    const unique = new Set(refs.map((ref) => `${ref.documentId}:${ref.startLine}:${ref.endLine}:${ref.excerptDigest}`));
+    if (unique.size !== refs.length) claimContractError(`source_claim_duplicate_range:${claim.claimId}`);
+    claims.set(claim.claimId, { claimId: claim.claimId, classification: claim.classification, sourceRefs: refs });
+  }
+  if (!claims.size) claimContractError("source_claims_empty");
+  const coveredRefs = new Set();
+  const declaredDocuments = new Set();
+  for (const document of declaration.documents) {
+    if (!document || typeof document !== "object" || Array.isArray(document) || !inventory.has(document.documentId) || declaredDocuments.has(document.documentId)) claimContractError("source_claims_foreign_or_duplicate_document");
+    const expected = inventory.get(document.documentId);
+    if (document.path !== expected.path || document.sha256 !== expected.sha256 || !Array.isArray(document.coverage) || !document.coverage.length) claimContractError(`source_claims_document_identity_or_coverage_invalid:${document.documentId}`);
+    declaredDocuments.add(document.documentId);
+    const ranges = [];
+    for (const item of document.coverage) {
+      if (!item || typeof item !== "object" || !claims.has(item.claimId)) claimContractError(`source_claims_unknown_coverage_claim:${document.documentId}`);
+      let ref;
+      try { ref = resolver.verify({ documentId: document.documentId, startLine: item.startLine, endLine: item.endLine, excerptDigest: item.excerptDigest }, `coverage '${item.claimId}'`); }
+      catch (error) { claimContractError(error.message.replace(/^source_provenance: /, "")); }
+      const key = `${ref.documentId}:${ref.startLine}:${ref.endLine}:${ref.excerptDigest}`;
+      if (!claims.get(item.claimId).sourceRefs.some((candidate) => `${candidate.documentId}:${candidate.startLine}:${candidate.endLine}:${candidate.excerptDigest}` === key) || coveredRefs.has(key)) claimContractError(`source_claims_coverage_not_exact:${item.claimId}`);
+      coveredRefs.add(key); ranges.push(ref);
+    }
+    ranges.sort((a, b) => a.startLine - b.startLine || a.endLine - b.endLine);
+    const lineCount = resolver.lineCount(document.documentId);
+    let next = 1;
+    for (const range of ranges) {
+      if (range.startLine !== next) claimContractError(`source_claims_coverage_gap_or_overlap:${document.documentId}`);
+      next = range.endLine + 1;
+    }
+    if (next !== lineCount + 1) claimContractError(`source_claims_coverage_gap_or_overlap:${document.documentId}`);
+  }
+  if (declaredDocuments.size !== inventory.size) claimContractError("source_claims_document_coverage_incomplete");
+  for (const claim of claims.values()) for (const ref of claim.sourceRefs) {
+    const key = `${ref.documentId}:${ref.startLine}:${ref.endLine}:${ref.excerptDigest}`;
+    if (!coveredRefs.has(key)) claimContractError(`source_claims_uncovered_claim_range:${claim.claimId}`);
+  }
+  const unsigned = { schemaVersion: SOURCE_CLAIM_MANIFEST_SCHEMA_VERSION, kind: "SourceClaimManifest", documentSetDigest, sourceDocuments, claims: [...claims.values()].sort((a, b) => a.claimId.localeCompare(b.claimId)) };
+  const digest = sha256(canonical(unsigned));
+  return Object.freeze({ ...unsigned, manifestId: `scm-${digest.slice(0, 24)}`, digest });
 }

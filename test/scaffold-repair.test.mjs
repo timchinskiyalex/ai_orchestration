@@ -8,6 +8,9 @@ import { join } from "node:path";
 import { DeliveryCoordinator } from "../src/delivery-coordinator.mjs";
 import { SwarmRouter } from "../src/router.mjs";
 import { fakeBlueprint } from "./product-blueprint-fixture.mjs";
+import { createHash } from "node:crypto";
+import { documentIdForPath, documentSetDigest } from "../src/product-blueprint.mjs";
+import { sourceFragmentDigest } from "../src/source-evidence.mjs";
 
 const git = (cwd, args) => execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8" }).trim();
 const productRoots = [{ id: "frontend", path: "frontend", adapter: "next-node" }, { id: "backend", path: "backend", adapter: "dotnet" }];
@@ -57,7 +60,7 @@ function configuration(root, client) {
 test("deterministic scaffold creates a WorkerArtifact before two dependent writers run in parallel", async () => {
   const root = mkdtempSync(join(tmpdir(), "deterministic-scaffold-")); const source = join(root, "requirements"); const client = new DeterministicLifecycleClient(); let router;
   try {
-    git(root, ["init", "-b", "main"]); mkdirSync(source); writeFileSync(join(source, "spec.md"), "# Product\nCreate frontend and backend."); writeFileSync(join(root, "package.json"), JSON.stringify({ name: "controller-only" })); git(root, ["add", "."]); git(root, ["-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "base"]);
+    git(root, ["init", "-b", "main"]); mkdirSync(source); const text = "# Product\nCreate frontend and backend."; const file = { documentId: documentIdForPath("spec.md"), path: "spec.md", sha256: createHash("sha256").update(text).digest("hex") }; const ref = (line) => ({ documentId: file.documentId, startLine: line, endLine: line, excerptDigest: sourceFragmentDigest(text, line, line) }); writeFileSync(join(source, "spec.md"), text); writeFileSync(join(source, "source-claims.json"), JSON.stringify({ schemaVersion: 1, kind: "SourceClaimsDeclaration", documentSetDigest: documentSetDigest([file]), documents: [{ ...file, coverage: [{ claimId: "fix-value-claim", ...ref(1) }, { claimId: "context-claim", ...ref(2) }] }], claims: [{ claimId: "fix-value-claim", classification: "mandatory", sourceRefs: [ref(1)] }, { claimId: "context-claim", classification: "non_mandatory", sourceRefs: [ref(2)] }] })); writeFileSync(join(root, "package.json"), JSON.stringify({ name: "controller-only" })); git(root, ["add", "."]); git(root, ["-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "base"]);
     router = new SwarmRouter(configuration(root, client));
     const run = await new DeliveryCoordinator(router).begin({ source,
       remoteGitAdapter: { async pushCandidate({ sha }) { return { status: "pushed", verifiedSha: sha }; } },

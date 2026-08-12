@@ -19,8 +19,8 @@ import { validateSecurityGateReport } from "./security-gate.mjs";
 import { GitHubCiAdapter, GitHubMergeAdapter, GitHubPullRequestAdapter, RemoteAdapterError, RemoteCiAdapter, RemoteGitAdapter } from "./remote-adapters.mjs";
 import { runManagedProcess } from "./managed-process-runner.mjs";
 import { provisionDeterministicScaffold } from "./deterministic-scaffold.mjs";
-import { specificationBlockers, validateControllerAuthorizedBlueprint } from "./product-blueprint.mjs";
-import { createImportedSourceResolver } from "./source-evidence.mjs";
+import { sourceClaimBlockers, specificationBlockers, validateControllerAuthorizedBlueprint } from "./product-blueprint.mjs";
+import { compileImportedSourceClaimManifest, createImportedSourceResolver } from "./source-evidence.mjs";
 import { PRODUCT_ACCEPTANCE_KIND, PRODUCT_ACCEPTANCE_SCHEMA_VERSION, productAcceptancePasses } from "./final-acceptance.mjs";
 import { compileWriteSurfaceTopology } from "./write-surface.mjs";
 
@@ -176,6 +176,14 @@ export class SwarmRouter extends EventEmitter {
 
   lifecycleEvents() { return [...this.lifecycleTrace]; }
 
+  sourceClaimManifestIdentity() {
+    const manifest = this.#currentSourceClaimManifest();
+    this.store.recordSourceClaimManifest(manifest);
+    return manifest.manifestId;
+  }
+
+  assertRunSourceCompleteness(run) { return this.#assertRunSourceCompleteness(run); }
+
   appServerDiagnostics() {
     return {
       lifecycleEvents: this.lifecycleEvents(),
@@ -314,6 +322,10 @@ export class SwarmRouter extends EventEmitter {
     if (!manifest || !["candidate_ready", "awaiting_human_merge"].includes(manifest.status) || manifest.localVerification?.status !== "passed") return { terminalState: "conflict_blocked", status: "conflict_blocked", reason: manifest?.blockedReason ?? "No locally verified candidate integration manifest" };
     const run = this.activeDeliveryRunId ? this.store.deliveryRun(this.activeDeliveryRunId) : null;
     if (!run || !integration.path || this.store.integrationManifest(integration.path)?.id !== manifest.id || !run.blueprintId || !run.candidate || run.candidate.sha.toLowerCase() !== manifest.candidateSha?.toLowerCase()) return { terminalState: "conflict_blocked", status: "conflict_blocked", reason: "Publication requires the exact persisted delivery run, blueprint, candidate, and integration manifest." };
+    if (run.sourceClaimManifestId) {
+      try { this.#assertRunSourceCompleteness(run); }
+      catch (error) { return { terminalState: "blocked_specification", status: "blocked_specification", reason: this.#safeSpecificationReason(error) }; }
+    }
     const remote = this.config.remote ?? {};
     const autonomy = { mode: "autonomous", autoPush: true, autoCreatePullRequest: true, autoMerge: true, autoRemediate: true, ...(this.config.autonomy ?? {}) };
     const autonomous = this.isAutonomous();
@@ -379,6 +391,7 @@ export class SwarmRouter extends EventEmitter {
   }
 
   async runToIntegration({ alreadyIdle = false, deliveryRunId = this.activeDeliveryRunId } = {}) {
+    if (deliveryRunId && this.store.deliveryRun(deliveryRunId)?.sourceClaimManifestId) this.#assertRunSourceCompleteness(this.store.deliveryRun(deliveryRunId));
     if (deliveryRunId && this.store.hasEffectiveInvalidatedWork(deliveryRunId)) throw new Error("Run-to-integration is blocked while scoped replan recovery is active");
     const gates = this.store.listTasks().filter((task) => (!deliveryRunId || task.deliveryRunId === deliveryRunId) && ["awaiting_human", "awaiting_approval"].includes(task.status));
     if (gates.length) throw new Error(`Run-to-integration refuses to bypass human gates: ${gates.map((task) => task.id).join(", ")}`);
@@ -399,6 +412,11 @@ export class SwarmRouter extends EventEmitter {
   startProject() {
     const inventory = join(this.config.repository, this.config.project.documentationDir, "inventory.json");
     if (!existsSync(inventory)) throw new Error(`Project documentation has not been imported: ${inventory}`);
+    // Direct legacy diagnostic tasks remain readable for historical fixtures.
+    // Autonomous coordinator intake always calls sourceClaimManifestIdentity()
+    // before creating its run and therefore cannot enter this compatibility path.
+    try { this.store.recordSourceClaimManifest(this.#currentSourceClaimManifest()); }
+    catch (error) { if (!/(?:source_claim_contract|source_provenance):/.test(String(error.message))) throw error; }
     const existingBootstrap = this.store.listTasks().find((task) => task.role === "bootstrap" && !task.parentTaskId && !["done", "failed", "cancelled", "blocked_budget", "blocked_specification", "interrupted"].includes(task.status));
     if (existingBootstrap) return existingBootstrap;
     const activeTasks = this.store.listTasks().filter((task) => !["done", "failed", "cancelled", "blocked_budget", "blocked_specification", "interrupted"].includes(task.status));
@@ -406,7 +424,7 @@ export class SwarmRouter extends EventEmitter {
     return this.enqueue({
       role: "bootstrap",
       title: `Bootstrap ${this.config.project.name}`,
-      prompt: `Read ${this.config.project.documentationDir}/inventory.json and the Markdown files it lists. Produce the required structured blueprint for project '${this.config.project.name}'.`,
+      prompt: `Read ${this.config.project.documentationDir}/inventory.json, ${this.config.project.documentationDir}/source-claims.json, and the Markdown files the inventory lists. Produce the required structured blueprint for project '${this.config.project.name}'. Every declaration claim must have an explicit sourceClaimIds disposition.`,
     });
   }
 
@@ -522,7 +540,7 @@ export class SwarmRouter extends EventEmitter {
             catch { recovery = null; }
           }
           const detail = recovery ? `${error.message} Recovery worktree: ${recovery.worktree} (${recovery.clean ? "clean" : "dirty"}). ${recovery.action}` : error.message;
-          if (/(?:specification_gap|source_provenance)/i.test(detail)) {
+          if (/(?:specification_gap|source_provenance|source_claim_contract|specification_authority)/i.test(detail)) {
             this.store.transition(task.id, "blocked_specification", { error: detail });
             if (task.deliveryRunId) this.store.updateDeliveryRun(task.deliveryRunId, { state: "blocked_specification", publish: { reason: detail } });
             const replan = this.store.scopedReplans(task.deliveryRunId).find((item) => item.plannerTaskId === task.id);
@@ -562,6 +580,11 @@ export class SwarmRouter extends EventEmitter {
       this.#blockScopedPlanner(task, "blocked_budget", "No local runtime token budget remains for scoped recovery planning");
       return;
     }
+    // Admission is rechecked immediately before an App Server turn.  A
+    // persisted planner/worker task never gets to rely on yesterday's intake.
+    const taskRun = task.deliveryRunId ? this.store.deliveryRun(task.deliveryRunId) : null;
+    if (task.role === "bootstrap" && taskRun?.sourceClaimManifestId) this.#currentSourceClaimManifest();
+    else if ((task.role === "planner" || ENGINEERING_DOMAINS.has(task.role)) && taskRun?.sourceClaimManifestId) this.#assertRunSourceCompleteness(taskRun);
 
     let worktree = task.worktree;
     let branch = task.branch;
@@ -637,11 +660,16 @@ export class SwarmRouter extends EventEmitter {
           this.store.setResultPath(task.id, resultPath);
         } else {
         const sourceResolver = this.#sourceEvidenceResolver();
-        const blueprint = validateBootstrap(extractOrchestrationJson(resultText), { sourceResolver, policyRegistry: this.#controllerPolicyRegistry() });
+        const manifestRequired = Boolean(task.deliveryRunId && this.store.deliveryRun(task.deliveryRunId)?.sourceClaimManifestId);
+        const sourceClaimManifest = manifestRequired ? this.#currentSourceClaimManifest() : null;
+        const blueprint = validateBootstrap(extractOrchestrationJson(resultText), { sourceResolver, policyRegistry: this.#controllerPolicyRegistry(), sourceClaimManifest });
         const persisted = this.#persistBlueprint(task, blueprint);
         this.store.setResultPath(task.id, persisted.artifactPath);
-        if (task.deliveryRunId) this.store.linkBlueprintToDelivery(task.deliveryRunId, blueprint.blueprintId);
-        const blockers = specificationBlockers(blueprint);
+        if (task.deliveryRunId) {
+          this.store.linkBlueprintToDelivery(task.deliveryRunId, blueprint.blueprintId);
+          if (persisted.sourceClaimManifestId) this.store.linkSourceClaimManifestToDelivery(task.deliveryRunId, persisted.sourceClaimManifestId);
+        }
+        const blockers = [...specificationBlockers(blueprint), ...(sourceClaimManifest ? sourceClaimBlockers(blueprint, sourceClaimManifest) : [])];
         if (blockers.length) {
           const reason = `blocked_specification: ${blockers.join(", ")}`;
           this.store.transition(task.id, "blocked_specification", { error: reason });
@@ -1124,12 +1152,34 @@ export class SwarmRouter extends EventEmitter {
     return createImportedSourceResolver({ repository: this.config.repository, documentationDir: this.config.project.documentationDir });
   }
 
+  #currentSourceClaimManifest() {
+    return compileImportedSourceClaimManifest({ repository: this.config.repository, documentationDir: this.config.project.documentationDir });
+  }
+
+  #safeSpecificationReason(error) {
+    const message = String(error?.message ?? error);
+    const codes = message.match(/(?:source_claim_contract|source_provenance|specification_authority):[^\n]+/g);
+    return codes?.[0]?.slice(0, 500) ?? "source_completeness_validation_failed";
+  }
+
+  #assertRunSourceCompleteness(run) {
+    if (!run?.blueprintId || !run.sourceClaimManifestId) throw new Error("source_claim_contract: persisted_run_manifest_missing");
+    const stored = this.store.productBlueprint(run.blueprintId);
+    if (!stored || stored.sourceClaimManifestId !== run.sourceClaimManifestId) throw new Error("source_claim_contract: persisted_blueprint_manifest_mismatch");
+    return this.#assertStoredBlueprintSourceIntegrity(stored);
+  }
+
   #controllerPolicyRegistry() {
     return this.config.specificationResolution?.policyRegistry ?? null;
   }
 
   #assertStoredBlueprintSourceIntegrity(stored) {
-    try { return validateControllerAuthorizedBlueprint(stored.blueprint, { sourceResolver: this.#sourceEvidenceResolver(), policyRegistry: this.#controllerPolicyRegistry(), persistedResolutionAuthority: stored.resolutionAuthority }); }
+    try {
+      if (!stored.sourceClaimManifestId) return validateControllerAuthorizedBlueprint(stored.blueprint, { sourceResolver: this.#sourceEvidenceResolver(), policyRegistry: this.#controllerPolicyRegistry(), persistedResolutionAuthority: stored.resolutionAuthority });
+      const sourceClaimManifest = this.#currentSourceClaimManifest();
+      if (stored.sourceClaimManifestId !== sourceClaimManifest.manifestId || stored.blueprint.sourceClaimManifest?.digest !== sourceClaimManifest.digest) throw new Error("persisted source claim manifest is absent, stale, or mismatched");
+      return validateControllerAuthorizedBlueprint(stored.blueprint, { sourceResolver: this.#sourceEvidenceResolver(), policyRegistry: this.#controllerPolicyRegistry(), persistedResolutionAuthority: stored.resolutionAuthority, sourceClaimManifest });
+    }
     catch (error) {
       const source = /source|documentSetDigest|sourceDocuments|source reference/i.test(String(error.message));
       const kind = source ? "source_provenance" : "specification_authority";
@@ -1146,7 +1196,10 @@ export class SwarmRouter extends EventEmitter {
     const digest = createHash("sha256").update(serialized).digest("hex");
     if (existsSync(absolutePath)) throw new Error(`ProductBlueprint artifact already exists and is immutable: ${artifactPath}`);
     writeFileSync(absolutePath, serialized, { encoding: "utf8", flag: "wx" });
-    return this.store.recordProductBlueprint({ blueprint, artifactPath, digest, bootstrapTaskId: task.id, deliveryRunId: task.deliveryRunId ?? null });
+    const run = task.deliveryRunId ? this.store.deliveryRun(task.deliveryRunId) : null;
+    const sourceClaimManifest = run?.sourceClaimManifestId ? this.#currentSourceClaimManifest() : null;
+    if (sourceClaimManifest) this.store.recordSourceClaimManifest(sourceClaimManifest);
+    return this.store.recordProductBlueprint({ blueprint, artifactPath, digest, bootstrapTaskId: task.id, deliveryRunId: task.deliveryRunId ?? null, sourceClaimManifestId: sourceClaimManifest?.manifestId ?? null });
   }
 
   #materializePlan(plannerTask, parsedPlan) {
@@ -1399,6 +1452,11 @@ export class SwarmRouter extends EventEmitter {
       if (!claimed || claimed.status !== "planning" || claimed.plannerTaskId) continue;
       const stored = this.store.productBlueprint(claimed.blueprintId);
       if (!stored) { this.store.blockScopedReplan(claimed.id, "fatal", "Persisted ProductBlueprint is unavailable"); continue; }
+      const run = this.store.deliveryRun(claimed.deliveryRunId);
+      if (run?.sourceClaimManifestId) {
+        try { this.#assertRunSourceCompleteness(run); }
+        catch (error) { this.store.blockScopedReplan(claimed.id, "blocked_specification", this.#safeSpecificationReason(error)); continue; }
+      }
       const planner = this.enqueue({
         role: "planner", title: `Scoped recovery plan ${claimed.id.slice(0, 8)}`,
         prompt: this.#scopedPlannerPrompt(claimed), blueprintId: claimed.blueprintId, deliveryRunId: claimed.deliveryRunId,

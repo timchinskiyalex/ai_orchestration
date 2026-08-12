@@ -20,6 +20,21 @@ It opens a live monitor and exits only with a machine-readable terminal delivery
 
 `npm run develop` runs the same launcher. `npm run deliver -- --source <requirements-dir>` is the non-interactive CLI equivalent. `npm run status -- --json` and `npm run watch` are read-only operational views.
 
+## Strict documentation input
+
+Autonomous delivery requires a documentation package containing Markdown files **and exactly one root-level `source-claims.json`**. It is an explicit controller input, not an LLM extraction hint. The declaration binds the current Markdown inventory digest and gives every normalized line of every imported document exactly one claimed coverage range.
+
+```text
+requirements/
+  product.md
+  architecture.md
+  source-claims.json
+```
+
+`source-claims.json` has `schemaVersion: 1`, `kind: "SourceClaimsDeclaration"`, the exact `documentSetDigest`, a `documents` entry (document ID, path, SHA-256, and exhaustive non-overlapping `coverage`) for every Markdown file, and stable `claims`. A claim is classified only as `mandatory`, `non_mandatory`, or `ambiguous`; each coverage range has its exact normalized UTF-8 line digest. Mandatory claims must map exactly once to a ProductBlueprint requirement with non-empty acceptance criteria, an explicitly blocking question/contradiction, or a configured trusted-policy resolution. Ambiguous claims remain blocked unless that exact trusted policy binds the claim ID.
+
+The controller persists only safe IDs, hashes, ranges, classifications, and reason codes in its SourceClaimManifest. It does not persist source excerpts. Missing, stale, incomplete, substituted, or invalid declarations stop at `blocked_specification` before Planner, workers, resume, or candidate publication. Re-import the package and run Bootstrap again; old Blueprints/runs remain visible but cannot resume autonomously.
+
 ## Default configuration
 
 New instances use `autonomy.mode: "autonomous"`. The required config shape is:

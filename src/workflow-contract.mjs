@@ -14,8 +14,8 @@ export function extractOrchestrationJson(text) {
   catch { fail("agent response must contain one valid JSON object in a fenced block"); }
 }
 
-export function validateBootstrap(value, { sourceDocuments = null, sourceResolver = null, policyRegistry = null } = {}) {
-  try { return authorizeBootstrapClaims(value, { sourceDocuments, sourceResolver, policyRegistry }); }
+export function validateBootstrap(value, { sourceDocuments = null, sourceResolver = null, policyRegistry = null, sourceClaimManifest = null } = {}) {
+  try { return authorizeBootstrapClaims(value, { sourceDocuments, sourceResolver, policyRegistry, sourceClaimManifest }); }
   catch (error) { fail(error.message.replace(/^Invalid ProductBlueprint: /, "")); }
 }
 
