@@ -22,6 +22,7 @@ import { provisionDeterministicScaffold } from "./deterministic-scaffold.mjs";
 import { specificationBlockers, validateControllerAuthorizedBlueprint } from "./product-blueprint.mjs";
 import { createImportedSourceResolver } from "./source-evidence.mjs";
 import { PRODUCT_ACCEPTANCE_KIND, PRODUCT_ACCEPTANCE_SCHEMA_VERSION, productAcceptancePasses } from "./final-acceptance.mjs";
+import { compileWriteSurfaceTopology } from "./write-surface.mjs";
 
 const gitSha = (repository, ref) => execFileSync("git", ["-C", repository, "rev-parse", "--verify", `${ref}^{commit}`], { encoding: "utf8" }).trim();
 
@@ -220,7 +221,7 @@ export class SwarmRouter extends EventEmitter {
     return {
       schemaVersion: 1,
       generatedAt: new Date().toISOString(),
-      tasks: tasks.map((task) => ({ id: task.id, title: task.title, role: task.role, status: task.status, dependencies: task.dependencies, blocker: task.error ?? null, tokenUsed: task.tokenUsed, estimatedTokens: task.estimatedTokens, tokenBudget: task.tokenBudget, interruptThresholdTokens: task.interruptThresholdTokens, configuredBudgetCap: task.configuredBudgetCap, budgetInterrupt: task.budgetInterrupt, threadId: task.threadId, turnId: task.turnId, worktree: task.worktree, remediationRound: task.remediationRound })),
+      tasks: tasks.map((task) => ({ id: task.id, title: task.title, role: task.role, status: task.status, dependencies: task.dependencies, executionDependencies: task.executionDependencies, executionTopologyVersion: task.executionTopologyVersion, executionIsWriter: task.executionIsWriter, executionRelease: task.executionIsWriter ? { state: task.executionReleaseState, artifactTaskId: task.executionReleaseArtifactTaskId } : null, blocker: task.error ?? this.#executionBlocker(task), tokenUsed: task.tokenUsed, estimatedTokens: task.estimatedTokens, tokenBudget: task.tokenBudget, interruptThresholdTokens: task.interruptThresholdTokens, configuredBudgetCap: task.configuredBudgetCap, budgetInterrupt: task.budgetInterrupt, threadId: task.threadId, turnId: task.turnId, worktree: task.worktree, remediationRound: task.remediationRound })),
       activeTurns: tasks.filter((task) => task.status === "running").map((task) => ({ taskId: task.id, threadId: task.threadId, turnId: task.turnId })),
       realConcurrency: tasks.filter((task) => task.status === "running").length,
       localBudget: readiness.localBudget,
@@ -967,6 +968,18 @@ export class SwarmRouter extends EventEmitter {
     });
   }
 
+  #executionBlocker(task) {
+    if (task.status !== "queued" || task.executionTopologyVersion !== 1) return null;
+    const blockedExecution = (task.executionDependencies ?? []).find((id) => this.store.getTask(id)?.executionReleaseState !== "released");
+    if (blockedExecution) return `awaiting safe controller release of execution predecessor ${blockedExecution}`;
+    if (task.executionIsWriter) {
+      const blockedLogical = task.dependencies.find((id) => this.store.getTask(id)?.executionIsWriter && this.store.getTask(id)?.executionReleaseState !== "released");
+      if (blockedLogical) return `awaiting safe controller release of logical writer predecessor ${blockedLogical}`;
+      if (task.executionReleaseState !== "pending") return `writer execution release is ${task.executionReleaseState}`;
+    }
+    return null;
+  }
+
   #saveQualityReport(task, report) {
     const root = join(this.config.repository, this.config.project.generatedDir, "quality-reports");
     mkdirSync(root, { recursive: true });
@@ -990,9 +1003,11 @@ export class SwarmRouter extends EventEmitter {
     const nextRound = (writer.remediationRound ?? 0) + 1;
     if (report.verdict === "pass") {
       this.store.transition(task.id, "done");
+      this.store.releaseWriterAfterPassedReviews(writer.id, task.id);
       this.#lifecycle("quality gate passed", { taskId: task.id, writerTaskId: writer.id });
       return;
     }
+    this.store.blockWriterRelease(writer.id, `quality gate verdict: ${report.verdict}`);
     const terminal = report.verdict === "blocked" || (report.verdict === "remediation_required" && nextRound > maxRounds);
     if (terminal) {
       const reason = report.verdict === "blocked" ? "Quality gate blocked; verification or findings are not safely remediable." : `Quality remediation limit (${maxRounds}) exhausted.`;
@@ -1055,6 +1070,7 @@ export class SwarmRouter extends EventEmitter {
       this.#lifecycle("security gate passed", { taskId: task.id, writerTaskId: writer.id });
       return;
     }
+    this.store.blockWriterRelease(writer.id, `security gate verdict: ${report.verdict}`);
     const terminal = report.verdict === "blocked" || (report.verdict === "remediation_required" && nextRound > maxRounds);
     if (terminal) {
       const reason = report.verdict === "blocked" ? "Security gate blocked; findings are not safely remediable." : `Security remediation limit (${maxRounds}) exhausted.`;
@@ -1148,6 +1164,7 @@ export class SwarmRouter extends EventEmitter {
     const controllerBase = scopedReplan ? (previous?.outputSha ?? scopedReplan.priorCheckpointSha ?? priorBatch?.basedOnCheckpointSha ?? gitSha(this.config.repository, this.config.baseRef)) : (previous?.outputSha ?? gitSha(this.config.repository, this.config.baseRef));
     const batchInput = { ...(parsedPlan ?? {}), schemaVersion: 1, kind: "PlanBatch", id: scopedReplan?.replacementPlanBatchId ?? scopedReplan?.id ?? randomUUID(), deliveryRunId: planRunId, blueprintId: stored.blueprint.blueprintId, wave: controllerWave, basedOnCheckpointSha: controllerBase, createdAt: new Date().toISOString() };
     const plan = validatePlan(normalizePlannerPlanForProject(batchInput, scopedReplan ? [] : this.config.project.productRoots), { maxTasks: this.config.router.maxPlanTasks, productRoots: scopedReplan ? [] : this.config.project.productRoots, blueprint: stored.blueprint, requirePlanBatch: true, allowPartialRequirementCoverage: Boolean(scopedReplan), recovery: Boolean(scopedReplan) });
+    const executionTopology = compileWriteSurfaceTopology(plan.tasks, { isWorkspaceWriter: (item) => this.config.roles[item.primaryDomain]?.sandbox === "workspace-write" });
     if (plan.deliveryRunId !== planRunId) throw new Error("PlanBatch deliveryRunId must match Planner delivery run");
     if (scopedReplan) {
       // Scoped recovery receives its controller-owned wave and baseline above.
@@ -1194,26 +1211,27 @@ export class SwarmRouter extends EventEmitter {
       const primaryId = primaryIds.get(item.id);
       const dependencies = [plannerTask.id, ...dependencyPlanIds.map((dependency) => primaryIds.get(dependency))];
       if (scaffoldTaskId && item.id !== "scaffold-product" && primary.sandbox === "workspace-write" && !dependencies.includes(scaffoldTaskId)) dependencies.push(scaffoldTaskId);
-      const writerPredecessors = dependencies
+      const executionDependencies = executionTopology.get(item.id)?.executionDependencies.map((dependency) => primaryIds.get(dependency)) ?? [];
+      const writerPredecessors = [...new Set([...dependencies
         .filter((dependency) => dependency !== plannerTask.id)
-        .filter((dependency) => this.config.roles[primaryRoleByTaskId.get(dependency)]?.sandbox === "workspace-write");
+        .filter((dependency) => this.config.roles[primaryRoleByTaskId.get(dependency)]?.sandbox === "workspace-write"), ...executionDependencies])];
       const fanIn = writerPredecessors.length > 1;
       const prompt = item.id === "scaffold-product"
         ? "[[product-scaffold]]\nController-owned scaffold contract: create every declared product root now. frontend/ must be a runnable Next.js application with package.json, npm lockfile, build and test scripts. backend/ must be an ASP.NET Core Web API solution with an xUnit test project. Do not create placeholders, plans, or a partial root. Run the declared checks after files are written."
         : item.prompt;
-      specs.push({ id: primaryId, role: item.primaryDomain, parentTaskId: plannerTask.id, title: item.title, prompt, allowedPaths: item.allowedPaths, acceptanceChecks: item.acceptanceChecks, dependencies, estimatedTokens: item.estimatedTokens, tokenBudget: primary.tokenBudget, maxAttempts: 1, humanApprovalRequired: elevatedGate, riskFlags: item.riskFlags, supportingDomains: item.supportingDomains, artifactBaseSha: primary.sandbox === "workspace-write" ? plan.basedOnCheckpointSha : null, artifactDependencies: fanIn ? [] : writerPredecessors, integrationBarrierId: fanIn ? `pending:${primaryId}` : null, blueprintId: stored.blueprint.blueprintId, requirementIds: item.requirementIds, deliveryRunId: planRunId, planBatchId: plan.id, wave: plan.wave });
+      specs.push({ id: primaryId, role: item.primaryDomain, parentTaskId: plannerTask.id, title: item.title, prompt, allowedPaths: item.allowedPaths, acceptanceChecks: item.acceptanceChecks, dependencies, executionDependencies, executionTopologyVersion: 1, executionIsWriter: primary.sandbox === "workspace-write", executionReleaseState: primary.sandbox === "workspace-write" ? "pending" : null, estimatedTokens: item.estimatedTokens, tokenBudget: primary.tokenBudget, maxAttempts: 1, humanApprovalRequired: elevatedGate, riskFlags: item.riskFlags, supportingDomains: item.supportingDomains, artifactBaseSha: primary.sandbox === "workspace-write" ? plan.basedOnCheckpointSha : null, artifactDependencies: fanIn ? [] : writerPredecessors, integrationBarrierId: fanIn ? `pending:${primaryId}` : null, blueprintId: stored.blueprint.blueprintId, requirementIds: item.requirementIds, deliveryRunId: planRunId, planBatchId: plan.id, wave: plan.wave });
       let predecessorId = primaryId;
       const mandatoryReview = primary.sandbox === "workspace-write";
-      if ((mandatoryReview || securityRequired) && item.primaryDomain !== "security") {
+      if (mandatoryReview || securityRequired) {
         const estimate = Math.min(this.config.roles.security?.tokenBudget ?? 0, Math.max(1000, Math.ceil(item.estimatedTokens * 0.35)));
         const security = assertRoute("security", estimate);
         predecessorId = randomUUID();
-        specs.push({ id: predecessorId, role: "security", parentTaskId: primaryId, title: `Security review: ${item.title}`, prompt: `Review finalized writer artifact '${item.title}' for declared risk flags: ${item.riskFlags.join(", ") || "none"}. Return the required SecurityGateReport only.`, allowedPaths: item.allowedPaths, acceptanceChecks: item.acceptanceChecks, dependencies: [primaryId], estimatedTokens: estimate, tokenBudget: security.tokenBudget, maxAttempts: 1, humanApprovalRequired: false, riskFlags: item.riskFlags, supportingDomains: ["security"], sourceWriterTaskId: primaryId, blueprintId: stored.blueprint.blueprintId, requirementIds: item.requirementIds, deliveryRunId: planRunId, planBatchId: plan.id, wave: plan.wave });
+        specs.push({ id: predecessorId, role: "security", parentTaskId: primaryId, title: `Security review: ${item.title}`, prompt: `Review finalized writer artifact '${item.title}' for declared risk flags: ${item.riskFlags.join(", ") || "none"}. Return the required SecurityGateReport only.`, allowedPaths: item.allowedPaths, acceptanceChecks: item.acceptanceChecks, dependencies: [primaryId], executionDependencies: [], executionTopologyVersion: 1, executionIsWriter: false, estimatedTokens: estimate, tokenBudget: security.tokenBudget, maxAttempts: 1, humanApprovalRequired: false, riskFlags: item.riskFlags, supportingDomains: ["security"], sourceWriterTaskId: primaryId, blueprintId: stored.blueprint.blueprintId, requirementIds: item.requirementIds, deliveryRunId: planRunId, planBatchId: plan.id, wave: plan.wave });
       }
-      if ((mandatoryReview || item.supportingDomains.includes("qa")) && item.primaryDomain !== "qa") {
+      if (mandatoryReview || item.supportingDomains.includes("qa")) {
         const estimate = Math.min(this.config.roles.qa?.tokenBudget ?? 0, Math.max(1000, Math.ceil(item.estimatedTokens * 0.4)));
         const qa = assertRoute("qa", estimate);
-        specs.push({ id: randomUUID(), role: "qa", parentTaskId: predecessorId, title: `QA: ${item.title}`, prompt: `Verify finalized writer artifact '${item.title}' against acceptance checks. Return the required QualityGateReport only.`, allowedPaths: item.allowedPaths, acceptanceChecks: item.acceptanceChecks, dependencies: [predecessorId], estimatedTokens: estimate, tokenBudget: qa.tokenBudget, maxAttempts: 1, humanApprovalRequired: false, riskFlags: item.riskFlags, supportingDomains: ["qa"], sourceWriterTaskId: primaryId, blueprintId: stored.blueprint.blueprintId, requirementIds: item.requirementIds, deliveryRunId: planRunId, planBatchId: plan.id, wave: plan.wave });
+        specs.push({ id: randomUUID(), role: "qa", parentTaskId: predecessorId, title: `QA: ${item.title}`, prompt: `Verify finalized writer artifact '${item.title}' against acceptance checks. Return the required QualityGateReport only.`, allowedPaths: item.allowedPaths, acceptanceChecks: item.acceptanceChecks, dependencies: [predecessorId], executionDependencies: [], executionTopologyVersion: 1, executionIsWriter: false, estimatedTokens: estimate, tokenBudget: qa.tokenBudget, maxAttempts: 1, humanApprovalRequired: false, riskFlags: item.riskFlags, supportingDomains: ["qa"], sourceWriterTaskId: primaryId, blueprintId: stored.blueprint.blueprintId, requirementIds: item.requirementIds, deliveryRunId: planRunId, planBatchId: plan.id, wave: plan.wave });
       }
     }
     const replacements = scopedReplan ? scopedReplan.affectedTaskIds.map((oldTaskId) => {
@@ -1240,13 +1258,13 @@ export class SwarmRouter extends EventEmitter {
 
   #connectArtifactDependents(predecessor, artifact) {
     for (const task of this.store.listTasks()) {
-      if (task.id === predecessor.id || !task.dependencies.includes(predecessor.id) || this.config.roles[task.role]?.sandbox !== "workspace-write") continue;
-      const writerPredecessors = task.dependencies.filter((dependency) => this.config.roles[this.store.getTask(dependency)?.role]?.sandbox === "workspace-write");
+      if (task.id === predecessor.id || (![...task.dependencies, ...(task.executionDependencies ?? [])].includes(predecessor.id)) || this.config.roles[task.role]?.sandbox !== "workspace-write") continue;
+      const writerPredecessors = [...new Set([...task.dependencies, ...(task.executionDependencies ?? [])].filter((dependency) => this.config.roles[this.store.getTask(dependency)?.role]?.sandbox === "workspace-write"))];
       if (writerPredecessors.length === 1 && !task.integrationBarrierId) this.store.setArtifactLineage(task.id, { artifactBaseSha: artifact.headSha, artifactDependencies: writerPredecessors });
     }
   }
   _assertWriterArtifactLineage(task) {
-    const writerPredecessors = task.dependencies.filter((dependency) => this.config.roles[this.store.getTask(dependency)?.role]?.sandbox === "workspace-write");
+    const writerPredecessors = [...new Set([...task.dependencies, ...(task.executionDependencies ?? [])].filter((dependency) => this.config.roles[this.store.getTask(dependency)?.role]?.sandbox === "workspace-write"))];
     if (writerPredecessors.length > 1) {
       const barrier = this.store.integrationBarrier(task.integrationBarrierId);
       const checkpoint = task.localCheckpointId ? this.store.integrationCheckpoint(task.localCheckpointId) : null;
@@ -1407,7 +1425,7 @@ export class SwarmRouter extends EventEmitter {
     while (changed) {
       changed = false;
       for (const candidate of tasks) {
-        const touches = candidate.dependencies.some((id) => affected.has(id)) || affected.has(candidate.sourceWriterTaskId) || (candidate.parentTaskId && affected.has(candidate.parentTaskId)) || (candidate.integrationBarrierId && context.barrierId === candidate.integrationBarrierId);
+        const touches = candidate.dependencies.some((id) => affected.has(id)) || (candidate.executionDependencies ?? []).some((id) => affected.has(id)) || affected.has(candidate.sourceWriterTaskId) || (candidate.parentTaskId && affected.has(candidate.parentTaskId)) || (candidate.integrationBarrierId && context.barrierId === candidate.integrationBarrierId);
         if (!affected.has(candidate.id) && touches) { affected.add(candidate.id); changed = true; }
       }
     }

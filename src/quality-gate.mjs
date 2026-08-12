@@ -1,4 +1,5 @@
 import { isAbsolute } from "node:path";
+import { isWriteSurfaceAncestorOrSame } from "./write-surface.mjs";
 
 export const QUALITY_GATE_VERSION = 1;
 const severities = new Set(["low", "medium", "high", "critical"]);
@@ -34,7 +35,10 @@ export function validateQualityGateReport(value) {
 
 export function remediationScope(report, writerTask) {
   const paths = [...new Set(report.findings.map((finding) => finding.path))];
-  if (!paths.length || !paths.every((path) => (writerTask.allowedPaths ?? []).some((allowed) => path === allowed || path.startsWith(`${allowed.replace(/\/$/, "")}/`)))) throw new Error("Quality remediation findings exceed the writer TaskEnvelope scope");
+  if (!paths.length || !paths.every((path) => (writerTask.allowedPaths ?? []).some((allowed) => {
+    try { return isWriteSurfaceAncestorOrSame(allowed, path); }
+    catch { return false; }
+  }))) throw new Error("Quality remediation findings exceed the writer TaskEnvelope scope");
   return paths;
 }
 

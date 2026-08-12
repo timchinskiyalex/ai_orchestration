@@ -3,6 +3,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { join, relative } from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { isWriteSurfaceAncestorOrSame, normalizeAllowedPaths, normalizeWriteSurface } from "./write-surface.mjs";
 import { commandCwd, commandsForPaths } from "./project-overlay.mjs";
 import { runManagedProcess } from "./managed-process-runner.mjs";
 import { validateWorkerArtifactContract } from "./workflow-contract.mjs";
@@ -16,9 +17,15 @@ async function git(cwd, args) { return (await exec("git", ["-C", cwd, ...args]))
 async function gitRaw(cwd, args) { return (await exec("git", ["-C", cwd, ...args], { encoding: "buffer" })).stdout.toString("utf8"); }
 function statusPaths(value) { return value.split("\0").filter(Boolean).map((entry) => toPosix(entry.slice(3))); }
 function nameStatusPaths(value) { const parts = value.split("\0"); const paths = []; for (let i = 0; i < parts.length; i += 1) { const status = parts[i]; if (!status) continue; if ((status.startsWith("R") || status.startsWith("C")) && parts[i + 2] !== undefined) paths.push(toPosix(parts[++i]), toPosix(parts[++i])); else if (parts[i + 1] !== undefined) paths.push(toPosix(parts[++i])); } return paths; }
-function isWithin(path, allowed) { return path === allowed || path.startsWith(`${allowed.replace(/\/$/, "")}/`); }
+function isWithin(path, allowed) {
+  try { return isWriteSurfaceAncestorOrSame(allowed, path); }
+  catch { return false; }
+}
 function pathAllowed(path, task, overlay, { autonomous = true } = {}) {
-  if (!task.allowedPaths?.length || !task.allowedPaths.some((allowed) => isWithin(path, allowed))) return { allowed: false, reason: "outside TaskEnvelope allowedPaths" };
+  let allowedPaths;
+  try { allowedPaths = normalizeAllowedPaths(task.allowedPaths); normalizeWriteSurface(path); }
+  catch { return { allowed: false, reason: "invalid TaskEnvelope allowedPaths or changed path" }; }
+  if (!allowedPaths.some((allowed) => isWithin(path, allowed))) return { allowed: false, reason: "outside TaskEnvelope allowedPaths" };
   const policies = overlay.pathPolicies ?? {};
   if ((policies.denyWrite ?? []).some((item) => isWithin(path, item))) return { allowed: false, reason: "deny_write policy" };
   if ((policies.generatedDoNotEdit ?? []).some((item) => isWithin(path, item))) return { allowed: false, reason: "generated_do_not_edit policy" };

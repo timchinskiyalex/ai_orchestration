@@ -65,6 +65,11 @@ export class StateStore {
         ,plan_batch_id TEXT
         ,wave INTEGER
         ,integration_barrier_id TEXT
+        ,execution_dependencies_json TEXT
+        ,execution_topology_version INTEGER NOT NULL DEFAULT 0
+        ,execution_is_writer INTEGER NOT NULL DEFAULT 0
+        ,execution_release_state TEXT
+        ,execution_release_artifact_task_id TEXT
       );
       CREATE TABLE IF NOT EXISTS events (
         sequence INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -260,6 +265,11 @@ export class StateStore {
     this.#addColumnIfMissing("tasks", "wave", "INTEGER");
     this.#addColumnIfMissing("tasks", "integration_barrier_id", "TEXT");
     this.#addColumnIfMissing("tasks", "local_checkpoint_id", "TEXT");
+    this.#addColumnIfMissing("tasks", "execution_dependencies_json", "TEXT");
+    this.#addColumnIfMissing("tasks", "execution_topology_version", "INTEGER NOT NULL DEFAULT 0");
+    this.#addColumnIfMissing("tasks", "execution_is_writer", "INTEGER NOT NULL DEFAULT 0");
+    this.#addColumnIfMissing("tasks", "execution_release_state", "TEXT");
+    this.#addColumnIfMissing("tasks", "execution_release_artifact_task_id", "TEXT");
     this.#addColumnIfMissing("integration_checkpoints", "checkpoint_type", "TEXT");
     this.#addColumnIfMissing("integration_checkpoints", "barrier_id", "TEXT");
     this.#addColumnIfMissing("integration_checkpoints", "effective_lineage_json", "TEXT");
@@ -301,6 +311,9 @@ export class StateStore {
     // Older resumable runs have no immutable intake contract. Preserve every
     // row, but prevent them from silently continuing under the new semantics.
     this.#blockLegacyRunsWithoutBlueprint();
+    // A PlanBatch persisted before execution topology existed cannot safely be
+    // resumed: it may contain overlapping writers with no controller lane.
+    this.#blockLegacyPlanTasksWithoutExecutionTopology();
   }
 
   close() { this.db.close(); }
@@ -313,12 +326,12 @@ export class StateStore {
     this.#mutate(task.id, `task/${initialStatus}`, { role: task.role, title: task.title, humanApprovalRequired: Boolean(task.humanApprovalRequired) }, () => this.db.prepare(`INSERT INTO tasks (
       id, parent_task_id, role, title, prompt, status, allowed_paths_json,
       acceptance_checks_json, dependencies_json, human_approval_required, token_budget, estimated_tokens, max_attempts, created_at, updated_at,
-      risk_flags_json, supporting_domains_json, artifact_base_sha, artifact_dependencies_json, remediation_round, source_writer_task_id, delivery_run_id, blueprint_id, requirement_ids_json, plan_batch_id, wave, integration_barrier_id
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      risk_flags_json, supporting_domains_json, artifact_base_sha, artifact_dependencies_json, remediation_round, source_writer_task_id, delivery_run_id, blueprint_id, requirement_ids_json, plan_batch_id, wave, integration_barrier_id, execution_dependencies_json, execution_topology_version, execution_is_writer, execution_release_state, execution_release_artifact_task_id
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
       task.id, task.parentTaskId ?? null, task.role, task.title, task.prompt,
       initialStatus, json(task.allowedPaths), json(task.acceptanceChecks), json(task.dependencies), task.humanApprovalRequired ? 1 : 0, task.tokenBudget, task.estimatedTokens ?? task.tokenBudget,
       task.maxAttempts, timestamp, timestamp, json(task.riskFlags), json(task.supportingDomains), task.artifactBaseSha ?? null,
-      json(task.artifactDependencies), task.remediationRound ?? 0, task.sourceWriterTaskId ?? null, task.deliveryRunId ?? null, task.blueprintId ?? null, json(task.requirementIds), task.planBatchId ?? null, task.wave ?? null, task.integrationBarrierId ?? null
+      json(task.artifactDependencies), task.remediationRound ?? 0, task.sourceWriterTaskId ?? null, task.deliveryRunId ?? null, task.blueprintId ?? null, json(task.requirementIds), task.planBatchId ?? null, task.wave ?? null, task.integrationBarrierId ?? null, task.executionDependencies === undefined ? null : json(task.executionDependencies), task.executionTopologyVersion ?? 0, task.executionIsWriter ? 1 : 0, task.executionReleaseState ?? null, task.executionReleaseArtifactTaskId ?? null
     ));
     return this.getTask(task.id);
   }
@@ -342,12 +355,12 @@ export class StateStore {
         this.db.prepare(`INSERT INTO tasks (
           id, parent_task_id, role, title, prompt, status, allowed_paths_json,
           acceptance_checks_json, dependencies_json, human_approval_required, token_budget, estimated_tokens, max_attempts, created_at, updated_at,
-          risk_flags_json, supporting_domains_json, artifact_base_sha, artifact_dependencies_json, remediation_round, source_writer_task_id, delivery_run_id, blueprint_id, requirement_ids_json, plan_batch_id, wave, integration_barrier_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)` ).run(
+          risk_flags_json, supporting_domains_json, artifact_base_sha, artifact_dependencies_json, remediation_round, source_writer_task_id, delivery_run_id, blueprint_id, requirement_ids_json, plan_batch_id, wave, integration_barrier_id, execution_dependencies_json, execution_topology_version, execution_is_writer, execution_release_state, execution_release_artifact_task_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)` ).run(
           task.id, task.parentTaskId ?? null, task.role, task.title, task.prompt,
           initialStatus, json(task.allowedPaths), json(task.acceptanceChecks), json(task.dependencies), task.humanApprovalRequired ? 1 : 0,
           task.tokenBudget, task.estimatedTokens ?? task.tokenBudget, task.maxAttempts ?? 1, timestamp, timestamp,
-          json(task.riskFlags), json(task.supportingDomains), task.artifactBaseSha ?? null, json(task.artifactDependencies), task.remediationRound ?? 0, task.sourceWriterTaskId ?? null, task.deliveryRunId ?? null, task.blueprintId ?? null, json(task.requirementIds), task.planBatchId ?? null, task.wave ?? null, task.integrationBarrierId ?? null
+          json(task.riskFlags), json(task.supportingDomains), task.artifactBaseSha ?? null, json(task.artifactDependencies), task.remediationRound ?? 0, task.sourceWriterTaskId ?? null, task.deliveryRunId ?? null, task.blueprintId ?? null, json(task.requirementIds), task.planBatchId ?? null, task.wave ?? null, task.integrationBarrierId ?? null, task.executionDependencies === undefined ? null : json(task.executionDependencies), task.executionTopologyVersion ?? 0, task.executionIsWriter ? 1 : 0, task.executionReleaseState ?? null, task.executionReleaseArtifactTaskId ?? null
         );
         this.#insertEvent(task.id, `task/${initialStatus}`, { role: task.role, title: task.title, humanApprovalRequired: Boolean(task.humanApprovalRequired) });
         for (const requirementId of task.requirementIds ?? []) this.#insertTraceability({ requirementId, blueprintId: task.blueprintId, taskId: task.id, checkpoint: "planned", payload: { role: task.role, parentTaskId: task.parentTaskId ?? null } });
@@ -400,7 +413,7 @@ export class StateStore {
     this.db.exec("BEGIN IMMEDIATE");
     try {
       const candidates = this.db.prepare("SELECT * FROM tasks WHERE status = 'queued' ORDER BY created_at").all();
-      const row = candidates.find((candidate) => parse(candidate.dependencies_json, []).every((id) => this.getTask(id)?.status === "done") && (!candidate.integration_barrier_id || this.integrationBarrier(candidate.integration_barrier_id)?.status === "passed"));
+      const row = candidates.find((candidate) => this.#claimable(candidate));
       if (!row) { this.db.exec("COMMIT"); return null; }
       const timestamp = now();
       this.db.prepare("UPDATE tasks SET status = 'preparing', attempt = attempt + 1, updated_at = ? WHERE id = ? AND status = 'queued'").run(timestamp, row.id);
@@ -669,8 +682,9 @@ export class StateStore {
         assertRole(task.role); this.#validateTaskBlueprint(task);
         if (this.getTask(task.id)) throw new Error("PlanBatch task ids must be unused");
         const timestamp = now(), initialStatus = task.humanApprovalRequired ? "awaiting_human" : "queued";
-        this.db.prepare(`INSERT INTO tasks (id,parent_task_id,role,title,prompt,status,allowed_paths_json,acceptance_checks_json,dependencies_json,human_approval_required,token_budget,estimated_tokens,max_attempts,created_at,updated_at,risk_flags_json,supporting_domains_json,artifact_base_sha,artifact_dependencies_json,remediation_round,source_writer_task_id,delivery_run_id,blueprint_id,requirement_ids_json,plan_batch_id,wave,integration_barrier_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-          .run(task.id, task.parentTaskId ?? null, task.role, task.title, task.prompt, initialStatus, json(task.allowedPaths), json(task.acceptanceChecks), json(task.dependencies), task.humanApprovalRequired ? 1 : 0, task.tokenBudget, task.estimatedTokens ?? task.tokenBudget, task.maxAttempts ?? 1, timestamp, timestamp, json(task.riskFlags), json(task.supportingDomains), task.artifactBaseSha ?? null, json(task.artifactDependencies), task.remediationRound ?? 0, task.sourceWriterTaskId ?? null, task.deliveryRunId ?? null, task.blueprintId ?? null, json(task.requirementIds), batch.id, batch.wave, task.integrationBarrierId ?? null);
+        if (task.executionTopologyVersion !== 1 || !Array.isArray(task.executionDependencies) || typeof task.executionIsWriter !== "boolean") throw new Error("PlanBatch task is missing controller-owned execution topology");
+        this.db.prepare(`INSERT INTO tasks (id,parent_task_id,role,title,prompt,status,allowed_paths_json,acceptance_checks_json,dependencies_json,human_approval_required,token_budget,estimated_tokens,max_attempts,created_at,updated_at,risk_flags_json,supporting_domains_json,artifact_base_sha,artifact_dependencies_json,remediation_round,source_writer_task_id,delivery_run_id,blueprint_id,requirement_ids_json,plan_batch_id,wave,integration_barrier_id,execution_dependencies_json,execution_topology_version,execution_is_writer,execution_release_state,execution_release_artifact_task_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+          .run(task.id, task.parentTaskId ?? null, task.role, task.title, task.prompt, initialStatus, json(task.allowedPaths), json(task.acceptanceChecks), json(task.dependencies), task.humanApprovalRequired ? 1 : 0, task.tokenBudget, task.estimatedTokens ?? task.tokenBudget, task.maxAttempts ?? 1, timestamp, timestamp, json(task.riskFlags), json(task.supportingDomains), task.artifactBaseSha ?? null, json(task.artifactDependencies), task.remediationRound ?? 0, task.sourceWriterTaskId ?? null, task.deliveryRunId ?? null, task.blueprintId ?? null, json(task.requirementIds), batch.id, batch.wave, task.integrationBarrierId ?? null, json(task.executionDependencies), task.executionTopologyVersion, task.executionIsWriter ? 1 : 0, task.executionIsWriter ? (task.executionReleaseState ?? "pending") : null, task.executionReleaseArtifactTaskId ?? null);
         this.#insertEvent(task.id, `task/${initialStatus}`, { role: task.role, title: task.title, planBatchId: batch.id, wave: batch.wave });
         for (const requirementId of task.requirementIds ?? []) this.#insertTraceability({ requirementId, blueprintId: task.blueprintId, taskId: task.id, checkpoint: "planned", payload: { planBatchId: batch.id, wave: batch.wave } });
       }
@@ -974,6 +988,7 @@ export class StateStore {
       riskFlags: parse(row.risk_flags_json, []), supportingDomains: parse(row.supporting_domains_json, []),
       artifactBaseSha: row.artifact_base_sha, artifactDependencies: parse(row.artifact_dependencies_json, []),
       planBatchId: row.plan_batch_id, wave: row.wave, integrationBarrierId: row.integration_barrier_id, localCheckpointId: row.local_checkpoint_id,
+      executionDependencies: row.execution_dependencies_json === null ? null : parse(row.execution_dependencies_json, []), executionTopologyVersion: row.execution_topology_version ?? 0, executionIsWriter: Boolean(row.execution_is_writer), executionReleaseState: row.execution_release_state, executionReleaseArtifactTaskId: row.execution_release_artifact_task_id,
       remediationRound: row.remediation_round, sourceWriterTaskId: row.source_writer_task_id,
       deliveryRunId: row.delivery_run_id, blueprintId: row.blueprint_id, requirementIds: parse(row.requirement_ids_json, []), interruptThresholdTokens: row.interrupt_threshold_tokens, configuredBudgetCap: row.configured_budget_cap,
       budgetInterrupt: this.budgetInterruption(row.id)
@@ -1043,6 +1058,43 @@ export class StateStore {
     if (!columns.some((item) => item.name === column)) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
   }
 
+  #claimable(candidate) {
+    const logicalReady = parse(candidate.dependencies_json, []).every((id) => this.getTask(id)?.status === "done");
+    if (!logicalReady || (candidate.integration_barrier_id && this.integrationBarrier(candidate.integration_barrier_id)?.status !== "passed")) return false;
+    // Non-PlanBatch tasks retain their historical/manual scheduling contract.
+    if (!candidate.plan_batch_id) return true;
+    if (candidate.execution_topology_version !== 1 || !candidate.execution_dependencies_json) return false;
+    const executionReady = parse(candidate.execution_dependencies_json, []).every((id) => this.getTask(id)?.executionReleaseState === "released");
+    if (!executionReady) return false;
+    if (!candidate.execution_is_writer) return true;
+    if (candidate.execution_release_state !== "pending") return false;
+    // Logical planner edges remain logically distinct, but a direct writer
+    // dependency must still be safely released before another writer starts.
+    return parse(candidate.dependencies_json, []).every((id) => {
+      const dependency = this.getTask(id);
+      return !dependency?.executionIsWriter || dependency.executionReleaseState === "released";
+    });
+  }
+
+  releaseWriterAfterPassedReviews(writerTaskId, qaTaskId) {
+    const writer = this.getTask(writerTaskId); const qa = this.getTask(qaTaskId);
+    if (!writer?.executionIsWriter || writer.executionTopologyVersion !== 1 || writer.executionReleaseState !== "pending") return writer;
+    const artifact = this.workerArtifactRecord(writerTaskId);
+    const qaReport = qa?.role === "qa" && qa.status === "done" && qa.sourceWriterTaskId === writerTaskId ? this.qualityReport(qaTaskId)?.report : null;
+    const security = this.listTasks().find((task) => task.role === "security" && task.sourceWriterTaskId === writerTaskId && task.status === "done");
+    const securityReport = security ? this.securityReport(security.id)?.report : null;
+    if (writer.status !== "done" || !artifact?.artifact || artifact.trusted === false || !qa?.dependencies.includes(security?.id) || qaReport?.verdict !== "pass" || securityReport?.verdict !== "pass") throw new Error(`Writer ${writerTaskId} cannot be released without a finalized artifact and passed Security/QA evidence`);
+    this.#mutate(writerTaskId, "execution/released", { writerTaskId, qaTaskId, securityTaskId: security.id, artifactTaskId: writerTaskId }, () => this.db.prepare("UPDATE tasks SET execution_release_state = 'released', execution_release_artifact_task_id = ?, updated_at = ? WHERE id = ? AND execution_release_state = 'pending'").run(writerTaskId, now(), writerTaskId));
+    return this.getTask(writerTaskId);
+  }
+
+  blockWriterRelease(writerTaskId, reason) {
+    const writer = this.getTask(writerTaskId);
+    if (!writer?.executionIsWriter || writer.executionTopologyVersion !== 1 || writer.executionReleaseState !== "pending") return writer;
+    this.#mutate(writerTaskId, "execution/release-blocked", { writerTaskId, reason: String(reason).slice(0, 500) }, () => this.db.prepare("UPDATE tasks SET execution_release_state = 'blocked', updated_at = ? WHERE id = ? AND execution_release_state = 'pending'").run(now(), writerTaskId));
+    return this.getTask(writerTaskId);
+  }
+
   #validateTaskBlueprint(task) {
     if (!task.blueprintId && !(task.requirementIds?.length)) return;
     if (!task.blueprintId || !Array.isArray(task.requirementIds) || (!task.requirementIds.length && !["bootstrap", "planner"].includes(task.role))) throw new Error("Blueprint-linked task requires blueprintId and non-empty requirementIds");
@@ -1065,6 +1117,22 @@ export class StateStore {
         this.db.prepare("UPDATE delivery_runs SET state = 'blocked_specification', publish_json = ?, owner_pid = NULL, owner_session_id = NULL, heartbeat_at = NULL, updated_at = ? WHERE id = ?").run(JSON.stringify({ reason, recovery: { action: "Start a fresh delivery from source documentation; historical artifacts and tasks remain retained." } }), timestamp, row.id);
         this.db.prepare("UPDATE tasks SET status = 'blocked_specification', error = ?, updated_at = ? WHERE delivery_run_id = ? AND status IN ('queued','preparing','running','awaiting_approval','awaiting_human','interrupted')").run(reason, timestamp, row.id);
         this.#insertEvent(row.bootstrap_task_id, "delivery/blocked_specification", { deliveryRunId: row.id, reason });
+      }
+      this.db.exec("COMMIT");
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+  }
+
+  #blockLegacyPlanTasksWithoutExecutionTopology() {
+    const statuses = ["queued", "preparing", "running", "awaiting_approval", "awaiting_human", "interrupted"];
+    const rows = this.db.prepare(`SELECT id FROM tasks WHERE plan_batch_id IS NOT NULL AND COALESCE(execution_topology_version, 0) != 1 AND status IN (${statuses.map(() => "?").join(",")})`).all(...statuses);
+    if (!rows.length) return;
+    const timestamp = now();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      for (const row of rows) {
+        const reason = "legacy_execution_topology_incomplete: replan required before overlapping writers can resume";
+        this.db.prepare("UPDATE tasks SET status = 'blocked_specification', error = ?, updated_at = ? WHERE id = ?").run(reason, timestamp, row.id);
+        this.#insertEvent(row.id, "execution/topology-blocked", { reason });
       }
       this.db.exec("COMMIT");
     } catch (error) { this.db.exec("ROLLBACK"); throw error; }

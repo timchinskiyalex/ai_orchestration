@@ -1,6 +1,7 @@
 function fail(message) { throw new Error(`Invalid orchestration JSON: ${message}`); }
 import { enforceRoutingInvariants } from "./routing-evaluator.mjs";
 import { assertMandatoryRequirementCoverage, authorizeBootstrapClaims, validateRequirementIds } from "./product-blueprint.mjs";
+import { isWriteSurfaceAncestorOrSame, normalizeAllowedPaths } from "./write-surface.mjs";
 const domains = new Set(["backend", "frontend", "database", "qa", "security", "devops"]);
 const riskFlags = new Set(["public_api_change", "auth_or_authorization", "secret_handling", "sensitive_data", "destructive_data_change", "schema_change", "production_write", "network_exposure", "permission_change", "dependency_supply_chain", "irreversible_operation", "high_blast_radius"]);
 const sha = (value) => typeof value === "string" && /^[a-f0-9]{40,64}$/i.test(value);
@@ -42,6 +43,8 @@ export function validatePlan(value, { maxTasks, productRoots = [], blueprint = n
     ids.add(task.id);
     if (typeof task.title !== "string" || typeof task.prompt !== "string" || !task.title.trim() || !task.prompt.trim()) fail(`task '${task.id}' needs title and prompt`);
     if (![task.supportingDomains, task.riskFlags, task.dependsOn, task.allowedPaths, task.acceptanceChecks, ...(blueprint ? [task.requirementIds] : [])].every(Array.isArray)) fail(`task '${task.id}' array fields are invalid`);
+    try { task.allowedPaths = normalizeAllowedPaths(task.allowedPaths); }
+    catch (error) { fail(`task '${task.id}' ${error.message.replace(/^Invalid write surface: /, "")}`); }
     if (blueprint) {
       try { validateRequirementIds(task.requirementIds, blueprint); }
       catch (error) { fail(`task '${task.id}' ${error.message.replace(/^Invalid ProductBlueprint: /, "")}`); }
@@ -64,7 +67,7 @@ export function validatePlan(value, { maxTasks, productRoots = [], blueprint = n
     if (!roots.every((root) => scaffold.allowedPaths.includes(root))) fail("scaffold-product must be allowed to create every declared product root");
     for (const task of value.tasks) {
       if (task.id === scaffold.id) continue;
-      const writesProduct = task.allowedPaths.some((path) => roots.some((root) => path === root || path.startsWith(`${root}/`)));
+      const writesProduct = task.allowedPaths.some((path) => roots.some((root) => isWriteSurfaceAncestorOrSame(root, path)));
       if (writesProduct && !task.dependsOn.includes(scaffold.id)) fail(`product task '${task.id}' must directly depend on scaffold-product`);
     }
   }
