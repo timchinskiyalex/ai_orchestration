@@ -13,7 +13,7 @@ import { documentIdForPath, documentSetDigest } from "../src/product-blueprint.m
 const git = (cwd, args) => execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8" }).trim();
 
 class LineageClient extends EventEmitter {
-  constructor(plan) { super(); this.plan = plan; this.next = 0; this.threads = new Map(); this.writerBases = new Map(); }
+  constructor(plan, { contextualFanIn = false } = {}) { super(); this.plan = plan; this.contextualFanIn = contextualFanIn; this.next = 0; this.threads = new Map(); this.writerBases = new Map(); }
   async connect() {}
   shutdown() {}
   diagnostics() { return { protocolEvents: [], stderrTail: "", process: {} }; }
@@ -23,9 +23,12 @@ class LineageClient extends EventEmitter {
   async startTurn({ threadId }) { const thread = this.threads.get(threadId); thread.turn = `${threadId}-turn`; return { turn: { id: thread.turn } }; }
   async waitForTurn(threadId, turnId) {
     const thread = this.threads.get(threadId);
-    if (/^Write A\n\nWrite A$/.test(thread.goal)) { this.writerBases.set("writer-a", git(thread.cwd, ["rev-parse", "HEAD"])); writeFileSync(join(thread.cwd, "src", "a.mjs"), "export const a = true;\n"); }
-    if (/^Write C\n\nWrite C$/.test(thread.goal)) { this.writerBases.set("writer-c", git(thread.cwd, ["rev-parse", "HEAD"])); writeFileSync(join(thread.cwd, "src", "c.mjs"), "export const c = true;\n"); }
-    if (/^Write B\n\nWrite B$/.test(thread.goal)) { this.writerBases.set("writer-b", git(thread.cwd, ["rev-parse", "HEAD"])); writeFileSync(join(thread.cwd, "src", "b.mjs"), "export const b = true;\n"); }
+    if (this.contextualFanIn && /^Write A\n\nWrite A$/.test(thread.goal)) { this.writerBases.set("writer-a", git(thread.cwd, ["rev-parse", "HEAD"])); writeFileSync(join(thread.cwd, "src", "a.mjs"), "export const a = true;\n"); }
+    if (this.contextualFanIn && /^Write C\n\nWrite C$/.test(thread.goal)) { this.writerBases.set("writer-c", git(thread.cwd, ["rev-parse", "HEAD"])); writeFileSync(join(thread.cwd, "src", "context.mjs"), "export const context = 'created-by-c';\n"); }
+    if (this.contextualFanIn && /^Write B\n\nWrite B$/.test(thread.goal)) { this.writerBases.set("writer-b", git(thread.cwd, ["rev-parse", "HEAD"])); writeFileSync(join(thread.cwd, "src", "context.mjs"), "export const context = 'modified-by-b';\n"); }
+    if (!this.contextualFanIn && /^Write A\n\nWrite A$/.test(thread.goal)) { this.writerBases.set("writer-a", git(thread.cwd, ["rev-parse", "HEAD"])); writeFileSync(join(thread.cwd, "src", "a.mjs"), "export const a = true;\n"); }
+    if (!this.contextualFanIn && /^Write C\n\nWrite C$/.test(thread.goal)) { this.writerBases.set("writer-c", git(thread.cwd, ["rev-parse", "HEAD"])); writeFileSync(join(thread.cwd, "src", "c.mjs"), "export const c = true;\n"); }
+    if (!this.contextualFanIn && /^Write B\n\nWrite B$/.test(thread.goal)) { this.writerBases.set("writer-b", git(thread.cwd, ["rev-parse", "HEAD"])); writeFileSync(join(thread.cwd, "src", "b.mjs"), "export const b = true;\n"); }
     const generic = thread.goal.match(/^Write ([A-Z])\n\nWrite \1$/);
     if (generic && !["A", "B", "C"].includes(generic[1])) { const name = generic[1].toLowerCase(); this.writerBases.set(`writer-${name}`, git(thread.cwd, ["rev-parse", "HEAD"])); writeFileSync(join(thread.cwd, "src", `${name}.mjs`), `export const ${name} = true;\n`); }
     return { id: turnId, status: "completed" };
@@ -75,6 +78,37 @@ test("local fan-in consumer reaches candidate_ready from its checkpoint lineage"
     router = new SwarmRouter(config(root, client)); await router.ensureProjectOverlay(); router.startProject(); await router.runUntilIdle();
     const integration = await router.runToIntegration({ alreadyIdle: true });
     assert.equal(integration.integration.manifest.status, "candidate_ready");
+  } finally { router?.close(); rmSync(root, { recursive: true, force: true }); }
+});
+test("checkpoint-derived lineage overrides adversarial caller order for a contextual local fan-in", async () => {
+  const plan = { blueprintId: "pb-test", tasks: [writer("writer-a", "Write A"), { ...writer("writer-c", "Write C"), allowedPaths: ["src"] }, { ...writer("writer-b", "Write B", ["writer-a", "writer-c"]), allowedPaths: ["src"] }] };
+  const client = new LineageClient(plan, { contextualFanIn: true }); const root = setup(client); let router;
+  try {
+    router = new SwarmRouter(config(root, client)); await router.ensureProjectOverlay(); router.startProject(); await router.runUntilIdle();
+    const a = router.list().find((task) => task.title === "Write A"), c = router.list().find((task) => task.title === "Write C"), b = router.list().find((task) => task.title === "Write B");
+    const checkpoint = router.store.integrationCheckpoint(b.localCheckpointId);
+    assert.equal(b.artifactBaseSha, checkpoint.outputSha); assert.deepEqual(b.artifactDependencies, []);
+    const integration = await router.integrateFinalized([b.id, c.id, a.id]);
+    assert.equal(integration.manifest.status, "candidate_ready");
+    assert.deepEqual(integration.manifest.appliedArtifacts, [a.id, c.id, b.id]);
+    assert.deepEqual(integration.manifest.effectiveLineage.map((item) => `${item.kind}:${item.id}`), [`artifact:${a.id}`, `artifact:${c.id}`, `checkpoint:${checkpoint.id}`, `artifact:${b.id}`]);
+    assert.equal(git(integration.manifest.worktree, ["show", "HEAD:src/context.mjs"]), "export const context = 'modified-by-b';");
+  } finally { router?.close(); rmSync(root, { recursive: true, force: true }); }
+});
+test("restart resumes a checkpoint consumer from its persisted exact checkpoint base", async () => {
+  const plan = { blueprintId: "pb-test", tasks: [writer("writer-a", "Write A"), { ...writer("writer-c", "Write C"), allowedPaths: ["src"] }, { ...writer("writer-b", "Write B", ["writer-a", "writer-c"]), allowedPaths: ["src"] }] };
+  const paused = new LineageClient(plan, { contextualFanIn: true }); const root = setup(paused); let router;
+  try {
+    router = new SwarmRouter(config(root, paused)); await router.ensureProjectOverlay(); router.startProject();
+    const claimNext = router.store.claimNext.bind(router.store);
+    router.store.claimNext = () => router.store.listTasks().some((task) => task.title === "Write B" && task.status === "queued" && task.localCheckpointId) ? null : claimNext();
+    await router.runUntilIdle();
+    const b = router.list().find((task) => task.title === "Write B"), checkpoint = router.store.integrationCheckpoint(b.localCheckpointId);
+    assert.ok(checkpoint); assert.equal(b.status, "queued"); assert.equal(b.artifactBaseSha, checkpoint.outputSha); assert.deepEqual(b.artifactDependencies, []); assert.equal(router.store.workerArtifact(b.id), null); router.close();
+    const resumed = new LineageClient(plan, { contextualFanIn: true }); router = new SwarmRouter(config(root, resumed)); await router.runUntilIdle({ deliveryRunId: null });
+    const a = router.list().find((task) => task.title === "Write A"), c = router.list().find((task) => task.title === "Write C"), resumedB = router.list().find((task) => task.title === "Write B");
+    const integration = await router.integrateFinalized([resumedB.id, c.id, a.id]);
+    assert.equal(integration.manifest.status, "candidate_ready"); assert.deepEqual(integration.manifest.appliedArtifacts, [a.id, c.id, resumedB.id]);
   } finally { router?.close(); rmSync(root, { recursive: true, force: true }); }
 });
 test("two independent local fan-ins in one wave reconcile without checkpoint collision", async () => {

@@ -1276,7 +1276,7 @@ export class SwarmRouter extends EventEmitter {
       progressed = true;
       const artifacts = barrier.inputArtifacts.map((item) => this.store.workerArtifact(item.artifactId));
       const resolved = this.#resolveEffectiveLineage(barrier.inputArtifacts.map((item) => item.artifactId), { baseSha: barrier.baseSha });
-      const result = await new Integrator({ ...this.config, processRunner: this.processRunner }).integrateBarrier({ barrier, artifacts, effectiveArtifacts: resolved.artifacts, allowedBaseShas: resolved.allowedBaseShas, overlay: this.#workerOverlayContext().overlay });
+      const result = await new Integrator({ ...this.config, processRunner: this.processRunner }).integrateBarrier({ barrier, artifacts, effectiveArtifacts: resolved.artifacts, effectiveLineage: resolved.lineage, allowedBaseShas: resolved.allowedBaseShas, overlay: this.#workerOverlayContext().overlay });
       if (result.status !== "passed") {
         this.store.failIntegrationBarrier(barrier.id, result.error);
         const consumer = this.store.listTasks().find((item) => item.integrationBarrierId === barrier.id);

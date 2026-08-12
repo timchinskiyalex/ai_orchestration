@@ -44,21 +44,17 @@ export class Integrator {
     finally { closeSync(lock); try { unlinkSync(lockPath); } catch { /* lock cleanup is best effort */ } }
   }
 
-  async integrateBarrier({ barrier, artifacts, effectiveArtifacts = artifacts, allowedBaseShas = [], overlay }) {
+  async integrateBarrier({ barrier, artifacts, effectiveArtifacts = artifacts, effectiveLineage = null, allowedBaseShas = [], overlay }) {
     validateIntegrationBarrier(barrier);
     if (!Array.isArray(artifacts) || artifacts.length !== barrier.inputArtifacts.length) throw new Error("IntegrationBarrier artifacts do not match immutable inputs");
     const byId = new Map(artifacts.map((artifact) => [artifact.taskId, artifact]));
     const ordered = barrier.inputArtifacts.map((input) => { const artifact = byId.get(input.artifactId); if (!artifact || artifact.headSha !== input.headSha) throw new Error(`IntegrationBarrier input ${input.artifactId} does not match its verified identity`); return artifact; });
     ordered.forEach(validateWorkerArtifact);
     for (const artifact of ordered) await this.#verifyArtifactIntegrity(artifact);
-    const effective = this.#dependencyOrder(effectiveArtifacts);
+    const effectiveOrder = this.#effectiveOrder(effectiveArtifacts, effectiveLineage);
+    const effective = effectiveOrder.artifacts;
     const permittedBases = new Set([barrier.baseSha, ...allowedBaseShas]);
-    for (const artifact of effective) {
-      validateWorkerArtifact(artifact); await this.#verifyArtifactIntegrity(artifact);
-      const parents = (artifact.dependencies ?? []).filter((id) => effective.some((item) => item.taskId === id));
-      const expectedBase = parents.length ? effective.find((item) => item.taskId === parents[0]).headSha : null;
-      if ((parents.length > 1) || (expectedBase && artifact.baseSha !== expectedBase) || (!expectedBase && !permittedBases.has(artifact.baseSha))) throw new Error(`Barrier artifact ${artifact.taskId} has an unproved effective base`);
-    }
+    await this.#validateEffectiveBases(effective, { permittedBases, label: "Barrier artifact" });
     const root = resolve(this.runtimeDir, "integrations"); mkdirSync(root, { recursive: true }); const id = barrier.id, worktree = join(root, `barrier-${id}`), branch = `swarm/barrier/${id}`;
     try {
       const existing = await git(this.repository, ["branch", "--list", branch]); if (!existing) await exec("git", ["-C", this.repository, "worktree", "add", "-b", branch, worktree, barrier.baseSha]); else await exec("git", ["-C", this.repository, "worktree", "add", worktree, branch]);
@@ -73,17 +69,11 @@ export class Integrator {
   async #integrateUnlocked({ artifacts, overlay, baseSha, allowedBaseShas, lineage }) {
     if (!Array.isArray(artifacts) || !artifacts.length) throw new Error("Integrator requires at least one WorkerArtifact");
     artifacts.forEach(validateWorkerArtifact);
-    const sorted = this.#dependencyOrder(artifacts);
-    const byTaskId = new Map(sorted.map((artifact) => [artifact.taskId, artifact]));
-    for (const artifact of sorted) {
-      const artifactParents = (artifact.dependencies ?? []).map((id) => byTaskId.get(id)).filter(Boolean);
-      if (artifactParents.length > 1) throw new Error(`Artifact ${artifact.taskId} has multiple artifact parents; chained artifacts require one deterministic predecessor`);
-      const expectedBase = artifactParents[0]?.headSha;
-      if (expectedBase ? artifact.baseSha !== expectedBase : !new Set([baseSha, ...allowedBaseShas]).has(artifact.baseSha)) throw new Error(`Artifact ${artifact.taskId} base SHA does not match its effective lineage`);
-      await this.#verifyArtifactIntegrity(artifact);
-    }
+    const effectiveOrder = this.#effectiveOrder(artifacts, lineage);
+    const sorted = effectiveOrder.artifacts;
+    await this.#validateEffectiveBases(sorted, { permittedBases: new Set([baseSha, ...allowedBaseShas]), label: "Artifact" });
     for (let i = 0; i < sorted.length; i += 1) for (let j = 0; j < i; j += 1) {
-      const chained = (sorted[i].dependencies ?? []).includes(sorted[j].taskId);
+      const chained = this.#isEffectiveAncestor(sorted[i], sorted[j], effectiveOrder);
       if (chained) continue;
       if (intersects(sorted[i].changedPaths, sorted[j].changedPaths) || (sorted[i].changedPaths.some(sensitiveArea) && sorted[j].changedPaths.some(sensitiveArea))) {
         return this.#blocked(overlay, sorted, `CONFLICT_BLOCKED: semantic/security/migration/infrastructure path overlap between ${sorted[j].taskId} and ${sorted[i].taskId}`);
@@ -116,6 +106,67 @@ export class Integrator {
 
   #blocked(overlay, artifacts, reason, details = {}) {
     return this.#writeManifest({ id: details.id ?? randomUUID(), status: "CONFLICT_BLOCKED", reason, blockedReason: reason, branch: details.branch ?? null, worktree: details.worktree ?? null, baseSha: overlay.repository.baseSha, candidateSha: null, headSha: null, appliedArtifacts: details.applied ?? [], artifacts: artifacts.map((item) => item.taskId), verificationResults: details.verificationResults ?? [], localVerification: { status: details.verificationResults?.some((item) => item.status === "failed") ? "failed" : "not-run", commands: details.verificationResults ?? [] }, remoteCi: this.#extensionStatus("remote CI", this.integration.remoteCiExtension), pullRequest: this.#extensionStatus("pull request", this.integration.pullRequestExtension), recovery: { mode: "preserved-worktree", worktree: details.worktree ?? null, action: "Resolve the blocked condition manually; run git cherry-pick --abort if needed, then remove the candidate worktree before retrying." }, humanMergeGate: { required: true, action: "resolve conflict outside Integrator and retry" } });
+  }
+
+  #effectiveOrder(artifacts, lineage) {
+    if (!Array.isArray(artifacts) || !artifacts.length) throw new Error("Effective integration order requires artifacts");
+    const byId = new Map();
+    for (const artifact of artifacts) {
+      validateWorkerArtifact(artifact);
+      if (byId.has(artifact.taskId)) throw new Error(`Effective integration order contains duplicate artifact ${artifact.taskId}`);
+      byId.set(artifact.taskId, artifact);
+    }
+    if (!lineage) return { artifacts: this.#dependencyOrder(artifacts), lineage: null, checkpointPositions: new Map(), artifactPositions: new Map() };
+    if (!Array.isArray(lineage) || !lineage.length) throw new Error("Effective integration order requires a controller-derived lineage");
+    const seen = new Set(), ordered = [], checkpointPositions = new Map(), artifactPositions = new Map();
+    for (let index = 0; index < lineage.length; index += 1) {
+      const node = lineage[index];
+      if (!node || !["artifact", "checkpoint"].includes(node.kind) || typeof node.id !== "string" || !node.id || !/^[a-f0-9]{40,64}$/i.test(node.sha ?? "")) throw new Error("Effective integration lineage contains an invalid node");
+      const identity = `${node.kind}:${node.id}`;
+      if (seen.has(identity)) throw new Error(`Effective integration lineage contains duplicate ${identity}`);
+      seen.add(identity);
+      if (node.kind === "checkpoint") {
+        if (checkpointPositions.has(node.sha)) throw new Error(`Effective integration lineage contains duplicate checkpoint output ${node.sha}`);
+        checkpointPositions.set(node.sha, index);
+        continue;
+      }
+      const artifact = byId.get(node.id);
+      if (!artifact || artifact.headSha !== node.sha) throw new Error(`Effective integration lineage artifact ${node.id} is missing or inconsistent`);
+      ordered.push(artifact); artifactPositions.set(node.id, index);
+    }
+    if (ordered.length !== byId.size) throw new Error("Effective integration lineage is missing artifacts");
+    for (const artifact of ordered) {
+      const position = artifactPositions.get(artifact.taskId);
+      for (const dependency of artifact.dependencies ?? []) {
+        const dependencyPosition = artifactPositions.get(dependency);
+        if (dependencyPosition === undefined) throw new Error(`Effective integration lineage is missing dependency ${dependency} for ${artifact.taskId}`);
+        if (dependencyPosition >= position) throw new Error(`Effective integration lineage is not topological for ${artifact.taskId}`);
+      }
+      const checkpointPosition = checkpointPositions.get(artifact.baseSha);
+      if (checkpointPosition !== undefined && checkpointPosition >= position) throw new Error(`Effective integration lineage applies ${artifact.taskId} before its base checkpoint`);
+    }
+    return { artifacts: ordered, lineage, checkpointPositions, artifactPositions };
+  }
+
+  async #validateEffectiveBases(artifacts, { permittedBases, label }) {
+    const byTaskId = new Map(artifacts.map((artifact) => [artifact.taskId, artifact]));
+    for (const artifact of artifacts) {
+      validateWorkerArtifact(artifact);
+      const dependencies = artifact.dependencies ?? [];
+      const artifactParents = dependencies.map((id) => byTaskId.get(id));
+      if (artifactParents.some((parent) => !parent)) throw new Error(`${label} ${artifact.taskId} dependency is missing from its effective lineage`);
+      if (artifactParents.length > 1) throw new Error(`${label} ${artifact.taskId} has multiple artifact parents; chained artifacts require one deterministic predecessor`);
+      const expectedBase = artifactParents[0]?.headSha;
+      if (expectedBase ? artifact.baseSha !== expectedBase : !permittedBases.has(artifact.baseSha)) throw new Error(`${label} ${artifact.taskId} has an unproved effective base`);
+      await this.#verifyArtifactIntegrity(artifact);
+    }
+  }
+
+  #isEffectiveAncestor(later, earlier, effectiveOrder) {
+    if ((later.dependencies ?? []).includes(earlier.taskId)) return true;
+    const checkpointPosition = effectiveOrder.checkpointPositions.get(later.baseSha);
+    if (checkpointPosition === undefined || !effectiveOrder.lineage) return false;
+    return effectiveOrder.lineage.findIndex((node) => node.kind === "artifact" && node.id === earlier.taskId) < checkpointPosition;
   }
 
   #dependencyOrder(artifacts) {
