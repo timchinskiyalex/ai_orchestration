@@ -1108,7 +1108,10 @@ export class SwarmRouter extends EventEmitter {
     const batchInput = { ...(parsedPlan ?? {}), schemaVersion: 1, kind: "PlanBatch", id: scopedReplan?.replacementPlanBatchId ?? scopedReplan?.id ?? randomUUID(), deliveryRunId: planRunId, blueprintId: stored.blueprint.blueprintId, wave: controllerWave, basedOnCheckpointSha: controllerBase, createdAt: new Date().toISOString() };
     const plan = validatePlan(normalizePlannerPlanForProject(batchInput, scopedReplan ? [] : this.config.project.productRoots), { maxTasks: this.config.router.maxPlanTasks, productRoots: scopedReplan ? [] : this.config.project.productRoots, blueprint: stored.blueprint, requirePlanBatch: true, allowPartialRequirementCoverage: Boolean(scopedReplan), recovery: Boolean(scopedReplan) });
     if (plan.deliveryRunId !== planRunId) throw new Error("PlanBatch deliveryRunId must match Planner delivery run");
-    if (existingBatches.length && !scopedReplan) {
+    if (scopedReplan) {
+      // Scoped recovery receives its controller-owned wave and baseline above.
+      // It deliberately does not satisfy the greenfield wave-one invariant.
+    } else if (existingBatches.length) {
       const checkpoint = this.store.currentCheckpoint(plan.deliveryRunId);
       if (!checkpoint || plan.wave !== checkpoint.wave + 1 || plan.basedOnCheckpointSha !== checkpoint.outputSha) throw new Error("Next PlanBatch requires successful reconciliation of the current verified checkpoint");
     } else if (plan.wave !== 1 || plan.basedOnCheckpointSha !== gitSha(this.config.repository, this.config.baseRef)) {

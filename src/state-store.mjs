@@ -662,7 +662,9 @@ export class StateStore {
         const replan = this.scopedReplan(replanId);
         if (!replan || !["planning", "pending"].includes(replan.status)) throw new Error(`Scoped replan ${replanId} is not materializable`);
         this.db.prepare("UPDATE scoped_replans SET replacement_plan_batch_id = ?, status = 'materialized', updated_at = ? WHERE id = ? AND replacement_plan_batch_id IS NULL").run(batch.id, now(), replanId);
-        for (const item of replacements) this.db.prepare("INSERT OR IGNORE INTO task_replacements(replan_id,old_task_id,replacement_task_id,kind,created_at) VALUES (?,?,?,?,?)").run(replanId, item.oldTaskId, item.replacementTaskId ?? null, item.kind ?? "task", now());
+        for (const item of replacements) this.db.prepare(`INSERT INTO task_replacements(replan_id,old_task_id,replacement_task_id,kind,created_at) VALUES (?,?,?,?,?)
+          ON CONFLICT(replan_id,old_task_id) DO UPDATE SET replacement_task_id = excluded.replacement_task_id, kind = excluded.kind
+          WHERE task_replacements.replacement_task_id IS NULL`).run(replanId, item.oldTaskId, item.replacementTaskId ?? null, item.kind ?? "task", now());
         this.#insertEvent(replan.plannerTaskId, "scoped-replan/materialized", { replanId, replacementPlanBatchId: batch.id, replacementTaskIds: tasks.map((task) => task.id) });
       }
       this.#insertEvent(null, "plan-batch/persisted", { planBatchId: batch.id, deliveryRunId: batch.deliveryRunId, wave: batch.wave, basedOnCheckpointSha: batch.basedOnCheckpointSha });
