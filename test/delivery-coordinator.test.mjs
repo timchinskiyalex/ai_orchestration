@@ -57,6 +57,7 @@ function fakeRemote(calls) {
     remoteGitAdapter: { async pushCandidate({ sha }) { calls.push += 1; return { status: "pushed", verifiedSha: sha }; } },
     pullRequestAdapter: { async ensurePullRequest({ sha }) { calls.pr += 1; return { status: "open", number: 1, url: "https://example.test/pr/1", headSha: sha }; } },
     remoteCiAdapter: { async waitForChecks() { calls.ci += 1; return { status: "passed", checkRuns: [{ name: "test", status: "completed", conclusion: "success" }] }; } },
+    productEvidenceAdapter: { async verify({ candidate }) { return { status: "pass", candidateSha: candidate.sha, reference: "deterministic-product-check" }; } },
     mergeAdapter: { async merge() { calls.merge += 1; return { status: "merged", mainSha: "b".repeat(40), mergeSha: "b".repeat(40), targetVerified: true }; } }
   };
 }

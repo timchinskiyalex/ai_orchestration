@@ -20,6 +20,7 @@ import { GitHubCiAdapter, GitHubMergeAdapter, GitHubPullRequestAdapter, RemoteAd
 import { runManagedProcess } from "./managed-process-runner.mjs";
 import { provisionDeterministicScaffold } from "./deterministic-scaffold.mjs";
 import { specificationBlockers } from "./product-blueprint.mjs";
+import { PRODUCT_ACCEPTANCE_KIND, PRODUCT_ACCEPTANCE_SCHEMA_VERSION } from "./final-acceptance.mjs";
 const gitSha = (repository, ref) => execFileSync("git", ["-C", repository, "rev-parse", "--verify", `${ref}^{commit}`], { encoding: "utf8" }).trim();
 
 export function formatTaskPrompt({ task, worktree, project, overlaySnapshot = null, documentationAvailable = true }) {
@@ -228,6 +229,7 @@ export class SwarmRouter extends EventEmitter {
       qualityReports: reports.map(({ taskId, path, report }) => ({ taskId, path, verdict: report.verdict, findings: report.findings.length })),
       securityReports: securityReports.map(({ taskId, path, report }) => ({ taskId, path, verdict: report.verdict, findings: report.findings.length })),
       deliveryRun: this.store.currentDeliveryRun(),
+      finalAcceptance: this.store.currentDeliveryRun() ? this.store.productAcceptanceForRun(this.store.currentDeliveryRun().id) : null,
       lifecycle: this.store.recentEvents(20)
     };
   }
@@ -303,9 +305,11 @@ export class SwarmRouter extends EventEmitter {
     return result;
   }
 
-  async publishCandidate(integration, { confirmRemotePush = false, remoteGitAdapter = null, pullRequestAdapter = null, remoteCiAdapter = null, mergeAdapter = null } = {}) {
+  async publishCandidate(integration, { confirmRemotePush = false, remoteGitAdapter = null, pullRequestAdapter = null, remoteCiAdapter = null, mergeAdapter = null, acceptanceReportId = null } = {}) {
     const manifest = integration?.manifest;
     if (!manifest || !["candidate_ready", "awaiting_human_merge"].includes(manifest.status) || manifest.localVerification?.status !== "passed") return { terminalState: "conflict_blocked", status: "conflict_blocked", reason: manifest?.blockedReason ?? "No locally verified candidate integration manifest" };
+    const run = this.activeDeliveryRunId ? this.store.deliveryRun(this.activeDeliveryRunId) : null;
+    if (!run || !integration.path || this.store.integrationManifest(integration.path)?.id !== manifest.id || !run.blueprintId || !run.candidate || run.candidate.sha.toLowerCase() !== manifest.candidateSha?.toLowerCase()) return { terminalState: "conflict_blocked", status: "conflict_blocked", reason: "Publication requires the exact persisted delivery run, blueprint, candidate, and integration manifest." };
     const remote = this.config.remote ?? {};
     const autonomy = { mode: "autonomous", autoPush: true, autoCreatePullRequest: true, autoMerge: true, autoRemediate: true, ...(this.config.autonomy ?? {}) };
     const autonomous = this.isAutonomous();
@@ -314,8 +318,6 @@ export class SwarmRouter extends EventEmitter {
     const candidate = { branch: manifest.branch, sha: manifest.candidateSha, base: this.config.baseRef };
     if (!candidate.branch || !/^[0-9a-f]{40}$/i.test(candidate.sha ?? "")) return { terminalState: "conflict_blocked", status: "conflict_blocked", reason: "Integration manifest does not contain an exact candidate branch and SHA." };
     const checkpoint = (stage, extra = {}) => {
-      const run = this.activeDeliveryRunId ? this.store.deliveryRun(this.activeDeliveryRunId) : null;
-      if (!run) return;
       if (run.candidate && (run.candidate.branch !== candidate.branch || run.candidate.sha.toLowerCase() !== candidate.sha.toLowerCase())) throw new Error("Persisted delivery candidate identity does not match the integration manifest.");
       this.store.updateDeliveryRun(run.id, { state: "running", integrationPath: integration.path ?? run.integrationPath, candidate, publicationCheckpoint: { stage, candidate, updatedAt: new Date().toISOString(), ...extra } });
     };
@@ -360,12 +362,14 @@ export class SwarmRouter extends EventEmitter {
         const adapter = remoteCiAdapter ?? new GitHubCiAdapter({ repository: this.config.repository, timeoutMs: remote.ciTimeoutMs, pollIntervalMs: remote.ciPollIntervalMs, requiredContexts: remote.requiredCiContexts });
         return typeof adapter.waitForChecks === "function" ? adapter.waitForChecks({ pullRequest, candidate }) : adapter.verify(candidate);
       } });
-      if (remote.requireCi && remoteCi.status !== "passed") return { terminalState: "blocked_ci", status: "blocked_ci", candidate, remotePush, pullRequest, remoteCi, reason: remoteCi.reason ?? "Required remote CI is not green.", recovery: { action: "Read the persisted CI failure summary. A CI-only failure has no safely scoped source remediation artifact, so the candidate is retained without a forced merge." } };
+      if (remoteCi.status !== "passed") return { terminalState: "blocked_ci", status: "blocked_ci", candidate, remotePush, pullRequest, remoteCi: { ...remoteCi, candidateSha: candidate.sha }, reason: remoteCi.reason ?? "Final merge requires green remote CI for the exact candidate SHA." };
       if (!autonomy.autoMerge && !confirmRemotePush) return { terminalState: "completed_candidate_ready", status: "completed_candidate_ready", candidate, remotePush, pullRequest, remoteCi };
+      const acceptance = acceptanceReportId ? this.store.productAcceptanceReport(acceptanceReportId) : null;
+      if (!acceptance || !acceptance.passing || acceptance.report.deliveryRunId !== run.id || acceptance.report.integrationManifestId !== manifest.id || acceptance.report.candidateSha.toLowerCase() !== candidate.sha.toLowerCase()) return { terminalState: "awaiting_final_acceptance", status: "awaiting_final_acceptance", candidate, remotePush, pullRequest, remoteCi: { ...remoteCi, candidateSha: candidate.sha } };
       const mergeKey = `merge:${pullRequest.number}:${candidate.sha}`;
       const merge = await runAction({ key: mergeKey, kind: "pull-request-merge", stage: "merge", action: () => (mergeAdapter ?? new GitHubMergeAdapter({ repository: this.config.repository, mergeMethod: remote.mergeMethod })).merge({ pullRequest, candidate, base: candidate.base, idempotencyKey: mergeKey }) });
       if (merge.status !== "merged" || !merge.mainSha || merge.targetVerified !== true) throw new RemoteAdapterError("merge_verify_failed", "Merge adapter did not verify the target branch after merge.");
-      return { terminalState: "completed_merged", status: "completed_merged", candidate, remotePush, pullRequest, remoteCi, merge };
+      return { terminalState: "merge_verified", status: "merge_verified", candidate, remotePush, pullRequest, remoteCi: { ...remoteCi, candidateSha: candidate.sha }, merge, acceptanceReportId };
     } catch (error) {
       return failure(error, error?.code?.startsWith("ci") ? "ci" : error?.code?.startsWith("pr") ? "pull-request" : error?.code?.startsWith("merge") || error?.code === "branch_protection" ? "merge" : "push");
     }
@@ -819,6 +823,23 @@ export class SwarmRouter extends EventEmitter {
       }
     }
     throw new Error("Planner validation retry loop terminated unexpectedly");
+  }
+
+  buildProductAcceptanceReport({ integration, remoteCi, productEvidence = null }) {
+    const manifest = integration?.manifest; const run = this.activeDeliveryRunId ? this.store.deliveryRun(this.activeDeliveryRunId) : null; const stored = run?.blueprintId ? this.store.productBlueprint(run.blueprintId) : null;
+    if (!run || !stored || !manifest || !integration.path || run.candidate?.sha?.toLowerCase() !== manifest.candidateSha?.toLowerCase()) throw new Error("Final acceptance requires persisted run identity");
+    const applied = new Set(manifest.appliedArtifacts ?? []); const tasks = this.list().filter((task) => task.deliveryRunId === run.id);
+    const evidence = (kind, status, reference) => ({ kind, status, reference, candidateSha: manifest.candidateSha });
+    const product = productEvidence?.status === "pass" && productEvidence.candidateSha?.toLowerCase() === manifest.candidateSha.toLowerCase() ? evidence("product-e2e", "pass", productEvidence.reference ?? "product-e2e-adapter") : evidence("product-e2e", "not_verified", productEvidence?.reference ?? "product-e2e-unavailable");
+    const resultStatus = (requirementId) => {
+      const writers = tasks.filter((task) => task.requirementIds.includes(requirementId) && ENGINEERING_DOMAINS.has(task.role) && !["qa", "security"].includes(task.role)); const writerIds = new Set(writers.map((task) => task.id));
+      const artifacts = writers.map((task) => this.store.workerArtifact(task.id)).filter(Boolean); const linked = artifacts.length && artifacts.every((artifact) => applied.has(artifact.taskId));
+      const qa = tasks.filter((task) => task.role === "qa" && task.requirementIds.includes(requirementId)).map((task) => this.store.qualityReport(task.id)).filter(Boolean); const security = tasks.filter((task) => task.role === "security" && task.requirementIds.includes(requirementId)).map((task) => this.store.securityReport(task.id)).filter(Boolean);
+      return linked && qa.length && security.length && qa.every((item) => writerIds.has(item.writerTaskId) && item.report.verdict === "pass") && security.every((item) => writerIds.has(item.writerTaskId) && item.report.verdict === "pass") ? "pass" : linked ? "partial" : "missing";
+    };
+    const report = { schemaVersion: PRODUCT_ACCEPTANCE_SCHEMA_VERSION, kind: PRODUCT_ACCEPTANCE_KIND, deliveryRunId: run.id, blueprintId: stored.blueprint.blueprintId, blueprintDigest: stored.digest, documentSetDigest: stored.documentSetDigest, integrationManifestPath: integration.path, integrationManifestId: manifest.id, candidateSha: manifest.candidateSha, generatedAt: new Date().toISOString(), evidence: { integration: evidence("integration-manifest", manifest.localVerification?.status === "passed" ? "pass" : "missing", integration.path), qa: evidence("qa-lineage", "pass", "quality_reports"), security: evidence("security-lineage", "pass", "security_reports"), productE2e: product, ci: evidence("remote-ci", remoteCi?.status === "passed" && remoteCi.candidateSha?.toLowerCase() === manifest.candidateSha.toLowerCase() ? "pass" : "not_verified", "remote-ci") }, results: [] };
+    for (const requirement of stored.blueprint.requirements) { const status = resultStatus(requirement.requirementId); const lineage = evidence("artifact-lineage", status, `requirement:${requirement.requirementId}`); report.results.push({ requirementId: requirement.requirementId, criterionId: null, status, evidence: [lineage] }); for (const criterion of requirement.acceptanceCriteria) report.results.push({ requirementId: requirement.requirementId, criterionId: criterion.criterionId, status: product.status === "pass" ? status : product.status, evidence: [lineage, product] }); }
+    return report;
   }
 
   async #finalizeWriterWithRepair(client, task, threadId, worktree, branch, initialOverlayContext, initialResultText) {
