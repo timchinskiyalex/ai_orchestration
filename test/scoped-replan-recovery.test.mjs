@@ -22,7 +22,7 @@ const waitFor = async (predicate, label) => {
 function blueprint(root) {
   const path = "requirements.md";
   const source = { documentId: documentIdForPath(path), path, sha256: digest("Scoped recovery.\n") };
-  const requirement = (id) => ({ requirementId: id, type: "functional", priority: "must", mandatory: true, description: id, sourceRefs: [{ documentId: source.documentId, locator: "# Recovery", excerptDigest: digest("Scoped recovery.") }], acceptanceCriteria: [{ criterionId: `${id}-check`, description: `${id} works`, verificationHint: "npm test" }], constraints: [] });
+  const requirement = (id) => ({ requirementId: id, type: "functional", priority: "must", mandatory: true, description: id, sourceRefs: [{ documentId: source.documentId, startLine: 1, endLine: 1, excerptDigest: digest("Scoped recovery.") }], acceptanceCriteria: [{ criterionId: `${id}-check`, description: `${id} works`, verificationHint: "npm test" }], constraints: [] });
   return { schemaVersion: 1, kind: "ProductBlueprint", blueprintId: "pb-scoped", createdAt: "2026-01-01T00:00:00.000Z", documentSetDigest: documentSetDigest([source]), sourceDocuments: [source], requirements: [requirement("req-a"), requirement("req-b"), requirement("req-c")], nfrs: [], modules: [], integrations: [], dataModel: {}, constraints: [], assumptions: [], decisions: [], unresolvedQuestions: [], contradictions: [] };
 }
 

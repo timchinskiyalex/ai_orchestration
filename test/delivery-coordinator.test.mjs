@@ -55,6 +55,16 @@ class SourceBlockedClient extends DeliveryClient {
     return super.readThread({ threadId });
   }
 }
+class LegacySourceRefClient extends DeliveryClient {
+  async readThread({ threadId }) {
+    const thread = this.threads.get(threadId);
+    if (/^Bootstrap/.test(thread.goal)) {
+      const blueprint = fakeBlueprint(thread.cwd); blueprint.requirements[0].sourceRefs = [{ documentId: blueprint.sourceDocuments[0].documentId, locator: "# Requirement", excerptDigest: "a".repeat(64) }];
+      return { thread: { turns: [{ id: `turn-${threadId}`, items: [{ type: "agentMessage", text: `\`\`\`json\n${JSON.stringify(blueprint)}\n\`\`\`` }] }] } };
+    }
+    return super.readThread({ threadId });
+  }
+}
 function setup(remote = true) {
   const root = mkdtempSync(join(tmpdir(), "delivery-coordinator-")); git(root, ["init", "-b", "main"]); mkdirSync(join(root, "src")); mkdirSync(join(root, "test")); const source = join(root, "requirements"); mkdirSync(source); writeFileSync(join(source, "requirements.md"), "# Requirement\nFix value.\n"); writeFileSync(join(root, "package.json"), JSON.stringify({ packageManager: "npm@10", scripts: { test: "node --test" } })); writeFileSync(join(root, "package-lock.json"), "{}"); writeFileSync(join(root, "src", "value.mjs"), "export const value = 1;\n"); writeFileSync(join(root, "test", "value.test.mjs"), "import test from 'node:test'; import assert from 'node:assert/strict'; import { value } from '../src/value.mjs'; test('value',()=>assert.equal(value,2));\n"); git(root, ["add", "."]); git(root, ["-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "base"]);
   const roles = Object.fromEntries(["bootstrap", "planner", "backend", "frontend", "database", "qa", "security", "devops"].map((role) => [role, { sandbox: role === "backend" ? "workspace-write" : "read-only", approvalPolicy: "never", tokenBudget: 200, usesWorktree: role === "backend" }]));
@@ -103,6 +113,15 @@ test("only a persisted source-specification blocker yields blocked_specification
   try {
     const final = await coordinator.begin({ source: fixture.source, ...fakeRemote(calls) });
     assert.equal(final.state, "blocked_specification"); assert.deepEqual(calls, { push: 0, pr: 0, ci: 0, merge: 0 });
+  } finally { router.close(); rmSync(fixture.root, { recursive: true, force: true }); }
+});
+
+test("legacy SourceRef fails closed as blocked_specification before autonomous planning", async () => {
+  const fixture = setup(); fixture.config.appServerClientFactory = () => new LegacySourceRefClient(); const router = new SwarmRouter(fixture.config); const coordinator = new DeliveryCoordinator(router);
+  try {
+    const final = await coordinator.begin({ source: fixture.source, ...fakeRemote({ push: 0, pr: 0, ci: 0, merge: 0 }) });
+    const bootstrap = router.list().find((task) => task.role === "bootstrap");
+    assert.equal(final.state, "blocked_specification"); assert.equal(bootstrap.status, "blocked_specification"); assert.match(bootstrap.error, /source_provenance/); assert.equal(router.list().some((task) => task.role === "planner"), false);
   } finally { router.close(); rmSync(fixture.root, { recursive: true, force: true }); }
 });
 

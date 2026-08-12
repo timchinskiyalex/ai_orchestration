@@ -13,8 +13,8 @@ export function extractOrchestrationJson(text) {
   catch { fail("agent response must contain one valid JSON object in a fenced block"); }
 }
 
-export function validateBootstrap(value, { sourceDocuments = null } = {}) {
-  try { return resolveDeclaredPolicyDefaults(validateProductBlueprint(value, { sourceDocuments })); }
+export function validateBootstrap(value, { sourceDocuments = null, sourceResolver = null } = {}) {
+  try { return resolveDeclaredPolicyDefaults(validateProductBlueprint(value, { sourceDocuments, sourceResolver })); }
   catch (error) { fail(error.message.replace(/^Invalid ProductBlueprint: /, "")); }
 }
 
