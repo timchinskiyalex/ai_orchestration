@@ -12,8 +12,10 @@ function config(overrides = {}) {
 function load(value) { const root = mkdtempSync(join(tmpdir(), "config-validation-")); const path = join(root, "config.json"); writeFileSync(path, JSON.stringify(value)); try { return loadConfig(path); } finally { rmSync(root, { recursive: true, force: true }); } }
 test("config rejects unsafe role capabilities and project paths", () => {
   assert.throws(() => load(config({ roles: { ...config().roles, backend: { ...config().roles.backend, usesWorktree: false } } })), /workspace-write requires/);
-  assert.throws(() => load(config({ project: { documentationDir: "../escape", generatedDir: "docs/out" } })), /normalized relative/);
-  assert.throws(() => load(config({ project: { documentationDir: "docs/in", generatedDir: "C:/escape" } })), /normalized relative/);
+  for (const path of ["../escape", "/tmp/x", "C:\\escape", "C:/escape", "\\\\server\\share\\x", "\\escape", "C:escape"]) assert.throws(() => load(config({ project: { documentationDir: "docs/in", generatedDir: path } })), /normalized relative/, path);
+  const accepted = load(config({ project: { documentationDir: "docs/in", generatedDir: "controller/output", productRoots: [{ id: "frontend", path: "apps/frontend", adapter: "next-node" }] } }));
+  assert.equal(accepted.project.generatedDir, "controller/output");
+  assert.equal(accepted.project.productRoots[0].path, "apps/frontend");
   assert.throws(() => load(config({ roles: { ...config().roles, qa: { ...config().roles.qa, approvalPolicy: "on-request" } } })), /approvalPolicy/);
 });
 

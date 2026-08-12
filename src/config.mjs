@@ -64,7 +64,7 @@ export function loadConfig(configPath) {
   config.remote.ciPollIntervalMs ??= 10000;
   config.remote.mergeMethod ??= "merge";
   const safeProjectPath = (name, value) => {
-    if (typeof value !== "string" || !value.trim() || isAbsolute(value) || value.split(/[\\/]/).some((part) => part === "." || part === "..")) throw new Error(`${name} must be a normalized relative path inside the repository`);
+    if (typeof value !== "string" || !value.trim() || isAbsolute(value) || /^(?:[A-Za-z]:|[\\/]+)/.test(value) || value.split(/[\\/]/).some((part) => part === "." || part === "..")) throw new Error(`${name} must be a normalized relative path inside the repository`);
     return value.replace(/\\/g, "/").replace(/\/+$/, "");
   };
   config.project.documentationDir = safeProjectPath("project.documentationDir", config.project.documentationDir);

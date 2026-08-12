@@ -7,6 +7,7 @@ import { execFileSync } from "node:child_process";
 import { generateProjectOverlay } from "../src/project-overlay.mjs";
 import { WorktreeFinalizer } from "../src/worktree-finalizer.mjs";
 import { Integrator } from "../src/integrator.mjs";
+import { RUNTIME_GIT_IDENTITY } from "../src/runtime-git-identity.mjs";
 
 const git = (cwd, args) => execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8" }).trim();
 
@@ -39,6 +40,44 @@ test("finalizer produces a clean, committed artifact and integrator creates a ca
     assert.equal(git(integration.manifest.worktree, ["status", "--porcelain"]), "");
     execFileSync(process.execPath, ["--test"], { cwd: integration.manifest.worktree, stdio: "pipe" });
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("integration and barrier cherry-picks create runtime-identified commits without global Git identity", async () => {
+  const root = mkdtempSync(join(tmpdir(), "orchestration-runtime-identity-"));
+  const savedGlobal = process.env.GIT_CONFIG_GLOBAL;
+  const savedNoSystem = process.env.GIT_CONFIG_NOSYSTEM;
+  try {
+    git(root, ["init", "-b", "main"]);
+    writeFileSync(join(root, "package.json"), JSON.stringify({ packageManager: "npm@10", scripts: {} }), "utf8");
+    writeFileSync(join(root, "package-lock.json"), "{}", "utf8");
+    mkdirSync(join(root, "src"));
+    writeFileSync(join(root, "src", "base.mjs"), "export const base = true;\n", "utf8");
+    git(root, ["add", "."]); git(root, ["-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "base"]);
+    process.env.GIT_CONFIG_GLOBAL = join(root, "no-global-gitconfig");
+    process.env.GIT_CONFIG_NOSYSTEM = "1";
+    assert.throws(() => git(root, ["config", "--local", "--get", "user.name"]));
+    const { overlay, path } = await generateProjectOverlay({ repository: root, baseRef: "main" });
+    const finalizer = new WorktreeFinalizer({ repository: root, generatedDir: "docs/orchestration-generated" });
+    const artifacts = [];
+    for (const id of ["writer-a", "writer-b"]) {
+      const worktree = join(root, id);
+      git(root, ["worktree", "add", "-b", `swarm/${id}`, worktree, overlay.repository.baseSha]);
+      writeFileSync(join(worktree, "src", `${id}.mjs`), `export const ${id.replace("-", "_")} = true;\n`, "utf8");
+      artifacts.push((await finalizer.finalize({ task: { id, role: "backend", allowedPaths: ["src"], dependencies: [] }, worktree, branch: `swarm/${id}`, overlay, overlayPath: path })).artifact);
+    }
+    const integrator = new Integrator({ repository: root, runtimeDir: join(root, "runtime"), generatedDir: "docs/orchestration-generated" });
+    const integration = await integrator.integrate({ artifacts, overlay });
+    assert.equal(integration.manifest.status, "candidate_ready");
+    const barrier = { schemaVersion: 1, kind: "IntegrationBarrier", id: "identity-barrier", deliveryRunId: "run-identity", blueprintId: "blueprint-identity", wave: 1, baseSha: overlay.repository.baseSha, inputArtifacts: artifacts.map(({ taskId, headSha }) => ({ artifactId: taskId, headSha })), status: "pending", createdAt: "2026-01-01T00:00:00.000Z" };
+    const barrierResult = await integrator.integrateBarrier({ barrier, artifacts, overlay });
+    assert.equal(barrierResult.status, "passed");
+    const identity = `${RUNTIME_GIT_IDENTITY.name} <${RUNTIME_GIT_IDENTITY.email}>|${RUNTIME_GIT_IDENTITY.name} <${RUNTIME_GIT_IDENTITY.email}>`;
+    for (const worktree of [integration.manifest.worktree, barrierResult.worktree]) assert.equal(git(worktree, ["show", "-s", "--format=%an <%ae>|%cn <%ce>", "HEAD"]), identity);
+  } finally {
+    if (savedGlobal === undefined) delete process.env.GIT_CONFIG_GLOBAL; else process.env.GIT_CONFIG_GLOBAL = savedGlobal;
+    if (savedNoSystem === undefined) delete process.env.GIT_CONFIG_NOSYSTEM; else process.env.GIT_CONFIG_NOSYSTEM = savedNoSystem;
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("integrator deterministically records blocked overlapping artifacts for recovery", async () => {

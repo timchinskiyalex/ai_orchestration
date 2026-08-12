@@ -6,6 +6,7 @@ import { promisify } from "node:util";
 import { commandCwd, commandsForPaths } from "./project-overlay.mjs";
 import { runManagedProcess } from "./managed-process-runner.mjs";
 import { validateWorkerArtifactContract } from "./workflow-contract.mjs";
+import { RUNTIME_GIT_IDENTITY, runtimeGitIdentityArgs } from "./runtime-git-identity.mjs";
 
 const exec = promisify(execFile);
 const ARTIFACT_VERSION = 1;
@@ -26,7 +27,7 @@ function pathAllowed(path, task, overlay, { autonomous = true } = {}) {
 }
 
 export class WorktreeFinalizer {
-  constructor({ repository, generatedDir, autonomy = {}, runtimeIdentity = { name: "Codex Swarm Runtime", email: "codex-swarm-runtime@localhost" }, processRunner = runManagedProcess }) {
+  constructor({ repository, generatedDir, autonomy = {}, runtimeIdentity = RUNTIME_GIT_IDENTITY, processRunner = runManagedProcess }) {
     this.repository = repository;
     this.generatedDir = generatedDir;
     this.autonomous = autonomy.mode !== "manual";
@@ -75,7 +76,7 @@ export class WorktreeFinalizer {
     if (!stagedPaths.length) throw new Error("Finalizer staging produced no changed paths");
     const diff = await git(worktree, ["diff", "--cached", "--binary", "--no-ext-diff", artifactBaseSha, "--"]);
     if (!diff) throw new Error("Finalizer staging produced no diff");
-    await exec("git", ["-C", worktree, "-c", `user.name=${this.runtimeIdentity.name}`, "-c", `user.email=${this.runtimeIdentity.email}`, "commit", "-m", `swarm: finalize ${task.id}`]);
+    await exec("git", ["-C", worktree, ...runtimeGitIdentityArgs(this.runtimeIdentity), "commit", "-m", `swarm: finalize ${task.id}`]);
     const [headSha, treeSha, clean] = await Promise.all([
       git(worktree, ["rev-parse", "HEAD"]), git(worktree, ["rev-parse", "HEAD^{tree}"]), gitRaw(worktree, ["status", "--porcelain=v1", "-z", "--untracked-files=all"])
     ]);

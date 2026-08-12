@@ -8,6 +8,7 @@ import { validateWorkerArtifact } from "./worktree-finalizer.mjs";
 import { commandCwd, commandsForPaths } from "./project-overlay.mjs";
 import { runManagedProcess } from "./managed-process-runner.mjs";
 import { validateIntegrationBarrier } from "./workflow-contract.mjs";
+import { RUNTIME_GIT_IDENTITY, runtimeGitIdentityArgs } from "./runtime-git-identity.mjs";
 
 const exec = promisify(execFile);
 const toPosix = (value) => value.replace(/\\/g, "/");
@@ -19,7 +20,7 @@ const sensitiveArea = (path) => /(^|\/)(migrations?|infra|terraform|k8s|helm|\.g
 const checksum = (value) => createHash("sha256").update(value).digest("hex");
 
 export class Integrator {
-  constructor({ repository, runtimeDir, generatedDir, project = {}, integration = {}, processRunner = runManagedProcess }) {
+  constructor({ repository, runtimeDir, generatedDir, project = {}, integration = {}, runtimeIdentity = RUNTIME_GIT_IDENTITY, processRunner = runManagedProcess }) {
     this.repository = repository;
     this.runtimeDir = runtimeDir;
     // Router owns generatedDir under the project contract, while direct callers
@@ -28,6 +29,7 @@ export class Integrator {
     this.generatedDir = generatedDir ?? project.generatedDir;
     if (!this.generatedDir) throw new Error("Integrator requires project.generatedDir");
     this.integration = integration;
+    this.runtimeIdentity = runtimeIdentity;
     this.processRunner = processRunner;
   }
 
@@ -67,7 +69,7 @@ export class Integrator {
       const existing = await git(this.repository, ["branch", "--list", branch]);
       if (!existing) await exec("git", ["-C", this.repository, "worktree", "add", "-b", branch, worktree, barrier.baseSha]);
       else await exec("git", ["-C", this.repository, "worktree", "add", worktree, branch]);
-      for (const artifact of ordered) await git(worktree, ["cherry-pick", artifact.headSha]);
+      for (const artifact of ordered) await this.#gitWithRuntimeIdentity(worktree, ["cherry-pick", artifact.headSha]);
       const verificationResults = [];
       const verificationPlan = commandsForPaths(overlay, (overlay.components ?? []).filter((component) => component.state === "scaffolded").map((component) => component.root));
       if (verificationPlan.missing.length) throw new Error("Barrier verification unavailable for a scaffolded component");
@@ -113,7 +115,7 @@ export class Integrator {
     const applied = [];
     try {
       for (const artifact of sorted) {
-        try { await git(worktree, ["cherry-pick", artifact.headSha]); applied.push(artifact.taskId); }
+        try { await this.#gitWithRuntimeIdentity(worktree, ["cherry-pick", artifact.headSha]); applied.push(artifact.taskId); }
         catch { await git(worktree, ["cherry-pick", "--abort"]); return this.#blocked(overlay, sorted, `CONFLICT_BLOCKED: cherry-pick failed for ${artifact.taskId}`, { id, branch, worktree, applied }); }
       }
       const verificationResults = [];
@@ -143,6 +145,10 @@ export class Integrator {
       for (const id of ready) { ordered.push(byId.get(id)); pending.delete(id); }
     }
     return ordered;
+  }
+
+  async #gitWithRuntimeIdentity(cwd, args) {
+    return git(cwd, [...runtimeGitIdentityArgs(this.runtimeIdentity), ...args]);
   }
 
   async #verifyArtifactIntegrity(artifact) {
