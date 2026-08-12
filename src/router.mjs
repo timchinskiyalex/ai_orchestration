@@ -19,7 +19,7 @@ import { validateSecurityGateReport } from "./security-gate.mjs";
 import { GitHubCiAdapter, GitHubMergeAdapter, GitHubPullRequestAdapter, RemoteAdapterError, RemoteCiAdapter, RemoteGitAdapter } from "./remote-adapters.mjs";
 import { runManagedProcess } from "./managed-process-runner.mjs";
 import { provisionDeterministicScaffold } from "./deterministic-scaffold.mjs";
-import { specificationBlockers } from "./product-blueprint.mjs";
+import { specificationBlockers, validateControllerAuthorizedBlueprint } from "./product-blueprint.mjs";
 import { createImportedSourceResolver } from "./source-evidence.mjs";
 import { PRODUCT_ACCEPTANCE_KIND, PRODUCT_ACCEPTANCE_SCHEMA_VERSION, productAcceptancePasses } from "./final-acceptance.mjs";
 
@@ -636,7 +636,7 @@ export class SwarmRouter extends EventEmitter {
           this.store.setResultPath(task.id, resultPath);
         } else {
         const sourceResolver = this.#sourceEvidenceResolver();
-        const blueprint = validateBootstrap(extractOrchestrationJson(resultText), { sourceResolver });
+        const blueprint = validateBootstrap(extractOrchestrationJson(resultText), { sourceResolver, policyRegistry: this.#controllerPolicyRegistry() });
         const persisted = this.#persistBlueprint(task, blueprint);
         this.store.setResultPath(task.id, persisted.artifactPath);
         if (task.deliveryRunId) this.store.linkBlueprintToDelivery(task.deliveryRunId, blueprint.blueprintId);
@@ -1078,7 +1078,7 @@ export class SwarmRouter extends EventEmitter {
   }
 
   #structuredOutputContract(role) {
-    if (role === "bootstrap") return `Return only one fenced JSON ProductBlueprint v1. Required exact top-level fields: {"schemaVersion":1,"kind":"ProductBlueprint","blueprintId":"stable-kebab-id","createdAt":"ISO-8601","documentSetDigest":"sha256","sourceDocuments":[{"documentId":"doc-id","path":"path","sha256":"sha256"}],"requirements":[{"requirementId":"stable-kebab-id","type":"functional|nfr|data|integration|constraint","priority":"must|should|could","mandatory":true,"description":"string","sourceRefs":[{"documentId":"doc-id","startLine":120,"endLine":127,"excerptDigest":"lowercase-sha256"}],"acceptanceCriteria":[{"criterionId":"stable-kebab-id","description":"string","verificationHint":"optional"}],"constraints":[]}],"nfrs":[],"modules":[],"integrations":[],"dataModel":{},"constraints":[],"assumptions":[],"decisions":[{"adrId":"stable-kebab-id","decision":"string","rationale":"string","sourceRefs":[{"documentId":"doc-id","startLine":120,"endLine":127,"excerptDigest":"lowercase-sha256"}]}],"unresolvedQuestions":[{"questionId":"stable-kebab-id","description":"string","requiredForRequirementIds":["requirement-id"],"policyDefault":"only an explicitly declared source-policy default","status":"resolved_by_policy|unresolved"}],"contradictions":[{"contradictionId":"stable-kebab-id","requirementIds":["requirement-id"],"sourceRefs":[{"documentId":"doc-id","startLine":120,"endLine":127,"excerptDigest":"lowercase-sha256"}],"description":"string","status":"resolved|unresolved","resolution":"required when resolved"}]}. sourceDocuments must exactly match inventory.json. A SourceRef is controller-verified evidence only: read imported UTF-8 source, normalize CRLF/CR to LF, use inclusive 1-based lines, join the selected lines with LF, and hash that exact fragment with SHA-256. Do not use locator fields; do not invent ranges or digests. Do not invent resolutions: a missing mandatory fact or unresolved contradiction stays unresolved.`;
+    if (role === "bootstrap") return `Return only one fenced JSON ProductBlueprint v1 claim set. Required exact top-level fields: {"schemaVersion":1,"kind":"ProductBlueprint","blueprintId":"stable-kebab-id","createdAt":"ISO-8601","documentSetDigest":"sha256","sourceDocuments":[{"documentId":"doc-id","path":"path","sha256":"sha256"}],"requirements":[{"requirementId":"stable-kebab-id","type":"functional|nfr|data|integration|constraint","priority":"must|should|could","mandatory":true,"description":"string","sourceRefs":[{"documentId":"doc-id","startLine":120,"endLine":127,"excerptDigest":"lowercase-sha256"}],"acceptanceCriteria":[{"criterionId":"stable-kebab-id","description":"string","verificationHint":"optional"}],"constraints":[]}],"nfrs":[],"modules":[],"integrations":[],"dataModel":{},"constraints":[],"assumptions":[],"decisions":[{"adrId":"stable-kebab-id","decision":"string","rationale":"string","sourceRefs":[{"documentId":"doc-id","startLine":120,"endLine":127,"excerptDigest":"lowercase-sha256"}]}],"unresolvedQuestions":[{"questionId":"stable-kebab-id","description":"string","requiredForRequirementIds":["requirement-id"],"proposedPolicyId":"optional-controller-policy-id","proposedPolicyVersion":"optional-version","proposedPolicyDigest":"optional-sha256","proposedResolution":"optional-proposed-value","sourceRefs":[]}],"contradictions":[{"contradictionId":"stable-kebab-id","requirementIds":["requirement-id"],"sourceRefs":[{"documentId":"doc-id","startLine":120,"endLine":127,"excerptDigest":"lowercase-sha256"}],"description":"string"}]}. Bootstrap claims are never authorization: do not emit final resolution statuses, policy defaults, or authoritative resolutions. The controller alone validates configured trusted policy evidence and creates any ADR. sourceDocuments must exactly match inventory.json. A SourceRef is controller-verified evidence only: read imported UTF-8 source, normalize CRLF/CR to LF, use inclusive 1-based lines, join the selected lines with LF, and hash that exact fragment with SHA-256. Do not use locator fields; do not invent ranges or digests. Do not invent resolutions: a missing mandatory fact or unresolved contradiction stays unresolved.`;
     if (role === "planner") return `Return only one fenced JSON PlanBatch v1 with exact fields {"schemaVersion":1,"kind":"PlanBatch","id":"new-immutable-id","deliveryRunId":"controller-provided-run-id","blueprintId":"persisted-blueprint-id","wave":1,"basedOnCheckpointSha":"controller-provided-verified-git-sha","tasks":[{"id":"safe-kebab-id","title":"string","prompt":"specific implementation instruction","primaryDomain":"backend|frontend|database|qa|security|devops","supportingDomains":["qa","security"],"riskFlags":["public_api_change"],"humanApprovalRequired":false,"estimatedTokens":8000,"dependsOn":["other-task-id"],"allowedPaths":["path"],"acceptanceChecks":["test or check"],"requirementIds":["ProductBlueprint requirement id"]}],"createdAt":"ISO-8601"}. The controller-provided id/run/wave/base are authoritative. Every implementation task must have non-empty requirementIds from the immutable ProductBlueprint; every mandatory requirement must be covered. A writer with two writer predecessors is valid: the controller creates the fan-in barrier. Do not create implementation tasks for ambiguity; return {"outcome":"specification_gap","reason":"..."} instead.`;
     if (role === "qa") return `Return only one fenced JSON QualityGateReport: {"verdict":"pass|remediation_required|blocked","summary":"string","findings":[{"id":"stable-id","severity":"low|medium|high|critical","path":"relative/path","evidence":"concrete safe evidence","requiredFix":"specific fix","verification":"specific verification"}],"executedChecks":[],"notRunChecks":[]}. Never include secrets or raw command output. A pass requires no findings.`;
     if (role === "security") return `Return only one fenced JSON SecurityGateReport: {"verdict":"pass|remediation_required|blocked","summary":"string","findings":[{"id":"stable-id","severity":"low|medium|high|critical","path":"relative/path","evidence":"concrete safe evidence","requiredFix":"specific fix","verification":"specific verification"}],"executedChecks":[],"notRunChecks":[]}. Never include secrets or raw command output. A pass requires no findings.`;
@@ -1108,15 +1108,23 @@ export class SwarmRouter extends EventEmitter {
     return createImportedSourceResolver({ repository: this.config.repository, documentationDir: this.config.project.documentationDir });
   }
 
+  #controllerPolicyRegistry() {
+    return this.config.specificationResolution?.policyRegistry ?? null;
+  }
+
   #assertStoredBlueprintSourceIntegrity(stored) {
-    try { return validateBootstrap(stored.blueprint, { sourceResolver: this.#sourceEvidenceResolver() }); }
-    catch (error) { throw new Error(`source_provenance: persisted ProductBlueprint '${stored.blueprint?.blueprintId ?? "unknown"}' cannot continue autonomous delivery; re-run Bootstrap after correcting imported documentation. ${error.message.replace(/^Invalid orchestration JSON: /, "")}`); }
+    try { return validateControllerAuthorizedBlueprint(stored.blueprint, { sourceResolver: this.#sourceEvidenceResolver(), policyRegistry: this.#controllerPolicyRegistry(), persistedResolutionAuthority: stored.resolutionAuthority }); }
+    catch (error) {
+      const source = /source|documentSetDigest|sourceDocuments|source reference/i.test(String(error.message));
+      const kind = source ? "source_provenance" : "specification_authority";
+      throw new Error(`${kind}: persisted ProductBlueprint '${stored.blueprint?.blueprintId ?? "unknown"}' cannot continue autonomous delivery; re-run Bootstrap after correcting imported documentation. ${error.message.replace(/^Invalid ProductBlueprint: /, "")}`);
+    }
   }
 
   #persistBlueprint(task, blueprint) {
     const root = join(this.config.repository, this.config.project.generatedDir, "blueprints");
     mkdirSync(root, { recursive: true });
-    const artifactPath = join(this.config.project.generatedDir, "blueprints", `${blueprint.blueprintId}.v1.json`).split("\\").join("/");
+    const artifactPath = join(this.config.project.generatedDir, "blueprints", `${blueprint.blueprintId}.v${blueprint.schemaVersion}.json`).split("\\").join("/");
     const absolutePath = join(this.config.repository, artifactPath);
     const serialized = `${JSON.stringify(blueprint, null, 2)}\n`;
     const digest = createHash("sha256").update(serialized).digest("hex");

@@ -1,6 +1,6 @@
 function fail(message) { throw new Error(`Invalid orchestration JSON: ${message}`); }
 import { enforceRoutingInvariants } from "./routing-evaluator.mjs";
-import { assertMandatoryRequirementCoverage, resolveDeclaredPolicyDefaults, validateProductBlueprint, validateRequirementIds } from "./product-blueprint.mjs";
+import { assertMandatoryRequirementCoverage, authorizeBootstrapClaims, validateRequirementIds } from "./product-blueprint.mjs";
 const domains = new Set(["backend", "frontend", "database", "qa", "security", "devops"]);
 const riskFlags = new Set(["public_api_change", "auth_or_authorization", "secret_handling", "sensitive_data", "destructive_data_change", "schema_change", "production_write", "network_exposure", "permission_change", "dependency_supply_chain", "irreversible_operation", "high_blast_radius"]);
 const sha = (value) => typeof value === "string" && /^[a-f0-9]{40,64}$/i.test(value);
@@ -13,8 +13,8 @@ export function extractOrchestrationJson(text) {
   catch { fail("agent response must contain one valid JSON object in a fenced block"); }
 }
 
-export function validateBootstrap(value, { sourceDocuments = null, sourceResolver = null } = {}) {
-  try { return resolveDeclaredPolicyDefaults(validateProductBlueprint(value, { sourceDocuments, sourceResolver })); }
+export function validateBootstrap(value, { sourceDocuments = null, sourceResolver = null, policyRegistry = null } = {}) {
+  try { return authorizeBootstrapClaims(value, { sourceDocuments, sourceResolver, policyRegistry }); }
   catch (error) { fail(error.message.replace(/^Invalid ProductBlueprint: /, "")); }
 }
 

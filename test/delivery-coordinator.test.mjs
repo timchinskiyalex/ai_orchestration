@@ -55,6 +55,18 @@ class SourceBlockedClient extends DeliveryClient {
     return super.readThread({ threadId });
   }
 }
+class SelfAuthorizedPolicyClient extends DeliveryClient {
+  constructor() { super(); this.plannerReads = 0; }
+  async readThread({ threadId }) {
+    const thread = this.threads.get(threadId);
+    if (/^Bootstrap/.test(thread.goal)) {
+      const blueprint = fakeBlueprint(thread.cwd, { question: { questionId: "claimed-policy", description: "A required source fact is missing.", requiredForRequirementIds: ["fix-value"], status: "resolved_by_policy", policyDefault: "untrusted", resolution: "untrusted" } });
+      return { thread: { turns: [{ id: `turn-${threadId}`, items: [{ type: "agentMessage", text: `\`\`\`json\n${JSON.stringify(blueprint)}\n\`\`\`` }] }] } };
+    }
+    if (/^Plan /.test(thread.goal)) this.plannerReads += 1;
+    return super.readThread({ threadId });
+  }
+}
 class LegacySourceRefClient extends DeliveryClient {
   async readThread({ threadId }) {
     const thread = this.threads.get(threadId);
@@ -153,6 +165,14 @@ test("only a persisted source-specification blocker yields blocked_specification
   try {
     const final = await coordinator.begin({ source: fixture.source, ...fakeRemote(calls) });
     assert.equal(final.state, "blocked_specification"); assert.deepEqual(calls, { push: 0, pr: 0, ci: 0, merge: 0 });
+  } finally { router.close(); rmSync(fixture.root, { recursive: true, force: true }); }
+});
+
+test("unsupported Bootstrap policy claims block autonomous delivery before Planner", async () => {
+  const fixture = setup(true); const client = new SelfAuthorizedPolicyClient(); fixture.config.appServerClientFactory = () => client; const router = new SwarmRouter(fixture.config); const coordinator = new DeliveryCoordinator(router);
+  try {
+    const final = await coordinator.begin({ source: fixture.source, ...fakeRemote({ push: 0, pr: 0, ci: 0, merge: 0 }) }); const bootstrap = router.list().find((task) => task.role === "bootstrap");
+    assert.equal(final.state, "blocked_specification"); assert.equal(bootstrap.status, "blocked_specification"); assert.match(bootstrap.error, /missing_mandatory_fact:claimed-policy/); assert.equal(client.plannerReads, 0); assert.equal(router.list().some((task) => task.role === "planner"), false);
   } finally { router.close(); rmSync(fixture.root, { recursive: true, force: true }); }
 });
 

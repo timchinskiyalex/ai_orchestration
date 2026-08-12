@@ -15,10 +15,66 @@ export function documentIdForPath(path) { return `doc-${sha256(path).slice(0, 20
 export function documentSetDigest(sourceDocuments) {
   return sha256(canonical([...sourceDocuments].sort((left, right) => left.path.localeCompare(right.path))));
 }
+export const PRODUCT_BLUEPRINT_SCHEMA_VERSION = 2;
+export const SPECIFICATION_RESOLUTION_AUTHORITY_VERSION = 1;
+
+export function policyDigest(policy) {
+  if (!policy || typeof policy !== "object" || Array.isArray(policy)) return null;
+  const { digest, ...unsigned } = policy;
+  return sha256(canonical(unsigned));
+}
+
+export function policyRegistryDigest(policyRegistry) {
+  if (!policyRegistry || typeof policyRegistry !== "object" || Array.isArray(policyRegistry)) return null;
+  return sha256(canonical({ schemaVersion: policyRegistry.schemaVersion, policies: policyRegistry.policies }));
+}
+
+function policyRegistryStatus(policyRegistry) {
+  if (!policyRegistry || typeof policyRegistry !== "object" || Array.isArray(policyRegistry)) return { valid: false, reason: "policy_registry_missing", policies: [] };
+  if (policyRegistry.schemaVersion !== 1 || !Array.isArray(policyRegistry.policies)) return { valid: false, reason: "policy_registry_invalid", policies: [] };
+  const policyIds = new Set();
+  for (const policy of policyRegistry.policies) {
+    if (!policy || typeof policy !== "object" || Array.isArray(policy) || typeof policy.policyId !== "string" || !/^[a-z][a-z0-9-]{0,95}$/.test(policy.policyId) || policyIds.has(policy.policyId) || typeof policy.version !== "string" || !policy.version.trim() || typeof policy.digest !== "string" || !/^[a-f0-9]{64}$/.test(policy.digest) || policy.digest !== policyDigest(policy) || typeof policy.resolvedValue !== "string" || !policy.resolvedValue.trim()) return { valid: false, reason: "policy_registry_invalid", policies: [] };
+    const scope = policy.scope;
+    if (!scope || typeof scope !== "object" || Array.isArray(scope) || scope.kind !== "unresolved_question" || !Array.isArray(scope.questionIds) || !scope.questionIds.length || scope.questionIds.some((item) => typeof item !== "string" || !/^[a-z][a-z0-9-]{0,95}$/.test(item)) || new Set(scope.questionIds).size !== scope.questionIds.length || !Array.isArray(policy.affectedRequirementIds) || !policy.affectedRequirementIds.length || policy.affectedRequirementIds.some((item) => typeof item !== "string" || !/^[a-z][a-z0-9-]{0,95}$/.test(item)) || new Set(policy.affectedRequirementIds).size !== policy.affectedRequirementIds.length) return { valid: false, reason: "policy_registry_invalid", policies: [] };
+    policyIds.add(policy.policyId);
+  }
+  return { valid: true, reason: null, policies: policyRegistry.policies, digest: policyRegistryDigest(policyRegistry) };
+}
+
+export function validateTrustedPolicyRegistry(policyRegistry) {
+  const status = policyRegistryStatus(policyRegistry);
+  if (!status.valid) throw new Error(`Invalid trusted policy registry: ${status.reason}`);
+  return structuredClone(policyRegistry);
+}
+
+const sameIds = (left, right) => Array.isArray(left) && Array.isArray(right) && left.length === right.length && [...left].sort().every((item, index) => item === [...right].sort()[index]);
+const policyAdrId = (questionId) => `adr-policy-${sha256(questionId).slice(0, 20)}`;
+
+function proposalFor(question) {
+  return {
+    policyId: question.proposedPolicyId ?? null,
+    version: question.proposedPolicyVersion ?? null,
+    digest: question.proposedPolicyDigest ?? null,
+    value: question.proposedResolution ?? null
+  };
+}
+
+function authorizationForQuestion(question, registry) {
+  const proposal = proposalFor(question);
+  const base = { evidenceId: `evidence-policy-${sha256(question.questionId).slice(0, 20)}`, targetKind: "unresolved_question", targetId: question.questionId, affectedRequirementIds: [...question.requiredForRequirementIds].sort() };
+  if (!proposal.policyId && !proposal.version && !proposal.digest && !proposal.value) return { ...base, state: "unresolved", reason: "no_trusted_policy_proposal" };
+  if (!registry.valid) return { ...base, state: "unresolved", reason: registry.reason, proposedPolicyId: proposal.policyId };
+  const policy = registry.policies.find((item) => item.policyId === proposal.policyId);
+  if (!policy) return { ...base, state: "unresolved", reason: "policy_not_found", proposedPolicyId: proposal.policyId };
+  if (policy.version !== proposal.version || policy.digest !== proposal.digest || policy.resolvedValue !== proposal.value) return { ...base, state: "unresolved", reason: "policy_claim_mismatch", proposedPolicyId: proposal.policyId };
+  if (!policy.scope.questionIds.includes(question.questionId) || !sameIds(policy.affectedRequirementIds, question.requiredForRequirementIds)) return { ...base, state: "unresolved", reason: "policy_scope_mismatch", proposedPolicyId: proposal.policyId };
+  return { ...base, state: "resolved_by_policy", reason: "trusted_policy_match", policyId: policy.policyId, policyVersion: policy.version, policyDigest: policy.digest, resolvedValue: policy.resolvedValue, registryDigest: registry.digest };
+}
 export function validateProductBlueprint(value, { sourceDocuments = null, sourceResolver = null } = {}) {
   if (!value || typeof value !== "object" || Array.isArray(value)) fail("must be an object");
   for (const key of ["schemaVersion", "kind", "blueprintId", "createdAt", "documentSetDigest", "sourceDocuments", "requirements", "nfrs", "modules", "integrations", "dataModel", "constraints", "assumptions", "decisions", "unresolvedQuestions", "contradictions"]) if (!(key in value)) fail(`missing '${key}'`);
-  if (value.schemaVersion !== 1 || value.kind !== "ProductBlueprint") fail("schemaVersion must be 1 and kind must be ProductBlueprint");
+  if (![1, PRODUCT_BLUEPRINT_SCHEMA_VERSION].includes(value.schemaVersion) || value.kind !== "ProductBlueprint") fail("schemaVersion must be 1 or 2 and kind must be ProductBlueprint");
   id(value.blueprintId, "blueprintId");
   if (Number.isNaN(Date.parse(value.createdAt))) fail("createdAt must be an ISO timestamp");
   if (!Array.isArray(value.sourceDocuments) || !Array.isArray(value.requirements)) fail("sourceDocuments and requirements must be arrays");
@@ -65,16 +121,20 @@ export function validateProductBlueprint(value, { sourceDocuments = null, source
   for (const question of value.unresolvedQuestions) {
     if (!question || typeof question !== "object") fail("invalid unresolved question");
     id(question.questionId, "questionId");
-    if (typeof question.description !== "string" || !Array.isArray(question.requiredForRequirementIds) || !question.requiredForRequirementIds.every((requirementId) => requirementIds.has(requirementId)) || !["resolved_by_policy", "unresolved"].includes(question.status)) fail(`invalid unresolved question '${question.questionId}'`);
-    if (question.policyDefault !== undefined && typeof question.policyDefault !== "string") fail(`policyDefault for '${question.questionId}' must be a declared string`);
+    if (typeof question.description !== "string" || !question.description.trim() || !Array.isArray(question.requiredForRequirementIds) || !question.requiredForRequirementIds.every((requirementId) => requirementIds.has(requirementId)) || new Set(question.requiredForRequirementIds).size !== question.requiredForRequirementIds.length) fail(`invalid unresolved question '${question.questionId}'`);
+    if (question.status !== undefined && !["resolved_by_policy", "unresolved"].includes(question.status)) fail(`invalid unresolved question '${question.questionId}'`);
+    for (const key of ["proposedPolicyId", "proposedPolicyVersion", "proposedPolicyDigest", "proposedResolution", "policyDefault", "resolution"]) if (question[key] !== undefined && typeof question[key] !== "string") fail(`invalid proposal field '${key}' for '${question.questionId}'`);
+    if (question.proposedPolicyDigest !== undefined && !/^[a-f0-9]{64}$/.test(question.proposedPolicyDigest)) fail(`invalid proposal digest for '${question.questionId}'`);
+    if (question.sourceRefs !== undefined) verifySourceRefs(question.sourceRefs, `unresolved question '${question.questionId}'`, sourceResolver, documents);
   }
   for (const contradiction of value.contradictions) {
     if (!contradiction || typeof contradiction !== "object") fail("invalid contradiction");
     id(contradiction.contradictionId, "contradictionId");
-    if (!Array.isArray(contradiction.requirementIds) || !contradiction.requirementIds.every((requirementId) => requirementIds.has(requirementId)) || !Array.isArray(contradiction.sourceRefs) || typeof contradiction.description !== "string" || !["resolved", "unresolved"].includes(contradiction.status)) fail(`invalid contradiction '${contradiction.contradictionId}'`);
+    if (!Array.isArray(contradiction.requirementIds) || !contradiction.requirementIds.every((requirementId) => requirementIds.has(requirementId)) || !Array.isArray(contradiction.sourceRefs) || typeof contradiction.description !== "string" || !contradiction.description.trim() || (contradiction.status !== undefined && !["resolved", "unresolved"].includes(contradiction.status))) fail(`invalid contradiction '${contradiction.contradictionId}'`);
     if (contradiction.status === "resolved" && typeof contradiction.resolution !== "string") fail(`resolved contradiction '${contradiction.contradictionId}' needs resolution`);
     verifySourceRefs(contradiction.sourceRefs, `contradiction '${contradiction.contradictionId}'`, sourceResolver, documents);
   }
+  if (value.schemaVersion === PRODUCT_BLUEPRINT_SCHEMA_VERSION && (!value.resolutionAuthority || typeof value.resolutionAuthority !== "object" || value.resolutionAuthority.schemaVersion !== SPECIFICATION_RESOLUTION_AUTHORITY_VERSION || !Array.isArray(value.resolutionAuthority.records))) fail("schemaVersion 2 requires controller resolutionAuthority records");
   return structuredClone(value);
 }
 
@@ -87,25 +147,54 @@ function verifySourceRefs(refs, label, sourceResolver, documents) {
   }
 }
 
-// A declared policyDefault is the only autonomous resolution mechanism. The
-// resulting ADR is part of the immutable persisted blueprint, never a later
-// mutation of it.
-export function resolveDeclaredPolicyDefaults(blueprint) {
-  const copy = structuredClone(blueprint);
-  for (const question of copy.unresolvedQuestions) {
-    if (question.status === "unresolved" && question.policyDefault) {
-      question.status = "resolved_by_policy";
-      const adrId = `adr-policy-${question.questionId}`;
-      if (!copy.decisions.some((decision) => decision.adrId === adrId)) copy.decisions.push({ adrId, decision: question.policyDefault, rationale: `Declared policy default for ${question.questionId}: ${question.description}`, sourceRefs: [] });
-    }
+// Bootstrap provides claims only.  This controller-owned derivation discards
+// agent statuses, defaults, and free-text resolutions before it assigns state.
+export function authorizeBootstrapClaims(blueprint, { sourceDocuments = null, sourceResolver = null, policyRegistry = null } = {}) {
+  const claims = validateProductBlueprint(blueprint, { sourceDocuments, sourceResolver });
+  const registry = policyRegistryStatus(policyRegistry);
+  const copy = structuredClone(claims);
+  copy.schemaVersion = PRODUCT_BLUEPRINT_SCHEMA_VERSION;
+  const records = [];
+  copy.unresolvedQuestions = copy.unresolvedQuestions.map((question) => {
+    const { status, policyDefault, resolution, ...claim } = question;
+    const evidence = authorizationForQuestion(claim, registry);
+    records.push(evidence);
+    return { ...claim, status: evidence.state };
+  });
+  // P0 deliberately has no automatic contradiction resolver.  Agent-supplied
+  // status or text is retained only as a non-authoritative claim and cannot
+  // change the controller-derived unresolved state.
+  copy.contradictions = copy.contradictions.map((contradiction) => {
+    const { status, resolution, ...claim } = contradiction;
+    return { ...claim, status: "unresolved" };
+  });
+  copy.resolutionAuthority = { schemaVersion: SPECIFICATION_RESOLUTION_AUTHORITY_VERSION, registryDigest: registry.valid ? registry.digest : null, records };
+  for (const evidence of records.filter((item) => item.state === "resolved_by_policy")) {
+    const adrId = policyAdrId(evidence.targetId);
+    if (!copy.decisions.some((decision) => decision.adrId === adrId)) copy.decisions.push({ adrId, decision: evidence.resolvedValue, rationale: `Controller-authorized policy ${evidence.policyId}@${evidence.policyVersion}`, sourceRefs: [] });
   }
   return copy;
 }
 
+export function validateControllerAuthorizedBlueprint(blueprint, { sourceDocuments = null, sourceResolver = null, policyRegistry = null, persistedResolutionAuthority = undefined } = {}) {
+  const stored = validateProductBlueprint(blueprint, { sourceDocuments, sourceResolver });
+  if (stored.schemaVersion !== PRODUCT_BLUEPRINT_SCHEMA_VERSION) fail("legacy resolution authority cannot be proven for autonomous delivery");
+  if (persistedResolutionAuthority !== undefined && canonical(stored.resolutionAuthority) !== canonical(persistedResolutionAuthority)) fail("persisted controller resolution authority evidence is missing or tampered");
+  const rederived = authorizeBootstrapClaims(stored, { sourceDocuments, sourceResolver, policyRegistry });
+  if (canonical(stored.unresolvedQuestions) !== canonical(rederived.unresolvedQuestions) || canonical(stored.contradictions) !== canonical(rederived.contradictions) || canonical(stored.resolutionAuthority) !== canonical(rederived.resolutionAuthority)) fail("controller resolution authority evidence is missing, tampered, or no longer trusted");
+  for (const evidence of stored.resolutionAuthority.records.filter((item) => item.state === "resolved_by_policy")) {
+    const adrId = policyAdrId(evidence.targetId);
+    const decision = stored.decisions.find((item) => item.adrId === adrId);
+    if (!decision || decision.decision !== evidence.resolvedValue || decision.rationale !== `Controller-authorized policy ${evidence.policyId}@${evidence.policyVersion}`) fail(`controller ADR evidence is missing for '${evidence.targetId}'`);
+  }
+  return stored;
+}
+
 export function specificationBlockers(blueprint) {
   const blockers = [];
-  for (const question of blueprint.unresolvedQuestions) if (question.status === "unresolved" && question.requiredForRequirementIds.length) blockers.push(`missing_mandatory_fact:${question.questionId}`);
-  for (const contradiction of blueprint.contradictions) if (contradiction.status === "unresolved") blockers.push(`unresolved_contradiction:${contradiction.contradictionId}`);
+  const controllerAuthorized = blueprint?.schemaVersion === PRODUCT_BLUEPRINT_SCHEMA_VERSION && blueprint?.resolutionAuthority?.schemaVersion === SPECIFICATION_RESOLUTION_AUTHORITY_VERSION;
+  for (const question of blueprint.unresolvedQuestions ?? []) if ((!controllerAuthorized || question.status !== "resolved_by_policy") && question.requiredForRequirementIds.length) blockers.push(`missing_mandatory_fact:${question.questionId}`);
+  for (const contradiction of blueprint.contradictions ?? []) if (!controllerAuthorized || contradiction.status !== "resolved_by_controller") blockers.push(`unresolved_contradiction:${contradiction.contradictionId}`);
   return blockers;
 }
 

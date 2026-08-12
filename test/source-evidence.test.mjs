@@ -78,7 +78,7 @@ test("controller rejects document substitution and inventory traversal", () => {
 test("unresolved mandatory source facts remain blocked_specification inputs", () => {
   const context = sourceContext();
   try {
-    const value = blueprint(context); value.unresolvedQuestions = [{ questionId: "missing-source-fact", description: "Missing mandatory source fact", requiredForRequirementIds: ["req-evidence"], status: "unresolved" }];
+    const value = blueprint(context); value.contradictions = []; value.unresolvedQuestions = [{ questionId: "missing-source-fact", description: "Missing mandatory source fact", requiredForRequirementIds: ["req-evidence"], status: "unresolved" }];
     assert.deepEqual(specificationBlockers(validate(context, value)), ["missing_mandatory_fact:missing-source-fact"]);
   } finally { rmSync(context.root, { recursive: true, force: true }); }
 });

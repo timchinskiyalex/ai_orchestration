@@ -18,6 +18,7 @@ export class StateStore {
     // pre-migration database must remain observable rather than throwing on a
     // column added by a newer controller.
     this.hasTokenUsageSource = this.#hasColumn("tasks", "token_usage_source");
+    this.hasResolutionAuthorityEvidence = this.#hasTable("specification_resolution_evidence");
     if (readOnly) return;
     // Switching journal mode takes an exclusive SQLite lock. Do it once at
     // database creation, never in every short-lived status/watch reader.
@@ -177,6 +178,12 @@ export class StateStore {
         blueprint_json TEXT NOT NULL,
         created_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS specification_resolution_evidence (
+        blueprint_id TEXT PRIMARY KEY REFERENCES product_blueprints(blueprint_id),
+        schema_version INTEGER NOT NULL,
+        evidence_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS traceability_records (
         sequence INTEGER PRIMARY KEY AUTOINCREMENT,
         requirement_id TEXT NOT NULL,
@@ -231,6 +238,7 @@ export class StateStore {
       CREATE INDEX IF NOT EXISTS idx_tasks_thread ON tasks(thread_id);
       CREATE INDEX IF NOT EXISTS idx_events_task ON events(task_id, sequence);
     `);
+    this.hasResolutionAuthorityEvidence = true;
     this.#addColumnIfMissing("tasks", "dependencies_json", "TEXT NOT NULL DEFAULT '[]'");
     this.#addColumnIfMissing("tasks", "result_path", "TEXT");
     this.#addColumnIfMissing("tasks", "estimated_tokens", "INTEGER NOT NULL DEFAULT 0");
@@ -795,6 +803,7 @@ export class StateStore {
     try {
       this.db.prepare(`INSERT INTO product_blueprints(blueprint_id, schema_version, artifact_path, digest, document_set_digest, bootstrap_task_id, delivery_run_id, blueprint_json, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(blueprint.blueprintId, blueprint.schemaVersion, artifactPath, digest, blueprint.documentSetDigest, bootstrapTaskId, deliveryRunId, JSON.stringify(blueprint), now());
+      if (blueprint.resolutionAuthority) this.db.prepare("INSERT INTO specification_resolution_evidence(blueprint_id, schema_version, evidence_json, created_at) VALUES (?, ?, ?, ?)").run(blueprint.blueprintId, blueprint.resolutionAuthority.schemaVersion, JSON.stringify(blueprint.resolutionAuthority), now());
       this.#insertEvent(bootstrapTaskId, "blueprint/persisted", { blueprintId: blueprint.blueprintId, artifactPath, digest, deliveryRunId });
       this.db.exec("COMMIT");
     } catch (error) { this.db.exec("ROLLBACK"); throw error; }
@@ -803,7 +812,9 @@ export class StateStore {
 
   productBlueprint(blueprintId) {
     const row = this.db.prepare("SELECT artifact_path, digest, document_set_digest, bootstrap_task_id, delivery_run_id, blueprint_json, created_at FROM product_blueprints WHERE blueprint_id = ?").get(blueprintId);
-    return row ? { blueprint: JSON.parse(row.blueprint_json), artifactPath: row.artifact_path, digest: row.digest, documentSetDigest: row.document_set_digest, bootstrapTaskId: row.bootstrap_task_id, deliveryRunId: row.delivery_run_id, createdAt: row.created_at } : null;
+    if (!row) return null;
+    const authority = this.hasResolutionAuthorityEvidence ? this.db.prepare("SELECT schema_version, evidence_json FROM specification_resolution_evidence WHERE blueprint_id = ?").get(blueprintId) : null;
+    return { blueprint: JSON.parse(row.blueprint_json), artifactPath: row.artifact_path, digest: row.digest, documentSetDigest: row.document_set_digest, bootstrapTaskId: row.bootstrap_task_id, deliveryRunId: row.delivery_run_id, createdAt: row.created_at, resolutionAuthority: authority ? { schemaVersion: authority.schema_version, ...JSON.parse(authority.evidence_json) } : null };
   }
 
   productBlueprintForBootstrap(bootstrapTaskId) {
@@ -1065,6 +1076,11 @@ export class StateStore {
 
   #hasColumn(table, column) {
     try { return this.db.prepare(`PRAGMA table_info(${table})`).all().some((item) => item.name === column); }
+    catch { return false; }
+  }
+
+  #hasTable(table) {
+    try { return Boolean(this.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(table)); }
     catch { return false; }
   }
 

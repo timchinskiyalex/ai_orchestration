@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig } from "../src/config.mjs";
+import { policyDigest } from "../src/product-blueprint.mjs";
 
 function config(overrides = {}) {
   const roles = Object.fromEntries(["bootstrap", "planner", "backend", "frontend", "database", "qa", "security", "devops"].map((role) => [role, { sandbox: role === "backend" ? "workspace-write" : "read-only", approvalPolicy: "never", tokenBudget: 10, usesWorktree: role === "backend" }]));
@@ -28,4 +29,11 @@ test("new config defaults to fully autonomous delivery and retains explicit manu
   const manual = load(config({ autonomy: { mode: "manual", autoApproveWorkflowGates: false, autoRemediate: false, autoPush: false, autoCreatePullRequest: false, autoMerge: false, maxRemediationRounds: 1 }, delivery: { maxRemediationRounds: 1 } }));
   assert.equal(manual.autonomy.mode, "manual");
   assert.throws(() => load(config({ autonomy: { mode: "autonomous", autoApproveWorkflowGates: false } })), /requires all autonomy/);
+});
+
+test("trusted specification policy registry requires stable digest, scope, and affected requirements", () => {
+  const policy = { policyId: "region-default", version: "1", scope: { kind: "unresolved_question", questionIds: ["region-choice"] }, affectedRequirementIds: ["req-one"], resolvedValue: "eu-central" }; policy.digest = policyDigest(policy);
+  const loaded = load(config({ specificationResolution: { policyRegistry: { schemaVersion: 1, policies: [policy] } } }));
+  assert.equal(loaded.specificationResolution.policyRegistry.policies[0].digest, policy.digest);
+  assert.throws(() => load(config({ specificationResolution: { policyRegistry: { schemaVersion: 1, policies: [{ ...policy, digest: "0".repeat(64) }] } } })), /trusted policy registry/);
 });

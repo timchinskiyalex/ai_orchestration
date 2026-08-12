@@ -5,7 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { StateStore } from "../src/state-store.mjs";
-import { assertMandatoryRequirementCoverage, documentIdForPath, documentSetDigest, resolveDeclaredPolicyDefaults, specificationBlockers, validateProductBlueprint } from "../src/product-blueprint.mjs";
+import { assertMandatoryRequirementCoverage, documentIdForPath, documentSetDigest, policyDigest, specificationBlockers, validateProductBlueprint } from "../src/product-blueprint.mjs";
+import { validateBootstrap } from "../src/workflow-contract.mjs";
 import { createImportedSourceResolver, sourceFragmentDigest } from "../src/source-evidence.mjs";
 
 function evidenceContext() {
@@ -32,10 +33,11 @@ test("mandatory coverage and unknown requirement IDs reject before task material
   assert.throws(() => assertMandatoryRequirementCoverage({ tasks: [] }, value), /not planned/);
 });
 
-test("declared policy defaults create an ADR while unresolved facts and contradictions block", () => {
-  const docs = [{ documentId: "doc-input", path: "input.md", sha256: "a".repeat(64) }]; const value = (overrides) => blueprint(docs, "b".repeat(64), overrides);
-  const resolved = resolveDeclaredPolicyDefaults(value({ unresolvedQuestions: [{ questionId: "q-default", description: "Region", requiredForRequirementIds: ["req-must"], policyDefault: "Use EU region", status: "unresolved" }] }));
-  assert.equal(resolved.unresolvedQuestions[0].status, "resolved_by_policy"); assert.equal(resolved.decisions[0].adrId, "adr-policy-q-default");
+test("trusted policy proposals create a controller ADR while unresolved facts and contradictions block", () => {
+  const docs = [{ documentId: "doc-input", path: "input.md", sha256: "a".repeat(64) }]; const value = (overrides) => blueprint(docs, "b".repeat(64), overrides); const sourceResolver = { verify() {} };
+  const policy = { policyId: "default-region", version: "1", scope: { kind: "unresolved_question", questionIds: ["q-default"] }, affectedRequirementIds: ["req-must"], resolvedValue: "Use EU region" }; policy.digest = policyDigest(policy);
+  const resolved = validateBootstrap(value({ unresolvedQuestions: [{ questionId: "q-default", description: "Region", requiredForRequirementIds: ["req-must"], proposedPolicyId: policy.policyId, proposedPolicyVersion: policy.version, proposedPolicyDigest: policy.digest, proposedResolution: policy.resolvedValue }] }), { sourceResolver, policyRegistry: { schemaVersion: 1, policies: [policy] } });
+  assert.equal(resolved.unresolvedQuestions[0].status, "resolved_by_policy"); assert.match(resolved.decisions[0].rationale, /Controller-authorized/); assert.equal(resolved.resolutionAuthority.records[0].policyId, "default-region");
   assert.deepEqual(specificationBlockers(value({ unresolvedQuestions: [{ questionId: "q-missing", description: "Missing API endpoint", requiredForRequirementIds: ["req-must"], status: "unresolved" }] })), ["missing_mandatory_fact:q-missing"]);
   assert.deepEqual(specificationBlockers(value({ contradictions: [{ contradictionId: "c-source", requirementIds: ["req-must"], sourceRefs: [], description: "Conflicting sources", status: "unresolved" }] })), ["unresolved_contradiction:c-source"]);
 });

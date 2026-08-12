@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { ROLES } from "./domain.mjs";
+import { validateTrustedPolicyRegistry } from "./product-blueprint.mjs";
 
 export function loadConfig(configPath) {
   if (!existsSync(configPath)) throw new Error(`Missing config: ${configPath}. Copy config/swarm.config.example.json first.`);
@@ -45,6 +46,10 @@ export function loadConfig(configPath) {
   config.integration ??= {};
   config.integration.remoteCiExtension ??= null;
   config.integration.pullRequestExtension ??= null;
+  config.specificationResolution ??= {};
+  config.specificationResolution.policyRegistry ??= { schemaVersion: 1, policies: [] };
+  try { config.specificationResolution.policyRegistry = validateTrustedPolicyRegistry(config.specificationResolution.policyRegistry); }
+  catch (error) { throw new Error(error.message); }
   config.delivery ??= {};
   config.delivery.maxRemediationRounds ??= config.autonomy.maxRemediationRounds;
   config.delivery.leaseHeartbeatMs ??= 5000;
