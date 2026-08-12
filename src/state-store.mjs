@@ -2,7 +2,7 @@ import { existsSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { assertRole, assertTransition } from "./domain.mjs";
-import { validateIntegrationBarrier, validateIntegrationCheckpoint, validatePlan, validateWorkerArtifactContract } from "./workflow-contract.mjs";
+import { validateGlobalWaveCheckpoint, validateIntegrationBarrier, validateIntegrationCheckpoint, validateLocalIntegrationCheckpoint, validatePlan, validateWorkerArtifactContract } from "./workflow-contract.mjs";
 import { productAcceptancePasses, validateProductAcceptanceReport } from "./final-acceptance.mjs";
 
 const now = () => new Date().toISOString();
@@ -251,6 +251,14 @@ export class StateStore {
     this.#addColumnIfMissing("tasks", "plan_batch_id", "TEXT");
     this.#addColumnIfMissing("tasks", "wave", "INTEGER");
     this.#addColumnIfMissing("tasks", "integration_barrier_id", "TEXT");
+    this.#addColumnIfMissing("tasks", "local_checkpoint_id", "TEXT");
+    this.#addColumnIfMissing("integration_checkpoints", "checkpoint_type", "TEXT");
+    this.#addColumnIfMissing("integration_checkpoints", "barrier_id", "TEXT");
+    this.#addColumnIfMissing("integration_checkpoints", "effective_lineage_json", "TEXT");
+    this.#addColumnIfMissing("integration_checkpoints", "consumer_task_ids_json", "TEXT");
+    // Version-one checkpoints did not distinguish local fan-in from the global
+    // baseline.  Keep them as audit evidence but never promote them on restart.
+    this.db.prepare("UPDATE wave_reconciliations SET status = 'legacy_ambiguous' WHERE status = 'reconciled' AND checkpoint_id IN (SELECT id FROM integration_checkpoints WHERE COALESCE(checkpoint_type, '') NOT IN ('GlobalWaveCheckpoint'))").run();
     // Scoped recovery v2 is deliberately additive: old rows are evidence, not
     // safe autonomous work items.  New records carry all context needed to
     // claim a single recovery planner after a restart.
@@ -699,9 +707,46 @@ export class StateStore {
     } catch (error) { this.db.exec("ROLLBACK"); throw error; }
     return this.integrationCheckpoint(checkpoint.id);
   }
-  integrationCheckpoint(id) { const row = this.db.prepare("SELECT * FROM integration_checkpoints WHERE id = ?").get(id); return row ? { schemaVersion: row.schema_version, kind: row.kind, id: row.id, deliveryRunId: row.delivery_run_id, blueprintId: row.blueprint_id, wave: row.wave, baseSha: row.base_sha, inputArtifacts: parse(row.input_artifacts_json, []), outputSha: row.output_sha, verificationResults: parse(row.verification_results_json, []), status: row.status, createdAt: row.created_at } : null; }
-  reconcileWave({ deliveryRunId, wave, checkpointId }) { const checkpoint = this.integrationCheckpoint(checkpointId); if (!checkpoint || checkpoint.status !== "passed") throw new Error("Wave reconciliation requires a successful verified IntegrationCheckpoint"); this.db.prepare("INSERT INTO wave_reconciliations(delivery_run_id,wave,checkpoint_id,checkpoint_sha,status,created_at) VALUES (?,?,?,?,?,?)").run(deliveryRunId, wave, checkpointId, checkpoint.outputSha, "reconciled", now()); return this.currentCheckpoint(deliveryRunId); }
-  currentCheckpoint(deliveryRunId) { const row = this.db.prepare("SELECT checkpoint_id, checkpoint_sha, wave FROM wave_reconciliations WHERE delivery_run_id = ? AND status = 'reconciled' ORDER BY wave DESC LIMIT 1").get(deliveryRunId); return row ? { checkpointId: row.checkpoint_id, outputSha: row.checkpoint_sha, wave: row.wave } : null; }
+  integrationCheckpoint(id) {
+    const row = this.db.prepare("SELECT * FROM integration_checkpoints WHERE id = ?").get(id); if (!row) return null;
+    const checkpoint = { schemaVersion: row.schema_version, kind: row.kind, id: row.id, deliveryRunId: row.delivery_run_id, blueprintId: row.blueprint_id, wave: row.wave, baseSha: row.base_sha, inputArtifacts: parse(row.input_artifacts_json, []), outputSha: row.output_sha, verificationResults: parse(row.verification_results_json, []), status: row.status, createdAt: row.created_at, barrierId: row.barrier_id, effectiveLineage: parse(row.effective_lineage_json, []), consumerTaskIds: parse(row.consumer_task_ids_json, []) };
+    try {
+      if (row.checkpoint_type === "LocalIntegrationCheckpoint") validateLocalIntegrationCheckpoint(checkpoint);
+      else if (row.checkpoint_type === "GlobalWaveCheckpoint") validateGlobalWaveCheckpoint(checkpoint);
+      else return null;
+      return checkpoint;
+    } catch { return null; }
+  }
+  recordLocalIntegrationCheckpoint(checkpoint) {
+    validateLocalIntegrationCheckpoint(checkpoint);
+    const barrier = this.integrationBarrier(checkpoint.barrierId);
+    if (!barrier || barrier.status !== "running" || barrier.deliveryRunId !== checkpoint.deliveryRunId || barrier.wave !== checkpoint.wave || barrier.baseSha !== checkpoint.baseSha || JSON.stringify(barrier.inputArtifacts) !== JSON.stringify(checkpoint.inputArtifacts)) throw new Error("LocalIntegrationCheckpoint barrier linkage is missing or mismatched");
+    for (const input of checkpoint.inputArtifacts) { const artifact = this.workerArtifact(input.artifactId); if (!artifact || artifact.headSha !== input.headSha) throw new Error("LocalIntegrationCheckpoint included input is missing or mismatched"); }
+    const consumers = checkpoint.consumerTaskIds.map((id) => this.getTask(id));
+    if (consumers.some((task) => !task || task.integrationBarrierId !== checkpoint.barrierId || task.status !== "queued")) throw new Error("LocalIntegrationCheckpoint consumer linkage is missing or mismatched");
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      if (this.db.prepare("SELECT id FROM integration_checkpoints WHERE id = ?").get(checkpoint.id)) throw new Error("LocalIntegrationCheckpoint is immutable and already persisted");
+      this.db.prepare("INSERT INTO integration_checkpoints(id,schema_version,kind,delivery_run_id,blueprint_id,wave,base_sha,input_artifacts_json,output_sha,verification_results_json,status,created_at,checkpoint_type,barrier_id,effective_lineage_json,consumer_task_ids_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").run(checkpoint.id, checkpoint.schemaVersion, checkpoint.kind, checkpoint.deliveryRunId, checkpoint.blueprintId, checkpoint.wave, checkpoint.baseSha, json(checkpoint.inputArtifacts), checkpoint.outputSha, json(checkpoint.verificationResults), checkpoint.status, checkpoint.createdAt, checkpoint.kind, checkpoint.barrierId, json(checkpoint.effectiveLineage), json(checkpoint.consumerTaskIds));
+      this.db.prepare("UPDATE integration_barriers SET status = 'passed', checkpoint_id = ?, updated_at = ? WHERE id = ? AND status = 'running'").run(checkpoint.id, now(), checkpoint.barrierId);
+      for (const task of consumers) this.db.prepare("UPDATE tasks SET artifact_base_sha = ?, artifact_dependencies_json = '[]', local_checkpoint_id = ?, updated_at = ? WHERE id = ? AND status = 'queued'").run(checkpoint.outputSha, checkpoint.id, now(), task.id);
+      this.db.exec("COMMIT");
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    return this.integrationCheckpoint(checkpoint.id);
+  }
+  recordGlobalWaveCheckpoint(checkpoint) {
+    validateGlobalWaveCheckpoint(checkpoint);
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      if (this.db.prepare("SELECT 1 FROM wave_reconciliations WHERE delivery_run_id = ? AND wave = ? AND status = 'reconciled'").get(checkpoint.deliveryRunId, checkpoint.wave)) throw new Error("GlobalWaveCheckpoint is immutable and already reconciled");
+      this.db.prepare("INSERT INTO integration_checkpoints(id,schema_version,kind,delivery_run_id,blueprint_id,wave,base_sha,input_artifacts_json,output_sha,verification_results_json,status,created_at,checkpoint_type,effective_lineage_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)").run(checkpoint.id, checkpoint.schemaVersion, checkpoint.kind, checkpoint.deliveryRunId, checkpoint.blueprintId, checkpoint.wave, checkpoint.baseSha, json(checkpoint.inputArtifacts), checkpoint.outputSha, json(checkpoint.verificationResults), checkpoint.status, checkpoint.createdAt, checkpoint.kind, json(checkpoint.effectiveLineage));
+      this.db.prepare("INSERT INTO wave_reconciliations(delivery_run_id,wave,checkpoint_id,checkpoint_sha,status,created_at) VALUES (?,?,?,?,?,?)").run(checkpoint.deliveryRunId, checkpoint.wave, checkpoint.id, checkpoint.outputSha, "reconciled", now());
+      this.db.exec("COMMIT");
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    return this.currentCheckpoint(checkpoint.deliveryRunId);
+  }
+  reconcileWave({ deliveryRunId, wave, checkpointId }) { const checkpoint = this.integrationCheckpoint(checkpointId); if (!checkpoint || checkpoint.kind !== "GlobalWaveCheckpoint" || checkpoint.deliveryRunId !== deliveryRunId || checkpoint.wave !== wave) throw new Error("Wave reconciliation requires a verified GlobalWaveCheckpoint"); return this.recordGlobalWaveCheckpoint(checkpoint); }
+  currentCheckpoint(deliveryRunId) { const row = this.db.prepare("SELECT checkpoint_id, checkpoint_sha, wave FROM wave_reconciliations WHERE delivery_run_id = ? AND status = 'reconciled' ORDER BY wave DESC LIMIT 1").get(deliveryRunId); const checkpoint = row ? this.integrationCheckpoint(row.checkpoint_id) : null; return checkpoint?.kind === "GlobalWaveCheckpoint" && checkpoint.outputSha === row.checkpoint_sha ? { checkpointId: row.checkpoint_id, outputSha: row.checkpoint_sha, wave: row.wave } : null; }
   recordScopedReplan(value) {
     const timestamp = value.createdAt ?? now();
     if (!value.idempotencyKey || !value.failureKind || !value.deliveryRunId || !value.blueprintId) throw new Error("Scoped replan v2 requires delivery, blueprint, failure taxonomy, and idempotency key");
@@ -917,7 +962,7 @@ export class StateStore {
       error: row.error, resultPath: row.result_path,
       riskFlags: parse(row.risk_flags_json, []), supportingDomains: parse(row.supporting_domains_json, []),
       artifactBaseSha: row.artifact_base_sha, artifactDependencies: parse(row.artifact_dependencies_json, []),
-      planBatchId: row.plan_batch_id, wave: row.wave, integrationBarrierId: row.integration_barrier_id,
+      planBatchId: row.plan_batch_id, wave: row.wave, integrationBarrierId: row.integration_barrier_id, localCheckpointId: row.local_checkpoint_id,
       remediationRound: row.remediation_round, sourceWriterTaskId: row.source_writer_task_id,
       deliveryRunId: row.delivery_run_id, blueprintId: row.blueprint_id, requirementIds: parse(row.requirement_ids_json, []), interruptThresholdTokens: row.interrupt_threshold_tokens, configuredBudgetCap: row.configured_budget_cap,
       budgetInterrupt: this.budgetInterruption(row.id)

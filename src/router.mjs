@@ -9,7 +9,7 @@ import { BudgetGovernor } from "./budget-governor.mjs";
 import { depthOf, finalStatusForRole, assertRole, ENGINEERING_DOMAINS } from "./domain.mjs";
 import { StateStore } from "./state-store.mjs";
 import { WorktreeManager } from "./worktree-manager.mjs";
-import { extractOrchestrationJson, validateBootstrap, validatePlan, validateIntegrationCheckpoint } from "./workflow-contract.mjs";
+import { extractOrchestrationJson, validateBootstrap, validateLocalIntegrationCheckpoint, validatePlan } from "./workflow-contract.mjs";
 import { BudgetAccountAdapter } from "./budget-account-adapter.mjs";
 import { commandCwd, commandsForPaths, generateProjectOverlay, loadProjectOverlay, projectOverlayExecutionSnapshot } from "./project-overlay.mjs";
 import { WorktreeFinalizer } from "./worktree-finalizer.mjs";
@@ -289,7 +289,7 @@ export class SwarmRouter extends EventEmitter {
     const ids = Array.isArray(taskIds) ? taskIds : [];
     if (!ids.length) throw new Error("Provide at least one finalized task id");
     if (new Set(ids).size !== ids.length) throw new Error("Integration task ids must be unique");
-    const artifacts = ids.map((id) => {
+    const selected = ids.map((id) => {
       const task = this.store.getTask(id);
       if (!task) throw new Error(`Task ${id} has no finalized WorkerArtifact (task was not found)`);
       if (task.status !== "done") throw new Error(`Task ${id} must be done before integration (current status: ${task.status})`);
@@ -299,10 +299,11 @@ export class SwarmRouter extends EventEmitter {
       if (this.config.roles[task.role]?.sandbox === "workspace-write" && !this.#writerReviewPassed(task.id)) {
         throw new Error(`Task ${id} requires a passed Security and QA review chain before integration`);
       }
-      return artifact;
+      return { task, artifact };
     });
+    const resolved = this.#resolveEffectiveLineage(selected.map((item) => item.task.id));
     const { overlay } = loadProjectOverlay(this.config.repository, this.config.project.generatedDir);
-    const result = await new Integrator({ ...this.config, processRunner: this.processRunner }).integrate({ artifacts, overlay });
+    const result = await new Integrator({ ...this.config, processRunner: this.processRunner }).integrate({ artifacts: resolved.artifacts, overlay, baseSha: resolved.baseSha, allowedBaseShas: resolved.allowedBaseShas, lineage: resolved.lineage });
     this.store.recordIntegrationManifest(result.path, result.manifest);
     return result;
   }
@@ -384,12 +385,13 @@ export class SwarmRouter extends EventEmitter {
     const tasks = this.store.listTasks().filter((task) => (!deliveryRunId || task.deliveryRunId === deliveryRunId) && !this.store.isReplannedHistoricalTask(task.id));
     const unfinished = tasks.filter((task) => ENGINEERING_DOMAINS.has(task.role) && task.status !== "done");
     if (unfinished.length) throw new Error(`Run-to-integration stopped before completion: ${unfinished.map((task) => `${task.id}:${task.status}`).join(", ")}`);
-    const writerIds = tasks.filter((task) => this.config.roles[task.role]?.sandbox === "workspace-write" && task.status === "done").map((task) => task.id);
-    if (!writerIds.length) throw new Error("Run-to-integration found no finalized writer artifacts");
     const writers = tasks.filter((task) => this.config.roles[task.role]?.sandbox === "workspace-write" && task.status === "done");
+    const writerIds = writers.filter((task) => !writers.some((other) => other.id !== task.id && other.dependencies.includes(task.id))).map((task) => task.id);
+    if (!writerIds.length) throw new Error("Run-to-integration found no finalized writer artifacts");
     const missingReviews = writers.filter((writer) => !this.#writerReviewPassed(writer.id));
     if (missingReviews.length) throw new Error(`Run-to-integration requires a passed Security and QA report for every final artifact chain: ${missingReviews.map((task) => task.id).join(", ")}`);
     const result = await this.integrateFinalized(writerIds);
+    if (result.manifest.status === "candidate_ready") this.#persistGlobalWaveCheckpoint(deliveryRunId, result);
     return { writerArtifacts: writerIds.map((id) => this.store.workerArtifact(id)), integration: result, nextAction: result.manifest.status === "candidate_ready" ? "Autonomous remote publication will push the verified candidate, create a PR, wait for CI, and merge when green." : "Resolve the blocked integration and retry." };
   }
 
@@ -1239,10 +1241,10 @@ export class SwarmRouter extends EventEmitter {
     const writerPredecessors = task.dependencies.filter((dependency) => this.config.roles[this.store.getTask(dependency)?.role]?.sandbox === "workspace-write");
     if (writerPredecessors.length > 1) {
       const barrier = this.store.integrationBarrier(task.integrationBarrierId);
-      const checkpoint = barrier?.checkpointId ? this.store.integrationCheckpoint(barrier.checkpointId) : null;
+      const checkpoint = task.localCheckpointId ? this.store.integrationCheckpoint(task.localCheckpointId) : null;
       if (!barrier || barrier.status !== "passed" || !checkpoint) throw new Error(`Writer task ${task.id} cannot start before its IntegrationBarrier checkpoint`);
-      validateIntegrationCheckpoint(checkpoint);
-      if (task.artifactBaseSha !== checkpoint.outputSha || (task.artifactDependencies ?? []).length) throw new Error(`Writer task ${task.id} must start exactly from IntegrationCheckpoint output SHA`);
+      validateLocalIntegrationCheckpoint(checkpoint);
+      if (checkpoint.barrierId !== barrier.id || !checkpoint.consumerTaskIds.includes(task.id) || task.artifactBaseSha !== checkpoint.outputSha || (task.artifactDependencies ?? []).length) throw new Error(`Writer task ${task.id} must start exactly from LocalIntegrationCheckpoint output SHA`);
       return;
     }
     if (!writerPredecessors.length) return;
@@ -1273,20 +1275,74 @@ export class SwarmRouter extends EventEmitter {
       if (!barrier) continue;
       progressed = true;
       const artifacts = barrier.inputArtifacts.map((item) => this.store.workerArtifact(item.artifactId));
-      const result = await new Integrator({ ...this.config, processRunner: this.processRunner }).integrateBarrier({ barrier, artifacts, overlay: this.#workerOverlayContext().overlay });
+      const resolved = this.#resolveEffectiveLineage(barrier.inputArtifacts.map((item) => item.artifactId), { baseSha: barrier.baseSha });
+      const result = await new Integrator({ ...this.config, processRunner: this.processRunner }).integrateBarrier({ barrier, artifacts, effectiveArtifacts: resolved.artifacts, allowedBaseShas: resolved.allowedBaseShas, overlay: this.#workerOverlayContext().overlay });
       if (result.status !== "passed") {
         this.store.failIntegrationBarrier(barrier.id, result.error);
         const consumer = this.store.listTasks().find((item) => item.integrationBarrierId === barrier.id);
         if (consumer) this.#recordScopedFailure(consumer, result.error, "barrier_failure", { barrierId: barrier.id, inputArtifacts: barrier.inputArtifacts });
         continue;
       }
-      const checkpoint = { schemaVersion: 1, kind: "IntegrationCheckpoint", id: randomUUID(), deliveryRunId: barrier.deliveryRunId, blueprintId: barrier.blueprintId, wave: barrier.wave, baseSha: barrier.baseSha, inputArtifacts: barrier.inputArtifacts, outputSha: result.outputSha, verificationResults: result.verificationResults, status: "passed", createdAt: new Date().toISOString() };
-      this.store.recordIntegrationCheckpoint(checkpoint, { barrierId: barrier.id });
-      this.store.reconcileWave({ deliveryRunId: barrier.deliveryRunId, wave: barrier.wave, checkpointId: checkpoint.id });
-      for (const task of this.store.listTasks().filter((item) => item.integrationBarrierId === barrier.id && item.status === "queued")) this.store.setArtifactLineage(task.id, { artifactBaseSha: checkpoint.outputSha, artifactDependencies: [] });
+      const consumers = this.store.listTasks().filter((item) => item.integrationBarrierId === barrier.id && item.status === "queued");
+      const checkpoint = { schemaVersion: 2, kind: "LocalIntegrationCheckpoint", id: randomUUID(), deliveryRunId: barrier.deliveryRunId, blueprintId: barrier.blueprintId, wave: barrier.wave, baseSha: barrier.baseSha, inputArtifacts: barrier.inputArtifacts, outputSha: result.outputSha, verificationResults: result.verificationResults, status: "passed", barrierId: barrier.id, effectiveLineage: resolved.lineage, consumerTaskIds: consumers.map((task) => task.id), createdAt: new Date().toISOString() };
+      this.store.recordLocalIntegrationCheckpoint(checkpoint);
       this.#lifecycle("integration barrier checkpointed", { barrierId: barrier.id, checkpointId: checkpoint.id, outputSha: checkpoint.outputSha });
     }
     return progressed;
+  }
+
+  #resolveEffectiveLineage(taskIds, { baseSha = null } = {}) {
+    const tasks = new Map(this.store.listTasks().map((task) => [task.id, task]));
+    const artifacts = [], lineage = [], seenArtifacts = new Set(), seenCheckpoints = new Set(), visitingTasks = new Set(), allowedBaseShas = new Set();
+    let resolvedBase = baseSha;
+    const addCheckpoint = (checkpointId) => {
+      if (seenCheckpoints.has(checkpointId)) return;
+      const checkpoint = this.store.integrationCheckpoint(checkpointId);
+      if (!checkpoint || checkpoint.kind !== "LocalIntegrationCheckpoint") throw new Error(`Local checkpoint ${checkpointId} is missing, legacy, or invalid`);
+      const barrier = this.store.integrationBarrier(checkpoint.barrierId);
+      if (!barrier || barrier.status !== "passed" || barrier.checkpointId !== checkpoint.id || barrier.deliveryRunId !== checkpoint.deliveryRunId || JSON.stringify(barrier.inputArtifacts) !== JSON.stringify(checkpoint.inputArtifacts)) throw new Error(`Local checkpoint ${checkpointId} has mismatched barrier linkage`);
+      for (const node of checkpoint.effectiveLineage) {
+        const evidence = node.kind === "artifact" ? this.store.workerArtifact(node.id) : this.store.integrationCheckpoint(node.id);
+        const evidenceSha = node.kind === "artifact" ? evidence?.headSha : evidence?.outputSha;
+        if (!evidence || evidenceSha !== node.sha) throw new Error(`Local checkpoint ${checkpointId} has missing or tampered effective lineage evidence`);
+      }
+      seenCheckpoints.add(checkpointId); allowedBaseShas.add(checkpoint.outputSha);
+      for (const input of checkpoint.inputArtifacts) {
+        const artifact = this.store.workerArtifact(input.artifactId);
+        if (!artifact || artifact.headSha !== input.headSha) throw new Error(`Local checkpoint ${checkpointId} has a missing or tampered input`);
+        visit(input.artifactId);
+      }
+      lineage.push({ kind: "checkpoint", id: checkpoint.id, sha: checkpoint.outputSha });
+    };
+    const visit = (taskId) => {
+      if (seenArtifacts.has(taskId)) return;
+      if (visitingTasks.has(taskId)) throw new Error("Effective lineage contains a cycle");
+      const task = tasks.get(taskId), artifact = this.store.workerArtifact(taskId);
+      if (!task || !artifact || task.status !== "done") throw new Error(`Effective lineage input ${taskId} is missing or unfinished`);
+      visitingTasks.add(taskId);
+      if (task.localCheckpointId) {
+        const checkpoint = this.store.integrationCheckpoint(task.localCheckpointId);
+        if (!checkpoint || !checkpoint.consumerTaskIds.includes(task.id) || task.artifactBaseSha !== checkpoint.outputSha) throw new Error(`Task ${task.id} has incomplete local checkpoint lineage`);
+        addCheckpoint(task.localCheckpointId);
+      }
+      for (const dependency of task.artifactDependencies ?? []) visit(dependency);
+      if (!resolvedBase) resolvedBase = task.planBatchId ? this.store.planBatch(task.planBatchId)?.basedOnCheckpointSha : artifact.baseSha;
+      seenArtifacts.add(taskId); artifacts.push(artifact); lineage.push({ kind: "artifact", id: artifact.taskId, sha: artifact.headSha }); visitingTasks.delete(taskId);
+    };
+    for (const id of taskIds) visit(id);
+    if (!resolvedBase || !artifacts.length) throw new Error("Effective lineage has no immutable baseline or artifacts");
+    return { artifacts, lineage, baseSha: resolvedBase, allowedBaseShas: [...allowedBaseShas] };
+  }
+
+  #persistGlobalWaveCheckpoint(deliveryRunId, result) {
+    if (!deliveryRunId) return;
+    const writers = this.store.listTasks().filter((task) => task.deliveryRunId === deliveryRunId && this.config.roles[task.role]?.sandbox === "workspace-write" && task.status === "done");
+    const waves = [...new Set(writers.map((task) => task.wave))];
+    if (waves.length !== 1) return; // A later PlanBatch is only legal after its predecessor global checkpoint.
+    const wave = waves[0]; if (this.store.currentCheckpoint(deliveryRunId)?.wave === wave) return;
+    const batch = this.store.planBatch(writers[0]?.planBatchId);
+    const checkpoint = { schemaVersion: 2, kind: "GlobalWaveCheckpoint", id: randomUUID(), deliveryRunId, blueprintId: writers[0]?.blueprintId, wave, baseSha: batch?.basedOnCheckpointSha ?? result.manifest.baseSha, inputArtifacts: result.manifest.effectiveLineage.filter((item) => item.kind === "artifact").map((item) => ({ artifactId: item.id, headSha: item.sha })), outputSha: result.manifest.candidateSha, verificationResults: result.manifest.verificationResults, status: "passed", effectiveLineage: result.manifest.effectiveLineage, createdAt: new Date().toISOString() };
+    this.store.recordGlobalWaveCheckpoint(checkpoint);
   }
 
   #failureKind(task, detail) {

@@ -117,5 +117,36 @@ export function validateIntegrationCheckpoint(value) {
   if (!value || value.schemaVersion !== 1 || value.kind !== "IntegrationCheckpoint") fail("IntegrationCheckpoint has an invalid version or kind");
   for (const key of ["id", "deliveryRunId", "blueprintId", "wave", "baseSha", "inputArtifacts", "outputSha", "verificationResults", "status", "createdAt"]) if (!(key in value)) fail(`IntegrationCheckpoint is missing '${key}'`);
   if (!positive(value.wave) || !sha(value.baseSha) || !sha(value.outputSha) || value.status !== "passed" || !Array.isArray(value.inputArtifacts) || !value.inputArtifacts.length || !Array.isArray(value.verificationResults) || value.verificationResults.some((item) => item.status !== "passed")) fail("IntegrationCheckpoint is not a successful verified checkpoint");
+  const identities = new Set();
+  for (const item of value.inputArtifacts) {
+    if (!item || typeof item.artifactId !== "string" || !item.artifactId || !sha(item.headSha) || identities.has(item.artifactId)) fail("IntegrationCheckpoint inputs must be ordered, unique artifact identities with SHAs");
+    identities.add(item.artifactId);
+  }
+  return value;
+}
+
+function validateEffectiveLineage(value) {
+  if (!Array.isArray(value) || !value.length) fail("Checkpoint requires a non-empty effective lineage");
+  const identities = new Set();
+  for (const item of value) {
+    if (!item || !["artifact", "checkpoint"].includes(item.kind) || typeof item.id !== "string" || !item.id || !sha(item.sha)) fail("Checkpoint effective lineage has an invalid identity or SHA");
+    const identity = `${item.kind}:${item.id}`;
+    if (identities.has(identity)) fail("Checkpoint effective lineage must be ordered and duplicate-free");
+    identities.add(identity);
+  }
+}
+
+export function validateLocalIntegrationCheckpoint(value) {
+  if (!value || value.schemaVersion !== 2 || value.kind !== "LocalIntegrationCheckpoint" || typeof value.barrierId !== "string" || !value.barrierId) fail("LocalIntegrationCheckpoint has an invalid identity");
+  validateIntegrationCheckpoint({ ...value, schemaVersion: 1, kind: "IntegrationCheckpoint" });
+  validateEffectiveLineage(value.effectiveLineage);
+  if (!Array.isArray(value.consumerTaskIds) || !value.consumerTaskIds.length || new Set(value.consumerTaskIds).size !== value.consumerTaskIds.length || value.consumerTaskIds.some((id) => typeof id !== "string" || !id)) fail("LocalIntegrationCheckpoint must identify unique consumers");
+  return value;
+}
+
+export function validateGlobalWaveCheckpoint(value) {
+  if (!value || value.schemaVersion !== 2 || value.kind !== "GlobalWaveCheckpoint") fail("GlobalWaveCheckpoint has an invalid identity");
+  validateIntegrationCheckpoint({ ...value, schemaVersion: 1, kind: "IntegrationCheckpoint" });
+  validateEffectiveLineage(value.effectiveLineage);
   return value;
 }

@@ -33,28 +33,36 @@ export class Integrator {
     this.processRunner = processRunner;
   }
 
-  async integrate({ artifacts, overlay }) {
+  async integrate({ artifacts, overlay, baseSha = overlay.repository.baseSha, allowedBaseShas = [], lineage = null }) {
     const root = resolve(this.runtimeDir, "integrations");
     mkdirSync(root, { recursive: true });
     const lockPath = join(root, ".integration.lock");
     let lock;
     try { lock = openSync(lockPath, "wx"); }
     catch { throw new Error("Integration is already running; concurrent candidate branches are blocked by the integration lock"); }
-    try { return await this.#integrateUnlocked({ artifacts, overlay }); }
+    try { return await this.#integrateUnlocked({ artifacts, overlay, baseSha, allowedBaseShas, lineage }); }
     finally { closeSync(lock); try { unlinkSync(lockPath); } catch { /* lock cleanup is best effort */ } }
   }
 
-  async integrateBarrier({ barrier, artifacts, overlay }) {
+  async integrateBarrier({ barrier, artifacts, effectiveArtifacts = artifacts, allowedBaseShas = [], overlay }) {
     validateIntegrationBarrier(barrier);
     if (!Array.isArray(artifacts) || artifacts.length !== barrier.inputArtifacts.length) throw new Error("IntegrationBarrier artifacts do not match immutable inputs");
     const byId = new Map(artifacts.map((artifact) => [artifact.taskId, artifact]));
     const ordered = barrier.inputArtifacts.map((input) => { const artifact = byId.get(input.artifactId); if (!artifact || artifact.headSha !== input.headSha) throw new Error(`IntegrationBarrier input ${input.artifactId} does not match its verified identity`); return artifact; });
     ordered.forEach(validateWorkerArtifact);
-    for (const artifact of ordered) { if ((artifact.dependencies ?? []).length > 1 || artifact.parentArtifactId && (artifact.dependencies ?? [artifact.parentArtifactId])[0] !== artifact.parentArtifactId) throw new Error(`Artifact ${artifact.taskId} has invalid parent integrity`); if (artifact.baseSha !== barrier.baseSha) throw new Error(`Barrier artifact ${artifact.taskId} was not based on barrier base SHA`); await this.#verifyArtifactIntegrity(artifact); }
+    for (const artifact of ordered) await this.#verifyArtifactIntegrity(artifact);
+    const effective = this.#dependencyOrder(effectiveArtifacts);
+    const permittedBases = new Set([barrier.baseSha, ...allowedBaseShas]);
+    for (const artifact of effective) {
+      validateWorkerArtifact(artifact); await this.#verifyArtifactIntegrity(artifact);
+      const parents = (artifact.dependencies ?? []).filter((id) => effective.some((item) => item.taskId === id));
+      const expectedBase = parents.length ? effective.find((item) => item.taskId === parents[0]).headSha : null;
+      if ((parents.length > 1) || (expectedBase && artifact.baseSha !== expectedBase) || (!expectedBase && !permittedBases.has(artifact.baseSha))) throw new Error(`Barrier artifact ${artifact.taskId} has an unproved effective base`);
+    }
     const root = resolve(this.runtimeDir, "integrations"); mkdirSync(root, { recursive: true }); const id = barrier.id, worktree = join(root, `barrier-${id}`), branch = `swarm/barrier/${id}`;
     try {
       const existing = await git(this.repository, ["branch", "--list", branch]); if (!existing) await exec("git", ["-C", this.repository, "worktree", "add", "-b", branch, worktree, barrier.baseSha]); else await exec("git", ["-C", this.repository, "worktree", "add", worktree, branch]);
-      for (const artifact of ordered) await this.#gitWithRuntimeIdentity(worktree, ["cherry-pick", artifact.headSha]);
+      for (const artifact of effective) await this.#gitWithRuntimeIdentity(worktree, ["cherry-pick", artifact.headSha]);
       const verificationResults = [], verificationPlan = commandsForPaths(overlay, (overlay.components ?? []).filter((component) => component.state === "scaffolded").map((component) => component.root));
       if (verificationPlan.missing.length) throw new Error("Barrier verification unavailable for a scaffolded component");
       for (const command of verificationPlan.commands) { try { const result = await this.processRunner({ executable: command.executable, args: command.args, cwd: commandCwd(worktree, command), timeoutMs: command.timeoutMs ?? 120_000 }); verificationResults.push({ id: command.id, status: "passed", pid: result.pid, stdout: result.stdout.slice(-4000), stderr: result.stderr.slice(-4000) }); } catch (error) { verificationResults.push({ id: command.id, status: "failed", error: error.message }); throw Object.assign(new Error(`Barrier verification failed: ${command.id}`), { verificationResults }); } }
@@ -62,7 +70,7 @@ export class Integrator {
     } catch (error) { try { await git(worktree, ["cherry-pick", "--abort"]); } catch {} return { status: "failed", id, worktree, branch, error: error.message, verificationResults: error.verificationResults ?? [] }; }
   }
 
-  async #integrateUnlocked({ artifacts, overlay }) {
+  async #integrateUnlocked({ artifacts, overlay, baseSha, allowedBaseShas, lineage }) {
     if (!Array.isArray(artifacts) || !artifacts.length) throw new Error("Integrator requires at least one WorkerArtifact");
     artifacts.forEach(validateWorkerArtifact);
     const sorted = this.#dependencyOrder(artifacts);
@@ -70,8 +78,8 @@ export class Integrator {
     for (const artifact of sorted) {
       const artifactParents = (artifact.dependencies ?? []).map((id) => byTaskId.get(id)).filter(Boolean);
       if (artifactParents.length > 1) throw new Error(`Artifact ${artifact.taskId} has multiple artifact parents; chained artifacts require one deterministic predecessor`);
-      const expectedBase = artifactParents[0]?.headSha ?? overlay.repository.baseSha;
-      if (artifact.baseSha !== expectedBase) throw new Error(`Artifact ${artifact.taskId} base SHA does not match its predecessor chain`);
+      const expectedBase = artifactParents[0]?.headSha;
+      if (expectedBase ? artifact.baseSha !== expectedBase : !new Set([baseSha, ...allowedBaseShas]).has(artifact.baseSha)) throw new Error(`Artifact ${artifact.taskId} base SHA does not match its effective lineage`);
       await this.#verifyArtifactIntegrity(artifact);
     }
     for (let i = 0; i < sorted.length; i += 1) for (let j = 0; j < i; j += 1) {
@@ -86,7 +94,7 @@ export class Integrator {
     const worktree = join(root, id);
     const branch = `swarm/candidate/${id}`;
     mkdirSync(root, { recursive: true });
-    await exec("git", ["-C", this.repository, "worktree", "add", "-b", branch, worktree, overlay.repository.baseSha]);
+    await exec("git", ["-C", this.repository, "worktree", "add", "-b", branch, worktree, baseSha]);
     const applied = [];
     try {
       for (const artifact of sorted) {
@@ -102,7 +110,7 @@ export class Integrator {
       }
       const [headSha, clean] = await Promise.all([git(worktree, ["rev-parse", "HEAD"]), gitRaw(worktree, ["status", "--porcelain=v1", "-z", "--untracked-files=all"])]);
       if (clean) throw new Error("Integration worktree is not clean");
-      return this.#writeManifest({ id, status: "candidate_ready", branch, worktree, baseSha: overlay.repository.baseSha, candidateSha: headSha, headSha, appliedArtifacts: applied, verificationResults, localVerification: { status: "passed", commands: verificationResults }, remoteCi: this.#extensionStatus("remote CI", this.integration.remoteCiExtension), pullRequest: this.#extensionStatus("pull request", this.integration.pullRequestExtension), blockedReason: null, rollback: { baseSha: overlay.repository.baseSha, resetCommand: `git switch ${branch} && git reset --hard ${overlay.repository.baseSha}` }, recovery: { mode: "preserved-worktree", worktree, action: "Candidate worktree is retained for diagnosis and can be removed after merge verification." }, humanMergeGate: { required: false, targetBranch: overlay.repository.branch, candidateSha: headSha, action: "autonomous PR and merge when remote checks pass" } });
+      return this.#writeManifest({ id, status: "candidate_ready", branch, worktree, baseSha, candidateSha: headSha, headSha, appliedArtifacts: applied, effectiveLineage: lineage ?? sorted.map((artifact) => ({ kind: "artifact", id: artifact.taskId, sha: artifact.headSha })), verificationResults, localVerification: { status: "passed", commands: verificationResults }, remoteCi: this.#extensionStatus("remote CI", this.integration.remoteCiExtension), pullRequest: this.#extensionStatus("pull request", this.integration.pullRequestExtension), blockedReason: null, rollback: { baseSha, resetCommand: `git switch ${branch} && git reset --hard ${baseSha}` }, recovery: { mode: "preserved-worktree", worktree, action: "Candidate worktree is retained for diagnosis and can be removed after merge verification." }, humanMergeGate: { required: false, targetBranch: overlay.repository.branch, candidateSha: headSha, action: "autonomous PR and merge when remote checks pass" } });
     } catch (error) { return this.#blocked(overlay, sorted, `CONFLICT_BLOCKED: integration exception: ${error.message}`, { id, branch, worktree, applied }); }
   }
 
