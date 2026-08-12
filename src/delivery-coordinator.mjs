@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { ingestDocumentation } from "./project-intake.mjs";
 import { ENGINEERING_DOMAINS } from "./domain.mjs";
+import { specificationBlockers } from "./product-blueprint.mjs";
 
 function manualGateFor(tasks) {
   const task = tasks.find((item) => ["awaiting_human", "awaiting_approval"].includes(item.status));
@@ -118,7 +119,7 @@ export class DeliveryCoordinator {
     }
     if (!acceptance.passing) {
       const report = acceptance.report;
-      const specification = report.results.some((result) => result.status === "blocked");
+      const specification = specificationBlockers(this.router.store.productBlueprint(report.blueprintId)?.blueprint ?? []).length > 0;
       return this.router.store.updateDeliveryRun(run.id, { state: specification ? "blocked_specification" : "blocked_acceptance", integrationPath: integration.path, publish: { ...preliminary, acceptanceReportId: acceptance.id, reason: specification ? "Final acceptance is blocked by a source/specification condition." : "Final acceptance did not pass; candidate and evidence are retained." }, confirmRemotePush: this.router.isAutonomous() });
     }
     const merged = await this.router.publishCandidate(integration, { ...adapters, acceptanceReportId: acceptance.id });

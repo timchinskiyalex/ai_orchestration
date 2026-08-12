@@ -181,8 +181,11 @@ export class GitHubMergeAdapter {
     if (!safeName(base) || protectedBranches.has(candidate.branch?.toLowerCase())) throw new Error("Unsafe merge target");
     try {
       const repo = await this.github.repositoryName();
-      const verifyTarget = async (pr) => {
+      const verifyHead = (pr) => {
         if (pr.head?.sha?.toLowerCase() !== candidate.sha.toLowerCase() || pr.base?.ref !== base) throw new RemoteAdapterError("merge_verify_failed", "Persisted pull request no longer points at the candidate SHA and target branch.");
+      };
+      const verifyTarget = async (pr) => {
+        verifyHead(pr);
         const [main, comparison] = await Promise.all([this.github.api([`repos/${repo}/git/ref/heads/${base}`]), this.github.api([`repos/${repo}/compare/${candidate.sha}...${base}`])]);
         const ref = JSON.parse(String(main.stdout ?? "{}")); const compare = JSON.parse(String(comparison.stdout ?? "{}")); const sha = ref.object?.sha;
         if (!/^[0-9a-f]{40}$/i.test(sha) || !["behind", "identical"].includes(compare.status)) throw new RemoteAdapterError("merge_verify_failed", "Target branch was not verified to contain the candidate after merge.");
@@ -190,6 +193,7 @@ export class GitHubMergeAdapter {
       };
       const current = JSON.parse(String((await this.github.api([`repos/${repo}/pulls/${pullRequest.number}`])).stdout ?? "{}"));
       if (current.merged_at) { const mainSha = await verifyTarget(current); return { status: "merged", number: pullRequest.number, url: current.html_url ?? pullRequest.url, mergeSha: current.merge_commit_sha ?? mainSha, mainSha, targetVerified: true, duplicate: true, idempotencyKey }; }
+      verifyHead(current);
       const response = await this.github.api([`repos/${repo}/pulls/${pullRequest.number}/merge`, "--method", "PUT", "-f", `merge_method=${this.mergeMethod}`, "-f", `sha=${candidate.sha}`, "-f", `commit_title=Autonomous delivery #${pullRequest.number}`]);
       const merged = JSON.parse(String(response.stdout ?? "{}"));
       if (!merged.merged) throw new RemoteAdapterError("branch_protection", merged.message ? `GitHub refused merge: ${merged.message}` : "GitHub refused the merge.");
