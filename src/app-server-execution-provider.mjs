@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
 import { AppServerClient } from "./app-server-client.mjs";
-import { EXECUTION_PROVIDER_VERSION, REQUIRED_EXECUTION_CAPABILITIES, envelope, safeDiagnostics } from "./execution-provider-contract.mjs";
+import { EXECUTION_PROVIDER_VERSION, REQUIRED_EXECUTION_CAPABILITIES, envelope, lifecycleEvent, safeDiagnostics } from "./execution-provider-contract.mjs";
 
 const terminal = new Set(["completed", "failed", "interrupted", "cancelled"]);
 const usage = (params = {}) => {
@@ -31,9 +31,11 @@ export class AppServerExecutionProvider extends EventEmitter {
   constructor({ cwd, client = null, clientFactory = null } = {}) {
     super();
     this.client = client ?? (clientFactory ? clientFactory({ cwd }) : new AppServerClient({ cwd }));
-    this.connected = false; this.closed = false; this.interrupted = new Set(); this.active = new Map();
+    this.connected = false; this.closed = false; this.interrupted = new Set(); this.active = new Map(); this.approvalRequests = new Map();
     this.client.on?.("notification", (message) => this.#notification(message));
-    this.client.on?.("exit", (details) => this.emit("lifecycle", envelope({ operation: "observe_terminal", correlationId: null, success: false, errorCode: "process_exit", errorClass: "transport", diagnostics: details })));
+    this.client.on?.("serverRequest", (message) => this.#serverRequest(message));
+    this.client.on?.("protocol", (event) => this.#protocol(event));
+    this.client.on?.("exit", (details) => this.emit("lifecycle", lifecycleEvent({ kind: "process_exit", providerGlobal: true, success: false, errorCode: "process_exit", errorClass: "transport", diagnostics: details })));
   }
   async handshake(args) {
     if (args.contractVersion !== EXECUTION_PROVIDER_VERSION) return this.#failure("handshake", args, "unsupported_contract_version", "protocol");
@@ -43,13 +45,50 @@ export class AppServerExecutionProvider extends EventEmitter {
   async accountRead(args) { return this.#raw("account_read", args, async () => ({ account: await this.client.request("account/read", {}), usage: await this.client.request("account/usage/read", {}), rateLimits: await this.client.request("account/rateLimits/read", {}) })); }
   async startThread(args) { return this.#raw("start_thread", args, async () => { const result = await this.client.startThread(args.data); const threadId = result?.thread?.id; if (!threadId) throw new Error("invalid thread/start response"); return { threadId, providerRunId: threadId }; }); }
   async setGoal(args) { return this.#raw("set_goal", args, async () => { await this.client.setGoal(args.data); return { threadId: args.data.threadId, providerRunId: args.data.threadId }; }); }
-  async startTurn(args) { return this.#raw("start_turn", args, async () => { const result = await this.client.startTurn(args.data); const turnId = result?.turn?.id; if (!turnId) throw new Error("invalid turn/start response"); const data = { threadId: args.data.threadId, turnId, providerRunId: `${args.data.threadId}:${turnId}` }; this.active.set(`${data.threadId}:${data.turnId}`, args.correlationId); return data; }); }
-  async observeTerminal(args) { return this.#raw("observe_terminal", args, async () => { const turn = await this.client.waitForTurn(args.data.threadId, args.data.turnId, args.data.timeoutMs); const turnId = turn?.id ?? args.data.turnId; if (!terminal.has(turn?.status)) throw new Error("turn_failed"); return { threadId: args.data.threadId, turnId, providerRunId: `${args.data.threadId}:${turnId}`, terminalClass: turn.status, usage: usage(turn) }; }); }
+  async startTurn(args) { return this.#raw("start_turn", args, async () => { const result = await this.client.startTurn(args.data); const turnId = result?.turn?.id; if (!turnId) throw new Error("invalid turn/start response"); const data = { threadId: args.data.threadId, turnId, providerRunId: `${args.data.threadId}:${turnId}` }; this.#bind(data.threadId, turnId, args.correlationId); return data; }); }
+  async observeTerminal(args) { return this.#raw("observe_terminal", args, async () => { this.#bind(args.data.threadId, args.data.turnId, args.correlationId); const turn = await this.client.waitForTurn(args.data.threadId, args.data.turnId, args.data.timeoutMs); const turnId = turn?.id ?? args.data.turnId; if (!terminal.has(turn?.status)) throw new Error("turn_failed"); this.#bind(args.data.threadId, turnId, args.correlationId); return { threadId: args.data.threadId, turnId, providerRunId: `${args.data.threadId}:${turnId}`, terminalClass: turn.status, usage: usage(turn) }; }); }
   async readFinalResult(args) { return this.#raw("read_final_result", args, async () => { const result = await this.client.readThread({ threadId: args.data.threadId, includeTurns: true }); const turns = result?.thread?.turns ?? result?.turns ?? []; const turn = turns.find((item) => item?.id === args.data.turnId); const text = (turn?.items ?? []).filter((item) => item?.type === "agentMessage" && typeof item.text === "string").at(-1)?.text; if (!text?.trim()) throw new Error("result_unavailable"); return { threadId: args.data.threadId, turnId: args.data.turnId, providerRunId: `${args.data.threadId}:${args.data.turnId}`, resultText: text }; }); }
   async interruptTurn(args) { const key = `${args.data.threadId}:${args.data.turnId}`; if (this.interrupted.has(key)) return this.#ok("interrupt_turn", args, { threadId: args.data.threadId, turnId: args.data.turnId, providerRunId: key, terminalClass: "interrupted" }); this.interrupted.add(key); return this.#raw("interrupt_turn", args, async () => { await this.client.interruptTurn(args.data); return { threadId: args.data.threadId, turnId: args.data.turnId, providerRunId: key, terminalClass: "interrupted" }; }); }
+  async approvalResponse(args) { return this.#raw("approval_response", args, async () => { const { requestId, response } = args.data; if (typeof requestId !== "string" || !response || typeof response !== "object") throw new Error("invalid approval response"); const rawId = this.approvalRequests.get(requestId); if (rawId === undefined) throw new Error("unknown approval request"); this.client.respond(rawId, response); this.approvalRequests.delete(requestId); return { providerRunId: "app-server", requestId }; }); }
   async shutdown(args) { if (!this.closed) { this.closed = true; await this.client.shutdown(); } return this.#ok("shutdown", args, { providerRunId: "app-server", terminalClass: "shutdown" }); }
   async diagnostics(args) { return this.#ok("diagnostics", args, { diagnostics: safeDiagnostics(this.client.diagnostics?.() ?? {}) }); }
-  #notification(message) { if (message?.method === "thread/tokenUsage/updated") this.emit("usage", { contractVersion: EXECUTION_PROVIDER_VERSION, operation: "observe_terminal", correlationId: this.active.get(`${message.params?.threadId}:${message.params?.turnId}`) ?? null, success: true, data: { threadId: message.params?.threadId ?? null, turnId: message.params?.turnId ?? null, usage: usage(message.params), providerRunId: `${message.params?.threadId ?? ""}:${message.params?.turnId ?? ""}` }, diagnostics: null }); if (message?.method === "account/rateLimits/updated") this.emit("account", { contractVersion: EXECUTION_PROVIDER_VERSION, operation: "account_read", correlationId: null, success: true, data: { rateLimits: message.params?.rateLimits ?? {} }, diagnostics: null }); }
+
+  #bind(threadId, turnId, correlationId) { if (typeof threadId === "string" && typeof turnId === "string" && typeof correlationId === "string") this.active.set(`${threadId}:${turnId}`, correlationId); }
+  #correlation(threadId, turnId) { return this.active.get(`${threadId}:${turnId}`) ?? null; }
+  #task(kind, params, data = {}) {
+    const threadId = params?.threadId ?? params?.thread?.id;
+    const turnId = params?.turnId ?? params?.turn?.id;
+    const correlationId = this.#correlation(threadId, turnId);
+    if (!correlationId || typeof threadId !== "string" || typeof turnId !== "string") return;
+    this.emit("lifecycle", lifecycleEvent({ kind, correlationId, data: { threadId, turnId, providerRunId: `${threadId}:${turnId}`, ...data } }));
+  }
+  #notification(message) {
+    if (message?.method === "thread/tokenUsage/updated") this.#task("usage_updated", message.params, { usage: usage(message.params) });
+    else if (message?.method === "item/started") this.#task("item_started", message.params, { itemType: message.params?.item?.type ?? null, itemStatus: message.params?.item?.status ?? null });
+    else if (message?.method === "item/completed") this.#task("item_completed", message.params, { itemType: message.params?.item?.type ?? null, itemStatus: message.params?.item?.status ?? null });
+    else if (message?.method === "turn/completed") this.#task("turn_completed", message.params, { terminalClass: message.params?.turn?.status ?? message.params?.status ?? null, usage: usage(message.params) });
+    else if (message?.method === "account/rateLimits/updated") this.emit("lifecycle", lifecycleEvent({ kind: "account_updated", providerGlobal: true, data: { rateLimits: message.params?.rateLimits ?? {} } }));
+  }
+  #protocol(event) {
+    if (event?.method !== "turn-id-alias" || typeof event.threadId !== "string" || typeof event.requestedTurnId !== "string" || typeof event.resolvedTurnId !== "string") return;
+    const correlationId = this.#correlation(event.threadId, event.requestedTurnId);
+    if (!correlationId) return;
+    this.#bind(event.threadId, event.resolvedTurnId, correlationId);
+    this.emit("lifecycle", lifecycleEvent({ kind: "turn_alias", correlationId, data: { threadId: event.threadId, turnId: event.resolvedTurnId, requestedTurnId: event.requestedTurnId, resolvedTurnId: event.resolvedTurnId, providerRunId: `${event.threadId}:${event.resolvedTurnId}` } }));
+  }
+  #serverRequest(message) {
+    const params = message?.params ?? {}; const correlationId = this.#correlation(params.threadId, params.turnId);
+    if (typeof message?.id !== "string" && typeof message?.id !== "number") return;
+    if (!correlationId) {
+      // An unowned server request cannot be delegated to controller policy.
+      // Settle it conservatively and stop the identifiable orphan turn.
+      try { this.client.respond(message.id, { decision: "cancel" }); } catch {}
+      if (typeof params.threadId === "string" && typeof params.turnId === "string") this.client.interruptTurn({ threadId: params.threadId, turnId: params.turnId }).catch(() => {});
+      return;
+    }
+    this.approvalRequests.set(String(message.id), message.id);
+    this.emit("lifecycle", lifecycleEvent({ kind: "approval_requested", correlationId, data: { threadId: params.threadId, turnId: params.turnId, requestId: String(message.id), approvalKind: message.method === "item/commandExecution/requestApproval" ? "command" : message.method === "item/fileChange/requestApproval" ? "file" : message.method === "item/permissions/requestApproval" ? "permissions" : "unknown", providerRunId: `${params.threadId}:${params.turnId}` } }));
+  }
   async #raw(operation, args, fn) { try { return this.#ok(operation, args, await fn()); } catch (error) { return this.#caught(operation, args, error); } }
   #ok(operation, args, data) { return envelope({ operation, correlationId: args.correlationId, success: true, data }); }
   #failure(operation, args, errorCode, errorClass) { return envelope({ operation, correlationId: args.correlationId, success: false, errorCode, errorClass }); }

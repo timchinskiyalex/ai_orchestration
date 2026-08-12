@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import { EventEmitter } from "node:events";
 import { execFileSync } from "node:child_process";
 import { AppServerExecutionProvider } from "./app-server-execution-provider.mjs";
-import { EXECUTION_PROVIDER_VERSION, assertCapabilities, validateEnvelope, ExecutionProviderError } from "./execution-provider-contract.mjs";
+import { EXECUTION_PROVIDER_VERSION, assertCapabilities, validateEnvelope, validateLifecycleEvent, ExecutionProviderError } from "./execution-provider-contract.mjs";
 import { BudgetGovernor } from "./budget-governor.mjs";
 import { depthOf, finalStatusForRole, assertRole, ENGINEERING_DOMAINS } from "./domain.mjs";
 import { StateStore } from "./state-store.mjs";
@@ -508,26 +508,21 @@ export class SwarmRouter extends EventEmitter {
     this.activeDeliverySessionId = sessionId;
     await this.worktrees.verifyRepository();
     this.#validateWorkerOverlays();
-    // Temporary persisted-config compatibility is deliberately wrapped before
-    // Router use; all calls still cross the v1 envelope and handshake.
-    const legacyFactory = this.config.appServerClientFactory;
     const client = this.config.executionProviderFactory?.({ cwd: this.config.repository })
-      ?? (typeof legacyFactory === "function" ? new AppServerExecutionProvider({ client: legacyFactory({ cwd: this.config.repository }) }) : new AppServerExecutionProvider({ cwd: this.config.repository }));
+      ?? new AppServerExecutionProvider({ cwd: this.config.repository });
     this.activeClient = client;
     this.stopRequested = false;
     this.expectedClientShutdown = false;
     this.budgetInterruptedTasks.clear();
     this.pendingBudgetWatchdogs.clear();
     this.activeTurns.clear();
-    client.on?.("usage", (event) => this.#onProviderUsage(event));
-    client.on?.("account", (event) => this.#onProviderAccount(event));
     client.on?.("lifecycle", (event) => this.#onProviderLifecycle(event));
     const onSigint = () => { this.requestShutdown("interrupted_controller_exit: SIGINT received").catch(() => {}); };
     process.once("SIGINT", onSigint);
     const heartbeat = deliveryRunId ? setInterval(() => this.store.heartbeatDeliveryLease(deliveryRunId, this.activeDeliverySessionId), this.config.delivery?.leaseHeartbeatMs ?? 5_000) : null;
     try {
       const handshake = await this.#provider(client, "handshake", {}, ["providerRunId"]);
-      assertCapabilities(handshake);
+      assertCapabilities(handshake, client);
       this.#lifecycle("execution provider connected", { contractVersion: EXECUTION_PROVIDER_VERSION });
       const account = await this.#provider(client, "account_read", {});
       const snapshot = this.account.normalize({ account: account.account, usage: account.usage, rateLimits: account.rateLimits, previous: this.store.latestAccountSnapshot() });
@@ -678,11 +673,16 @@ export class SwarmRouter extends EventEmitter {
     // The generated App Server schema explicitly allows `effort`; it does not
     // expose any server-side max-token field for turn/start.
     if (["bootstrap", "planner"].includes(task.role)) turnOptions.effort = "low";
-    const turnResult = await this.#provider(client, "start_turn", turnOptions, ["threadId", "turnId"]);
+    // Establish controller ownership before the adapter can accept a
+    // task-scoped notification. The same opaque correlation binds all turn
+    // lifecycle aliases, usage, approval, and terminal observations.
+    const turnCorrelationId = randomUUID();
+    this.activeTurns.set(task.id, { taskId: task.id, threadId, turnId: null, requestedTurnId: null, correlationId: turnCorrelationId, permittedTurnIds: new Set(), completion: null });
+    const turnResult = await this.#provider(client, "start_turn", turnOptions, ["threadId", "turnId"], turnCorrelationId);
     const turnId = turnResult.turnId;
     this.store.setThread(task.id, { threadId, turnId });
-    const completion = this.#provider(client, "observe_terminal", { threadId, turnId, timeoutMs: this.config.router.turnTimeoutMs }, ["threadId", "turnId", "terminalClass"]);
-    this.activeTurns.set(task.id, { taskId: task.id, threadId, turnId, completion });
+    const completion = this.#provider(client, "observe_terminal", { threadId, turnId, timeoutMs: this.config.router.turnTimeoutMs }, ["threadId", "turnId", "terminalClass"], turnCorrelationId);
+    this.activeTurns.set(task.id, { taskId: task.id, threadId, turnId, requestedTurnId: turnId, correlationId: turnCorrelationId, permittedTurnIds: new Set([turnId]), completion });
     this.#lifecycle("turn started", { taskId: task.id, threadId, turnId });
     const terminal = await completion;
     if (terminal.threadId !== threadId) throw new ExecutionProviderError("protocol_violation", "terminal thread mismatch");
@@ -881,11 +881,10 @@ export class SwarmRouter extends EventEmitter {
     for (const [threadId, mappedTaskId] of this.threadTasks.entries()) if (mappedTaskId === taskId) this.threadTasks.delete(threadId);
   }
 
-  async #provider(provider, operation, data, requiredIds = []) {
-    const names = { handshake: "handshake", account_read: "accountRead", start_thread: "startThread", set_goal: "setGoal", start_turn: "startTurn", observe_terminal: "observeTerminal", read_final_result: "readFinalResult", interrupt_turn: "interruptTurn", shutdown: "shutdown", diagnostics: "diagnostics" };
+  async #provider(provider, operation, data, requiredIds = [], correlationId = randomUUID()) {
+    const names = { handshake: "handshake", account_read: "accountRead", start_thread: "startThread", set_goal: "setGoal", start_turn: "startTurn", observe_terminal: "observeTerminal", read_final_result: "readFinalResult", interrupt_turn: "interruptTurn", approval_response: "approvalResponse", shutdown: "shutdown", diagnostics: "diagnostics" };
     const method = provider?.[names[operation]];
     if (typeof method !== "function") throw new ExecutionProviderError("unsupported_capability", `provider does not implement ${operation}`);
-    const correlationId = randomUUID();
     let result;
     try { result = await method.call(provider, { contractVersion: EXECUTION_PROVIDER_VERSION, correlationId, data }); }
     catch (error) { throw new ExecutionProviderError("transport_failure", String(error?.message ?? error), { errorClass: "transport" }); }
@@ -995,15 +994,17 @@ export class SwarmRouter extends EventEmitter {
         if (attempt === maxRepairTurns) throw error;
         const reason = String(error.message).slice(0, 1000);
         this.#lifecycle("planner validation retry", { taskId: task.id, threadId, attempt: attempt + 1, reason });
+        const turnCorrelationId = randomUUID();
+        this.activeTurns.set(task.id, { taskId: task.id, threadId, turnId: null, requestedTurnId: null, correlationId: turnCorrelationId, permittedTurnIds: new Set(), completion: null });
         const retry = await this.#provider(client, "start_turn", {
           threadId,
           effort: "low",
           input: [{ type: "text", text: `Your previous execution DAG was rejected by the deterministic controller: ${reason}\nReturn a corrected replacement JSON only. Preserve the requested project scope. The controller will normalize declared frontend/backend scaffold paths and direct scaffold dependencies; do not invent risk-flag names.` }]
-        });
+        }, [], turnCorrelationId);
         const requestedTurnId = retry.turnId;
         this.store.setThread(task.id, { threadId, turnId: requestedTurnId });
-        const completion = this.#provider(client, "observe_terminal", { threadId, turnId: requestedTurnId, timeoutMs: this.config.router.turnTimeoutMs }, ["threadId", "turnId", "terminalClass"]);
-        this.activeTurns.set(task.id, { taskId: task.id, threadId, turnId: requestedTurnId, completion });
+        const completion = this.#provider(client, "observe_terminal", { threadId, turnId: requestedTurnId, timeoutMs: this.config.router.turnTimeoutMs }, ["threadId", "turnId", "terminalClass"], turnCorrelationId);
+        this.activeTurns.set(task.id, { taskId: task.id, threadId, turnId: requestedTurnId, correlationId: turnCorrelationId, permittedTurnIds: new Set([requestedTurnId]), completion });
         this.#lifecycle("planner repair turn started", { taskId: task.id, threadId, turnId: requestedTurnId, attempt: attempt + 1 });
         const terminal = await completion;
         if (terminal.threadId !== threadId) throw new ExecutionProviderError("protocol_violation", "planner terminal thread mismatch");
@@ -1030,14 +1031,16 @@ export class SwarmRouter extends EventEmitter {
         if (attempt === maxRepairTurns) throw error;
         const reason = String(error.message).slice(0, 1600);
         this.#lifecycle("writer verification retry", { taskId: task.id, threadId, attempt: attempt + 1, reason });
+        const turnCorrelationId = randomUUID();
+        this.activeTurns.set(task.id, { taskId: task.id, threadId, turnId: null, requestedTurnId: null, correlationId: turnCorrelationId, permittedTurnIds: new Set(), completion: null });
         const retry = await this.#provider(client, "start_turn", {
           threadId,
           input: [{ type: "text", text: `The controller could not finalize your work because deterministic validation failed: ${reason}\nFix this failure now inside the existing worktree. Keep all edits within the assigned allowed paths. Run the required checks. Do not explain or plan; make the correction and finish.` }]
-        });
+        }, [], turnCorrelationId);
         const requestedTurnId = retry.turnId;
         this.store.setThread(task.id, { threadId, turnId: requestedTurnId });
-        const completion = this.#provider(client, "observe_terminal", { threadId, turnId: requestedTurnId, timeoutMs: this.config.router.turnTimeoutMs }, ["threadId", "turnId", "terminalClass"]);
-        this.activeTurns.set(task.id, { taskId: task.id, threadId, turnId: requestedTurnId, completion });
+        const completion = this.#provider(client, "observe_terminal", { threadId, turnId: requestedTurnId, timeoutMs: this.config.router.turnTimeoutMs }, ["threadId", "turnId", "terminalClass"], turnCorrelationId);
+        this.activeTurns.set(task.id, { taskId: task.id, threadId, turnId: requestedTurnId, correlationId: turnCorrelationId, permittedTurnIds: new Set([requestedTurnId]), completion });
         this.#lifecycle("writer repair turn started", { taskId: task.id, threadId, turnId: requestedTurnId, attempt: attempt + 1 });
         const terminal = await completion;
         if (terminal.threadId !== threadId) throw new ExecutionProviderError("protocol_violation", "writer terminal thread mismatch");
@@ -1673,31 +1676,60 @@ export class SwarmRouter extends EventEmitter {
     }
   }
 
-  #onProviderUsage(event) {
-    if (event?.contractVersion !== EXECUTION_PROVIDER_VERSION || event.operation !== "observe_terminal" || !event.success) return;
-    const data = event.data ?? {};
-    const taskId = this.threadTasks.get(data.threadId);
-    if (!taskId) return;
-    if (this.store.getTask(taskId)?.status !== "running") return;
-    this.#adoptResolvedTurnId(taskId, data.threadId, data.turnId);
-    const reportedTokenUsed = this.governor.normalizeUsage({ tokenUsage: { last: data.usage } });
-    this.store.setTokenUsage(taskId, reportedTokenUsed, { source: "turn_last" });
-    const tokenUsed = this.store.getTask(taskId)?.tokenUsed ?? reportedTokenUsed;
-    const watchdog = this.#enforceUsageBudget(taskId, tokenUsed)
-      .catch((error) => this.#lifecycle("budget watchdog failed", { taskId, error: String(error.message).slice(0, 300) }))
-      .finally(() => this.pendingBudgetWatchdogs.delete(watchdog));
-    this.pendingBudgetWatchdogs.add(watchdog);
-  }
-
-  #onProviderAccount(event) {
-    if (event?.contractVersion !== EXECUTION_PROVIDER_VERSION || event.operation !== "account_read" || !event.success) return;
-    this.account.onRateLimitsUpdated({ rateLimits: event.data?.rateLimits ?? {} });
-  }
-
   #onProviderLifecycle(event) {
-    if (event?.contractVersion !== EXECUTION_PROVIDER_VERSION || event.success !== false) return;
-    this.#lifecycle("execution provider lifecycle failure", { errorCode: event.errorCode ?? "protocol_violation" });
-    if (event.errorCode === "process_exit" && !this.stopRequested && !this.expectedClientShutdown && this.activeDeliveryRunId) this.#markInterrupted("interrupted_controller_exit: execution provider process exited");
+    let normalized;
+    try { normalized = validateLifecycleEvent(event); }
+    catch (error) { this.#lifecycle("execution provider protocol violation", { errorCode: error.errorCode ?? "protocol_violation" }); return; }
+    if (normalized.providerGlobal) {
+      if (normalized.kind === "account_updated" && normalized.success) this.account.onRateLimitsUpdated({ rateLimits: normalized.data.rateLimits ?? {} });
+      else if (normalized.kind === "process_exit") {
+        this.#lifecycle("execution provider lifecycle failure", { errorCode: normalized.errorCode ?? "process_exit" });
+        if (!this.stopRequested && !this.expectedClientShutdown && this.activeDeliveryRunId) this.#markInterrupted("interrupted_controller_exit: execution provider process exited");
+      }
+      return;
+    }
+    const data = normalized.data;
+    const taskId = this.threadTasks.get(data.threadId);
+    const active = taskId ? this.activeTurns.get(taskId) : null;
+    const task = taskId ? this.store.getTask(taskId) : null;
+    const permitted = normalized.kind === "turn_alias"
+      ? active?.permittedTurnIds?.has(data.requestedTurnId)
+      : active?.permittedTurnIds?.has(data.turnId) || active?.turnId === data.turnId;
+    if (!taskId || !active || !task || task.status !== "running" || active.correlationId !== normalized.correlationId || active.threadId !== data.threadId || !permitted) {
+      this.#lifecycle("execution provider protocol violation", { errorCode: "protocol_violation" });
+      return;
+    }
+    if (normalized.kind === "turn_alias") {
+      if (!active.permittedTurnIds.has(data.requestedTurnId) || data.turnId !== data.resolvedTurnId) { this.#lifecycle("execution provider protocol violation", { errorCode: "protocol_violation" }); return; }
+      active.permittedTurnIds.add(data.resolvedTurnId);
+      this.activeTurns.set(taskId, { ...active, turnId: data.resolvedTurnId, permittedTurnIds: active.permittedTurnIds });
+      this.#adoptResolvedTurnId(taskId, data.threadId, data.resolvedTurnId);
+      return;
+    }
+    if (normalized.kind === "usage_updated") {
+      const reportedTokenUsed = this.governor.normalizeUsage({ tokenUsage: { last: data.usage } });
+      this.store.setTokenUsage(taskId, reportedTokenUsed, { source: "turn_last" });
+      const tokenUsed = this.store.getTask(taskId)?.tokenUsed ?? reportedTokenUsed;
+      const watchdog = this.#enforceUsageBudget(taskId, tokenUsed)
+        .catch((error) => this.#lifecycle("budget watchdog failed", { taskId, error: String(error.message).slice(0, 300) }))
+        .finally(() => this.pendingBudgetWatchdogs.delete(watchdog));
+      this.pendingBudgetWatchdogs.add(watchdog);
+      this.#lifecycle("token usage updated", { taskId, threadId: data.threadId, turnId: data.turnId });
+      return;
+    }
+    if (normalized.kind === "approval_requested") { this.#handleApprovalRequest(taskId, data, normalized.correlationId).catch((error) => this.#lifecycle("approval response failed", { taskId, errorCode: error.errorCode ?? "transport_failure" })); return; }
+    if (["item_started", "item_completed", "turn_completed"].includes(normalized.kind)) this.#lifecycle(normalized.kind.replace("_", " "), { taskId, threadId: data.threadId, turnId: data.turnId, itemType: data.itemType ?? null, itemStatus: data.itemStatus ?? data.terminalClass ?? null });
+  }
+
+  async #handleApprovalRequest(taskId, data, correlationId) {
+    const task = this.store.getTask(taskId); if (!task || task.status !== "running") return;
+    const method = data.approvalKind ?? "unknown";
+    this.store.recordApproval({ requestId: data.requestId, taskId, method, payload: { threadId: data.threadId, turnId: data.turnId, kind: method }, decision: "deny" });
+    this.#lifecycle("approval requested", { taskId, threadId: data.threadId, turnId: data.turnId, method });
+    const response = method === "permissions" ? { permissions: {}, scope: "turn" } : { decision: "cancel" };
+    await this.#provider(this.activeClient, "approval_response", { requestId: data.requestId, response }, ["requestId"]);
+    if (task.status === "running") this.store.transition(taskId, this.isAutonomous() ? "failed" : "awaiting_approval", { error: this.isAutonomous() ? "Unexpected execution approval request in autonomous mode" : "Approval requested by execution provider" });
+    if (method === "unknown") this.#interruptAndAwaitTurn(this.activeClient, { taskId, threadId: data.threadId, turnId: data.turnId }, "unexpected_approval", { timeoutMs: this.config.delivery?.shutdownGraceMs ?? 3_000 }).catch(() => {});
   }
 
   #adoptResolvedTurnId(taskId, threadId, resolvedTurnId) {
@@ -1708,7 +1740,8 @@ export class SwarmRouter extends EventEmitter {
     this.store.setThread(taskId, { threadId, turnId: resolvedTurnId });
     if (this.activeTurns.has(taskId)) {
       const active = this.activeTurns.get(taskId);
-      this.activeTurns.set(taskId, { ...active, taskId, threadId, turnId: resolvedTurnId });
+      active.permittedTurnIds?.add(resolvedTurnId);
+      this.activeTurns.set(taskId, { ...active, taskId, threadId, turnId: resolvedTurnId, permittedTurnIds: active.permittedTurnIds });
     }
     this.#lifecycle("turn id alias resolved", { taskId, threadId, requestedTurnId, resolvedTurnId });
     return this.store.getTask(taskId);

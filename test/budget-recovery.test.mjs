@@ -28,6 +28,7 @@ class UsageFakeAppServer extends EventEmitter {
     this.turnAliases.set(resolvedTurnId, turnId);
     setTimeout(() => {
       if (this.exit) { this.emit("exit", { code: 1, signal: null }); this.waiters.get(`${threadId}:${turnId}`)?.reject(new Error("fake App Server exited")); return; }
+      if (resolvedTurnId !== turnId) this.emit("protocol", { method: "turn-id-alias", threadId, requestedTurnId: turnId, resolvedTurnId });
       if (this.usage !== null) this.emit("notification", { method: "thread/tokenUsage/updated", params: { threadId, turnId: resolvedTurnId, tokenUsage: { last: { totalTokens: this.usage }, total: { totalTokens: 9_999_999 } } } });
       if (this.usage !== null && (this.usage < 20 || this.completeAfterUsage)) this.waiters.get(`${threadId}:${turnId}`)?.resolve({ id: turnId, status: "completed" });
     }, 0);

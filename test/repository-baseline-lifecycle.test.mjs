@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DeliveryCoordinator } from "../src/delivery-coordinator.mjs";
 import { SwarmRouter } from "../src/router.mjs";
+import { AppServerExecutionProvider } from "../src/app-server-execution-provider.mjs";
 import { finalizeRepositoryBaseline } from "../src/repository-baseline.mjs";
 import { ingestDocumentation } from "../src/project-intake.mjs";
 import { fakeBlueprint } from "./product-blueprint-fixture.mjs";
@@ -81,7 +82,7 @@ function fixture({ plan, declaration = true } = {}) {
 }
 
 async function persistedBaseline(fx, client = new LifecycleClient()) {
-  fx.config.appServerClientFactory = () => client; const router = new SwarmRouter(fx.config);
+  fx.config.executionProviderFactory = () => new AppServerExecutionProvider({ client }); const router = new SwarmRouter(fx.config);
   ingestDocumentation({ source: fx.source, repository: fx.root, destinationRelative: fx.config.project.documentationDir });
   await router.ensureProjectOverlay();
   const draft = router.captureRepositoryBaselineDraft(await router.ensureProjectOverlay());
@@ -100,7 +101,7 @@ test("brownfield controller lifecycle captures, finalizes, materializes, verifie
     const run = router.store.currentDeliveryRun();
     if (/^Bootstrap /.test(goal)) { assert.ok(router.store.repositoryBaselineDraft(run.id)); client.events.push("draft-before-bootstrap"); }
     if (/^Plan /.test(goal)) { assert.ok(router.store.repositoryBaselineForRun(run.id)); client.events.push("final-before-planner"); }
-  } }); fx.config.appServerClientFactory = () => client; router = new SwarmRouter(fx.config); const coordinator = new DeliveryCoordinator(router);
+  } }); fx.config.executionProviderFactory = () => new AppServerExecutionProvider({ client }); router = new SwarmRouter(fx.config); const coordinator = new DeliveryCoordinator(router);
   try {
     const final = await coordinator.begin({ source: fx.source, ...remoteAdapters(count) });
     const run = router.store.deliveryRun(final.id); const draft = router.store.repositoryBaselineDraft(final.id); const baseline = router.store.repositoryBaselineForRun(final.id); const manifest = router.store.integrationManifest(final.integrationPath); const acceptance = router.store.productAcceptanceForRun(final.id).report;
@@ -117,7 +118,7 @@ test("missing or invalid declaration blocks a coordinator delivery before Bootst
     ["missing", (fx) => rmSync(join(fx.root, "baseline.json")), "repository_baseline:declaration_unavailable"],
     ["invalid", (fx) => writeFileSync(join(fx.root, "baseline.json"), JSON.stringify({ label: "fixture-label-SECRET_VALUE", args: ["--token", "fixture command output SECRET_VALUE"] })), "repository_baseline:declaration_malformed"]
   ]) {
-    const fx = fixture(); const client = new LifecycleClient(); fx.config.appServerClientFactory = () => client; const router = new SwarmRouter(fx.config); const coordinator = new DeliveryCoordinator(router);
+    const fx = fixture(); const client = new LifecycleClient(); fx.config.executionProviderFactory = () => new AppServerExecutionProvider({ client }); const router = new SwarmRouter(fx.config); const coordinator = new DeliveryCoordinator(router);
     try {
       prepare(fx); const blocked = await coordinator.begin({ source: fx.source, ...remoteAdapters(calls()) }); const bootstrap = router.list().find((item) => item.role === "bootstrap"); const serialized = JSON.stringify({ blocked, status: router.statusSnapshot(), bootstrap });
       assert.equal(blocked.state, "blocked_repository_baseline", kind); assert.deepEqual(blocked.publish.codes, [code], kind); assert.equal(bootstrap.status, "blocked_repository_baseline", kind); assert.deepEqual(client.goals, [], kind); assert.equal(router.list().some((item) => item.role === "planner"), false, kind);
@@ -133,7 +134,7 @@ test("planner rejects missing, unknown, and out-of-scope behavior coverage befor
     ["out-of-scope", { blueprintId: "pb-test", tasks: [{ ...protectedPlan().tasks[0], allowedPaths: ["lib/disjoint.mjs"], baselineBehaviorIds: ["value-preserved"] }] }]
   ];
   for (const [label, plan] of variants) {
-    const fx = fixture(); const client = new LifecycleClient({ plan }); fx.config.appServerClientFactory = () => client; const router = new SwarmRouter(fx.config);
+    const fx = fixture(); const client = new LifecycleClient({ plan }); fx.config.executionProviderFactory = () => new AppServerExecutionProvider({ client }); const router = new SwarmRouter(fx.config);
     try {
       const result = await new DeliveryCoordinator(router).begin({ source: fx.source, ...remoteAdapters(calls()) });
       assert.equal(result.state, "failed", label); assert.equal(router.list().some((item) => item.role === "backend"), false, label); assert.equal(client.goals.some((goal) => /^Writer /.test(goal.objective)), false, label);
@@ -142,14 +143,14 @@ test("planner rejects missing, unknown, and out-of-scope behavior coverage befor
 });
 
 test("unchanged brownfield candidate resumes with its exact baseline, while legacy and stale records cannot publish", async () => {
-  const fx = fixture(); const count = calls(); const client = new LifecycleClient(); fx.config.appServerClientFactory = () => client; const router = new SwarmRouter(fx.config); const coordinator = new DeliveryCoordinator(router);
+  const fx = fixture(); const count = calls(); const client = new LifecycleClient(); fx.config.executionProviderFactory = () => new AppServerExecutionProvider({ client }); const router = new SwarmRouter(fx.config); const coordinator = new DeliveryCoordinator(router);
   try {
     const blockedCi = await coordinator.begin({ source: fx.source, ...remoteAdapters(count, { ci: "timed_out" }) }); const baseline = router.store.repositoryBaselineForRun(blockedCi.id); const goalCount = client.goals.length;
     const resumed = await coordinator.resume(remoteAdapters(count));
     assert.equal(blockedCi.state, "blocked_ci"); assert.equal(resumed.state, "completed_merged"); assert.equal(client.goals.length, goalCount); assert.equal(router.store.repositoryBaselineForRun(resumed.id).digest, baseline.digest);
   } finally { router.close(); rmSync(fx.root, { recursive: true, force: true }); }
 
-  const legacy = fixture(); const legacyClient = new LifecycleClient(); legacy.config.appServerClientFactory = () => legacyClient; const legacyRouter = new SwarmRouter(legacy.config); const legacyCount = calls();
+  const legacy = fixture(); const legacyClient = new LifecycleClient(); legacy.config.executionProviderFactory = () => new AppServerExecutionProvider({ client: legacyClient }); const legacyRouter = new SwarmRouter(legacy.config); const legacyCount = calls();
   try {
     const bootstrap = legacyRouter.enqueue({ role: "bootstrap", title: "legacy", prompt: "legacy" }); const run = legacyRouter.createDeliveryRun({ id: "legacy-brownfield-candidate", bootstrapTaskId: bootstrap.id, repositoryMode: "brownfield", repositoryBaseSha: null }); legacyRouter.store.linkTaskToDelivery(bootstrap.id, run.id); legacyRouter.store.updateDeliveryRun(run.id, { state: "interrupted", integrationPath: "missing-manifest", candidate: { branch: "swarm/candidate/legacy", sha: "a".repeat(40) } });
     const blocked = await new DeliveryCoordinator(legacyRouter).resume(remoteAdapters(legacyCount));
@@ -175,7 +176,7 @@ test("stale declaration, base/tree, and stored baseline stop interrupted resume 
 
 test("scoped replan retains a valid baseline and a stale baseline blocks recovery Planner creation", async () => {
   for (const stale of [false, true]) {
-    const fx = fixture({ plan: protectedPlan() }); const client = new LifecycleClient({ plan: protectedPlan(), scopedPlan: recoveryPlan(), onTurn: (goal) => { if (/^Scoped recovery plan /.test(goal)) client.events.push("scoped-planner-turn"); } }); fx.config.appServerClientFactory = () => client; const router = new SwarmRouter(fx.config); const coordinator = new DeliveryCoordinator(router);
+    const fx = fixture({ plan: protectedPlan() }); const client = new LifecycleClient({ plan: protectedPlan(), scopedPlan: recoveryPlan(), onTurn: (goal) => { if (/^Scoped recovery plan /.test(goal)) client.events.push("scoped-planner-turn"); } }); fx.config.executionProviderFactory = () => new AppServerExecutionProvider({ client }); const router = new SwarmRouter(fx.config); const coordinator = new DeliveryCoordinator(router);
     try {
       const initial = await coordinator.begin({ source: fx.source, ...remoteAdapters(calls(), { ci: "timed_out" }) }); const run = router.store.deliveryRun(initial.id); router.store.updateDeliveryRun(run.id, { state: "running" });
       const writer = router.enqueue({ role: "backend", title: "failed writer", prompt: "failed writer", allowedPaths: ["src/value.mjs"], requirementIds: ["fix-value"], baselineBehaviorIds: ["value-preserved"], blueprintId: "pb-test", deliveryRunId: run.id }); router.store.transition(writer.id, "preparing"); router.store.transition(writer.id, "running"); assert.ok(router.recordDependencyContractChange(writer.id, "deterministic recovery"));
