@@ -60,7 +60,10 @@ export class StateStore {
         blueprint_id TEXT,
         requirement_ids_json TEXT NOT NULL DEFAULT '[]',
         interrupt_threshold_tokens INTEGER,
-        configured_budget_cap INTEGER, plan_batch_id TEXT, wave INTEGER, integration_barrier_id TEXT
+        configured_budget_cap INTEGER
+        ,plan_batch_id TEXT
+        ,wave INTEGER
+        ,integration_barrier_id TEXT
       );
       CREATE TABLE IF NOT EXISTS events (
         sequence INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -160,7 +163,6 @@ export class StateStore {
         configured_budget_cap INTEGER NOT NULL,
         threshold_overshoot_tokens INTEGER NOT NULL,
         cap_overshoot_tokens INTEGER NOT NULL,
-
         reason TEXT NOT NULL,
         interrupted_at TEXT NOT NULL
       );
@@ -186,12 +188,45 @@ export class StateStore {
         payload_json TEXT NOT NULL,
         created_at TEXT NOT NULL
       );
-      CREATE TABLE IF NOT EXISTS product_acceptance_reports (id TEXT PRIMARY KEY, schema_version INTEGER NOT NULL, delivery_run_id TEXT NOT NULL, blueprint_id TEXT NOT NULL, blueprint_digest TEXT NOT NULL, manifest_id TEXT NOT NULL, manifest_path TEXT NOT NULL, candidate_sha TEXT NOT NULL, report_json TEXT NOT NULL, passing INTEGER NOT NULL, created_at TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS plan_batches (id TEXT PRIMARY KEY, schema_version INTEGER NOT NULL, kind TEXT NOT NULL, delivery_run_id TEXT NOT NULL, blueprint_id TEXT NOT NULL, wave INTEGER NOT NULL, based_on_checkpoint_sha TEXT NOT NULL, tasks_json TEXT NOT NULL, created_at TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS integration_barriers (id TEXT PRIMARY KEY, schema_version INTEGER NOT NULL, kind TEXT NOT NULL, delivery_run_id TEXT NOT NULL, blueprint_id TEXT NOT NULL, wave INTEGER NOT NULL, base_sha TEXT NOT NULL, input_artifacts_json TEXT NOT NULL, status TEXT NOT NULL, checkpoint_id TEXT, error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS integration_checkpoints (id TEXT PRIMARY KEY, schema_version INTEGER NOT NULL, kind TEXT NOT NULL, delivery_run_id TEXT NOT NULL, blueprint_id TEXT NOT NULL, wave INTEGER NOT NULL, base_sha TEXT NOT NULL, input_artifacts_json TEXT NOT NULL, output_sha TEXT NOT NULL, verification_results_json TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS wave_reconciliations (delivery_run_id TEXT NOT NULL, wave INTEGER NOT NULL, checkpoint_id TEXT NOT NULL, checkpoint_sha TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(delivery_run_id, wave));
-      CREATE TABLE IF NOT EXISTS scoped_replans (id TEXT PRIMARY KEY, delivery_run_id TEXT, blueprint_id TEXT, failed_task_id TEXT NOT NULL, invalidated_task_ids_json TEXT NOT NULL, prior_plan_batch_id TEXT, replacement_plan_batch_id TEXT, status TEXT NOT NULL, created_at TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS product_acceptance_reports (
+        id TEXT PRIMARY KEY, schema_version INTEGER NOT NULL, delivery_run_id TEXT NOT NULL REFERENCES delivery_runs(id),
+        blueprint_id TEXT NOT NULL, blueprint_digest TEXT NOT NULL, manifest_id TEXT NOT NULL, manifest_path TEXT NOT NULL,
+        candidate_sha TEXT NOT NULL, report_json TEXT NOT NULL, passing INTEGER NOT NULL, created_at TEXT NOT NULL
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_acceptance_identity ON product_acceptance_reports(delivery_run_id, manifest_id, candidate_sha);
+      CREATE TABLE IF NOT EXISTS plan_batches (
+        id TEXT PRIMARY KEY, schema_version INTEGER NOT NULL, kind TEXT NOT NULL,
+        delivery_run_id TEXT NOT NULL, blueprint_id TEXT NOT NULL, wave INTEGER NOT NULL,
+        based_on_checkpoint_sha TEXT NOT NULL, tasks_json TEXT NOT NULL, created_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS integration_barriers (
+        id TEXT PRIMARY KEY, schema_version INTEGER NOT NULL, kind TEXT NOT NULL,
+        delivery_run_id TEXT NOT NULL, blueprint_id TEXT NOT NULL, wave INTEGER NOT NULL,
+        base_sha TEXT NOT NULL, input_artifacts_json TEXT NOT NULL, status TEXT NOT NULL,
+        checkpoint_id TEXT, error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS integration_checkpoints (
+        id TEXT PRIMARY KEY, schema_version INTEGER NOT NULL, kind TEXT NOT NULL,
+        delivery_run_id TEXT NOT NULL, blueprint_id TEXT NOT NULL, wave INTEGER NOT NULL,
+        base_sha TEXT NOT NULL, input_artifacts_json TEXT NOT NULL, output_sha TEXT NOT NULL,
+        verification_results_json TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS wave_reconciliations (
+        delivery_run_id TEXT NOT NULL, wave INTEGER NOT NULL, checkpoint_id TEXT NOT NULL,
+        checkpoint_sha TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL,
+        PRIMARY KEY(delivery_run_id, wave)
+      );
+      CREATE TABLE IF NOT EXISTS scoped_replans (
+        id TEXT PRIMARY KEY, delivery_run_id TEXT, blueprint_id TEXT, failed_task_id TEXT NOT NULL,
+        invalidated_task_ids_json TEXT NOT NULL, prior_plan_batch_id TEXT, replacement_plan_batch_id TEXT,
+        status TEXT NOT NULL, created_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS task_replacements (
+        replan_id TEXT NOT NULL, old_task_id TEXT NOT NULL, replacement_task_id TEXT,
+        kind TEXT NOT NULL DEFAULT 'task', created_at TEXT NOT NULL,
+        PRIMARY KEY(replan_id, old_task_id),
+        FOREIGN KEY(replan_id) REFERENCES scoped_replans(id)
+      );
       CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status, created_at);
       CREATE INDEX IF NOT EXISTS idx_tasks_thread ON tasks(thread_id);
       CREATE INDEX IF NOT EXISTS idx_events_task ON events(task_id, sequence);
@@ -213,7 +248,29 @@ export class StateStore {
     this.#addColumnIfMissing("tasks", "interrupt_threshold_tokens", "INTEGER");
     this.#addColumnIfMissing("tasks", "configured_budget_cap", "INTEGER");
     this.#addColumnIfMissing("tasks", "token_usage_source", "TEXT");
-    this.#addColumnIfMissing("tasks", "plan_batch_id", "TEXT"); this.#addColumnIfMissing("tasks", "wave", "INTEGER"); this.#addColumnIfMissing("tasks", "integration_barrier_id", "TEXT");
+    this.#addColumnIfMissing("tasks", "plan_batch_id", "TEXT");
+    this.#addColumnIfMissing("tasks", "wave", "INTEGER");
+    this.#addColumnIfMissing("tasks", "integration_barrier_id", "TEXT");
+    // Scoped recovery v2 is deliberately additive: old rows are evidence, not
+    // safe autonomous work items.  New records carry all context needed to
+    // claim a single recovery planner after a restart.
+    this.#addColumnIfMissing("scoped_replans", "schema_version", "INTEGER NOT NULL DEFAULT 1");
+    this.#addColumnIfMissing("scoped_replans", "failure_kind", "TEXT");
+    this.#addColumnIfMissing("scoped_replans", "failure_detail", "TEXT");
+    this.#addColumnIfMissing("scoped_replans", "affected_task_ids_json", "TEXT");
+    this.#addColumnIfMissing("scoped_replans", "preserved_artifacts_json", "TEXT");
+    this.#addColumnIfMissing("scoped_replans", "prior_checkpoint_id", "TEXT");
+    this.#addColumnIfMissing("scoped_replans", "prior_checkpoint_sha", "TEXT");
+    this.#addColumnIfMissing("scoped_replans", "remaining_requirement_ids_json", "TEXT");
+    this.#addColumnIfMissing("scoped_replans", "prior_context_json", "TEXT");
+    this.#addColumnIfMissing("scoped_replans", "attempt", "INTEGER NOT NULL DEFAULT 0");
+    this.#addColumnIfMissing("scoped_replans", "max_attempts", "INTEGER NOT NULL DEFAULT 2");
+    this.#addColumnIfMissing("scoped_replans", "idempotency_key", "TEXT");
+    this.#addColumnIfMissing("scoped_replans", "planner_task_id", "TEXT");
+    this.#addColumnIfMissing("scoped_replans", "updated_at", "TEXT");
+    this.#addColumnIfMissing("scoped_replans", "completed_at", "TEXT");
+    this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_scoped_replans_idempotency ON scoped_replans(idempotency_key); CREATE INDEX IF NOT EXISTS idx_scoped_replans_run_status ON scoped_replans(delivery_run_id, status);");
+    this.db.prepare("UPDATE scoped_replans SET status = 'legacy_manual', updated_at = COALESCE(updated_at, created_at) WHERE schema_version < 2 OR failure_kind IS NULL OR idempotency_key IS NULL").run();
     this.hasTokenUsageSource = true;
     this.#addColumnIfMissing("delivery_runs", "owner_pid", "INTEGER");
     this.#addColumnIfMissing("delivery_runs", "owner_session_id", "TEXT");
@@ -240,12 +297,12 @@ export class StateStore {
     this.#mutate(task.id, `task/${initialStatus}`, { role: task.role, title: task.title, humanApprovalRequired: Boolean(task.humanApprovalRequired) }, () => this.db.prepare(`INSERT INTO tasks (
       id, parent_task_id, role, title, prompt, status, allowed_paths_json,
       acceptance_checks_json, dependencies_json, human_approval_required, token_budget, estimated_tokens, max_attempts, created_at, updated_at,
-      risk_flags_json, supporting_domains_json, artifact_base_sha, artifact_dependencies_json, remediation_round, source_writer_task_id, delivery_run_id, blueprint_id, requirement_ids_json
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      risk_flags_json, supporting_domains_json, artifact_base_sha, artifact_dependencies_json, remediation_round, source_writer_task_id, delivery_run_id, blueprint_id, requirement_ids_json, plan_batch_id, wave, integration_barrier_id
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
       task.id, task.parentTaskId ?? null, task.role, task.title, task.prompt,
       initialStatus, json(task.allowedPaths), json(task.acceptanceChecks), json(task.dependencies), task.humanApprovalRequired ? 1 : 0, task.tokenBudget, task.estimatedTokens ?? task.tokenBudget,
       task.maxAttempts, timestamp, timestamp, json(task.riskFlags), json(task.supportingDomains), task.artifactBaseSha ?? null,
-      json(task.artifactDependencies), task.remediationRound ?? 0, task.sourceWriterTaskId ?? null, task.deliveryRunId ?? null, task.blueprintId ?? null, json(task.requirementIds)
+      json(task.artifactDependencies), task.remediationRound ?? 0, task.sourceWriterTaskId ?? null, task.deliveryRunId ?? null, task.blueprintId ?? null, json(task.requirementIds), task.planBatchId ?? null, task.wave ?? null, task.integrationBarrierId ?? null
     ));
     return this.getTask(task.id);
   }
@@ -269,12 +326,12 @@ export class StateStore {
         this.db.prepare(`INSERT INTO tasks (
           id, parent_task_id, role, title, prompt, status, allowed_paths_json,
           acceptance_checks_json, dependencies_json, human_approval_required, token_budget, estimated_tokens, max_attempts, created_at, updated_at,
-          risk_flags_json, supporting_domains_json, artifact_base_sha, artifact_dependencies_json, remediation_round, source_writer_task_id, delivery_run_id, blueprint_id, requirement_ids_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)` ).run(
+          risk_flags_json, supporting_domains_json, artifact_base_sha, artifact_dependencies_json, remediation_round, source_writer_task_id, delivery_run_id, blueprint_id, requirement_ids_json, plan_batch_id, wave, integration_barrier_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)` ).run(
           task.id, task.parentTaskId ?? null, task.role, task.title, task.prompt,
           initialStatus, json(task.allowedPaths), json(task.acceptanceChecks), json(task.dependencies), task.humanApprovalRequired ? 1 : 0,
           task.tokenBudget, task.estimatedTokens ?? task.tokenBudget, task.maxAttempts ?? 1, timestamp, timestamp,
-          json(task.riskFlags), json(task.supportingDomains), task.artifactBaseSha ?? null, json(task.artifactDependencies), task.remediationRound ?? 0, task.sourceWriterTaskId ?? null, task.deliveryRunId ?? null, task.blueprintId ?? null, json(task.requirementIds)
+          json(task.riskFlags), json(task.supportingDomains), task.artifactBaseSha ?? null, json(task.artifactDependencies), task.remediationRound ?? 0, task.sourceWriterTaskId ?? null, task.deliveryRunId ?? null, task.blueprintId ?? null, json(task.requirementIds), task.planBatchId ?? null, task.wave ?? null, task.integrationBarrierId ?? null
         );
         this.#insertEvent(task.id, `task/${initialStatus}`, { role: task.role, title: task.title, humanApprovalRequired: Boolean(task.humanApprovalRequired) });
         for (const requirementId of task.requirementIds ?? []) this.#insertTraceability({ requirementId, blueprintId: task.blueprintId, taskId: task.id, checkpoint: "planned", payload: { role: task.role, parentTaskId: task.parentTaskId ?? null } });
@@ -294,7 +351,8 @@ export class StateStore {
 
   setArtifactLineage(taskId, { artifactBaseSha, artifactDependencies }) {
     if (!this.getTask(taskId)) throw new Error(`Task not found: ${taskId}`);
-    if (!Array.isArray(artifactDependencies) || artifactDependencies.length > 1) throw new Error("WorkerArtifact may have exactly zero or one parent artifact ID"); if (!/^[a-f0-9]{40,64}$/i.test(artifactBaseSha ?? "")) throw new Error("WorkerArtifact lineage requires a verified Git SHA");
+    if (!Array.isArray(artifactDependencies) || artifactDependencies.length > 1) throw new Error("WorkerArtifact may have exactly zero or one parent artifact ID");
+    if (!/^[a-f0-9]{40,64}$/i.test(artifactBaseSha ?? "")) throw new Error("WorkerArtifact lineage requires a verified Git SHA");
     this.db.prepare("UPDATE tasks SET artifact_base_sha = ?, artifact_dependencies_json = ?, updated_at = ? WHERE id = ? AND status = 'queued'").run(artifactBaseSha, json(artifactDependencies), now(), taskId);
     return this.getTask(taskId);
   }
@@ -329,7 +387,6 @@ export class StateStore {
       const row = candidates.find((candidate) => parse(candidate.dependencies_json, []).every((id) => this.getTask(id)?.status === "done") && (!candidate.integration_barrier_id || this.integrationBarrier(candidate.integration_barrier_id)?.status === "passed"));
       if (!row) { this.db.exec("COMMIT"); return null; }
       const timestamp = now();
-
       this.db.prepare("UPDATE tasks SET status = 'preparing', attempt = attempt + 1, updated_at = ? WHERE id = ? AND status = 'queued'").run(timestamp, row.id);
       this.#insertEvent(row.id, "task/claimed", { attempt: row.attempt + 1 });
       this.db.exec("COMMIT");
@@ -467,7 +524,10 @@ export class StateStore {
 
   recordWorkerArtifact(taskId, artifactPath, artifact) {
     const task = this.getTask(taskId);
-    validateWorkerArtifactContract(artifact); if (artifact.taskId !== taskId) throw new Error("WorkerArtifact taskId does not match persistence target"); if (this.workerArtifact(taskId)) throw new Error(`WorkerArtifact for ${taskId} is immutable and already persisted`);
+    validateWorkerArtifactContract(artifact);
+    if (artifact.taskId !== taskId) throw new Error("WorkerArtifact taskId does not match persistence target");
+    if (this.workerArtifact(taskId)) throw new Error(`WorkerArtifact for ${taskId} is immutable and already persisted`);
+    if ((artifact.dependencies ?? []).length > 1) throw new Error("WorkerArtifact may have exactly zero or one parent artifact ID");
     this.#mutate(taskId, "worker/artifact", { artifactPath, schemaVersion: artifact.schemaVersion }, () => {
       this.db.prepare(`INSERT INTO worker_artifacts(task_id, schema_version, artifact_path, artifact_json, created_at)
         VALUES (?, ?, ?, ?, ?)` ).run(taskId, artifact.schemaVersion, artifactPath, JSON.stringify(artifact), now());
@@ -477,27 +537,19 @@ export class StateStore {
 
   workerArtifact(taskId) {
     const row = this.db.prepare("SELECT artifact_json FROM worker_artifacts WHERE task_id = ?").get(taskId);
-    if (!row) return null; const artifact = JSON.parse(row.artifact_json); try { validateWorkerArtifactContract(artifact); return artifact; } catch { return null; }
+    if (!row) return null;
+    const artifact = JSON.parse(row.artifact_json);
+    try { validateWorkerArtifactContract(artifact); return artifact; }
+    catch { return null; } // legacy evidence remains in SQLite but is never trusted as a baseline
   }
 
   workerArtifactRecord(taskId) {
     const row = this.db.prepare("SELECT artifact_path, artifact_json FROM worker_artifacts WHERE task_id = ?").get(taskId);
-    if (!row) return null; const artifact = JSON.parse(row.artifact_json); try { validateWorkerArtifactContract(artifact); return { path: row.artifact_path, artifact }; } catch { return { path: row.artifact_path, artifact, trusted: false }; }
+    if (!row) return null;
+    const artifact = JSON.parse(row.artifact_json);
+    try { validateWorkerArtifactContract(artifact); return { path: row.artifact_path, artifact }; }
+    catch { return { path: row.artifact_path, artifact, trusted: false }; }
   }
-  createPlanBatch(batch, tasks = []) { validatePlan(batch, { maxTasks: Math.max(batch.tasks?.length ?? 0, 1), requirePlanBatch: true }); if (this.db.prepare("SELECT id FROM plan_batches WHERE id = ?").get(batch.id)) throw new Error(`PlanBatch ${batch.id} is immutable and already persisted`); if (!Array.isArray(tasks) || tasks.length < batch.tasks.length) throw new Error("PlanBatch task materialization must include every planned writer"); this.db.prepare("INSERT INTO plan_batches(id,schema_version,kind,delivery_run_id,blueprint_id,wave,based_on_checkpoint_sha,tasks_json,created_at) VALUES (?,?,?,?,?,?,?,?,?)").run(batch.id,batch.schemaVersion,batch.kind,batch.deliveryRunId,batch.blueprintId,batch.wave,batch.basedOnCheckpointSha,JSON.stringify(batch.tasks),batch.createdAt); try { this.createTasks(tasks); for (const task of tasks) this.db.prepare("UPDATE tasks SET plan_batch_id=?, wave=?, integration_barrier_id=? WHERE id=?").run(batch.id,batch.wave,task.integrationBarrierId ?? null,task.id); } catch (error) { this.db.prepare("DELETE FROM plan_batches WHERE id=?").run(batch.id); throw error; } return this.planBatch(batch.id); }
-  planBatch(id) { const row=this.db.prepare("SELECT * FROM plan_batches WHERE id=?").get(id); return row ? {schemaVersion:row.schema_version,kind:row.kind,id:row.id,deliveryRunId:row.delivery_run_id,blueprintId:row.blueprint_id,wave:row.wave,basedOnCheckpointSha:row.based_on_checkpoint_sha,tasks:parse(row.tasks_json,[]),createdAt:row.created_at}:null; }
-  planBatches(deliveryRunId) { return this.db.prepare("SELECT id FROM plan_batches WHERE delivery_run_id=? ORDER BY wave,created_at").all(deliveryRunId).map((row)=>this.planBatch(row.id)); }
-  createIntegrationBarrier(barrier) { validateIntegrationBarrier(barrier); this.db.prepare("INSERT INTO integration_barriers(id,schema_version,kind,delivery_run_id,blueprint_id,wave,base_sha,input_artifacts_json,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)").run(barrier.id,barrier.schemaVersion,barrier.kind,barrier.deliveryRunId,barrier.blueprintId,barrier.wave,barrier.baseSha,JSON.stringify(barrier.inputArtifacts),barrier.status,barrier.createdAt,barrier.createdAt); return this.integrationBarrier(barrier.id); }
-  integrationBarrier(id) { const row=this.db.prepare("SELECT * FROM integration_barriers WHERE id=?").get(id); return row ? {schemaVersion:row.schema_version,kind:row.kind,id:row.id,deliveryRunId:row.delivery_run_id,blueprintId:row.blueprint_id,wave:row.wave,baseSha:row.base_sha,inputArtifacts:parse(row.input_artifacts_json,[]),status:row.status,checkpointId:row.checkpoint_id,error:row.error,createdAt:row.created_at}:null; }
-  setIntegrationBarrier(taskId,barrierId) { this.db.prepare("UPDATE tasks SET integration_barrier_id=?,updated_at=? WHERE id=? AND status='queued'").run(barrierId,now(),taskId); return this.getTask(taskId); }
-  readyIntegrationBarriers(deliveryRunId=null) { const sql=deliveryRunId?"SELECT id FROM integration_barriers WHERE delivery_run_id=? AND status='pending'":"SELECT id FROM integration_barriers WHERE status='pending'"; return this.db.prepare(sql).all(...(deliveryRunId?[deliveryRunId]:[])).map((row)=>this.integrationBarrier(row.id)).filter((b)=>b.inputArtifacts.every((i)=>Boolean(this.workerArtifact(i.artifactId)))); }
-  claimIntegrationBarrier(id) { return this.db.prepare("UPDATE integration_barriers SET status='running',updated_at=? WHERE id=? AND status='pending'").run(now(),id).changes===1?this.integrationBarrier(id):null; }
-  failIntegrationBarrier(id,error) { this.db.prepare("UPDATE integration_barriers SET status='failed',error=?,updated_at=? WHERE id=?").run(error,now(),id); }
-  recordIntegrationCheckpoint(c,{barrierId}={}) { validateIntegrationCheckpoint(c); this.db.prepare("INSERT INTO integration_checkpoints(id,schema_version,kind,delivery_run_id,blueprint_id,wave,base_sha,input_artifacts_json,output_sha,verification_results_json,status,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)").run(c.id,c.schemaVersion,c.kind,c.deliveryRunId,c.blueprintId,c.wave,c.baseSha,JSON.stringify(c.inputArtifacts),c.outputSha,JSON.stringify(c.verificationResults),c.status,c.createdAt); if(barrierId)this.db.prepare("UPDATE integration_barriers SET status='passed',checkpoint_id=?,updated_at=? WHERE id=?").run(c.id,now(),barrierId); return this.integrationCheckpoint(c.id); }
-  integrationCheckpoint(id) { const row=this.db.prepare("SELECT * FROM integration_checkpoints WHERE id=?").get(id); return row?{schemaVersion:row.schema_version,kind:row.kind,id:row.id,deliveryRunId:row.delivery_run_id,blueprintId:row.blueprint_id,wave:row.wave,baseSha:row.base_sha,inputArtifacts:parse(row.input_artifacts_json,[]),outputSha:row.output_sha,verificationResults:parse(row.verification_results_json,[]),status:row.status,createdAt:row.created_at}:null; }
-  reconcileWave({deliveryRunId,wave,checkpointId}) { const c=this.integrationCheckpoint(checkpointId); if(!c||c.status!=="passed")throw new Error("Wave reconciliation requires a successful verified IntegrationCheckpoint"); this.db.prepare("INSERT INTO wave_reconciliations(delivery_run_id,wave,checkpoint_id,checkpoint_sha,status,created_at) VALUES (?,?,?,?,?,?)").run(deliveryRunId,wave,checkpointId,c.outputSha,"reconciled",now()); return this.currentCheckpoint(deliveryRunId); }
-  currentCheckpoint(deliveryRunId) { const row=this.db.prepare("SELECT checkpoint_id,checkpoint_sha,wave FROM wave_reconciliations WHERE delivery_run_id=? ORDER BY wave DESC LIMIT 1").get(deliveryRunId); return row?{checkpointId:row.checkpoint_id,outputSha:row.checkpoint_sha,wave:row.wave}:null; }
-  recordScopedReplan(v) { this.db.prepare("INSERT INTO scoped_replans(id,delivery_run_id,blueprint_id,failed_task_id,invalidated_task_ids_json,prior_plan_batch_id,replacement_plan_batch_id,status,created_at) VALUES (?,?,?,?,?,?,?,?,?)").run(v.id,v.deliveryRunId??null,v.blueprintId??null,v.failedTaskId,JSON.stringify(v.invalidatedTaskIds??[]),v.priorPlanBatchId??null,null,v.status??"pending",v.createdAt??now()); }
 
   recordQualityReport({ qaTaskId, writerTaskId, reportPath, report }) {
     const task = this.getTask(qaTaskId);
@@ -505,7 +557,6 @@ export class StateStore {
       this.db.prepare(`INSERT OR REPLACE INTO quality_reports(qa_task_id, writer_task_id, schema_version, report_path, report_json, created_at)
         VALUES (?, ?, ?, ?, ?, ?)` ).run(qaTaskId, writerTaskId, report.schemaVersion, reportPath, JSON.stringify(report), now());
       for (const requirementId of task?.requirementIds ?? []) this.#insertTraceability({ requirementId, blueprintId: task.blueprintId, taskId: qaTaskId, verificationPath: reportPath, checkpoint: "verification", payload: { kind: "qa", verdict: report.verdict } });
-
     });
   }
 
@@ -585,6 +636,111 @@ export class StateStore {
     return this.deliveryRun(id);
   }
 
+  createPlanBatch(batch, tasks = [], { replanId = null, replacements = [] } = {}) {
+    validatePlan(batch, { maxTasks: Math.max(batch.tasks?.length ?? 0, 1) });
+    const persisted = this.db.prepare("SELECT id FROM plan_batches WHERE id = ?").get(batch.id);
+    if (persisted) {
+      if (replanId && this.scopedReplan(replanId)?.replacementPlanBatchId === batch.id) return this.planBatch(batch.id);
+      throw new Error(`PlanBatch ${batch.id} is immutable and already persisted`);
+    }
+    if (!Array.isArray(tasks) || tasks.length < batch.tasks.length) throw new Error("PlanBatch task materialization must include every planned writer");
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.prepare("INSERT INTO plan_batches(id, schema_version, kind, delivery_run_id, blueprint_id, wave, based_on_checkpoint_sha, tasks_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+        .run(batch.id, batch.schemaVersion, batch.kind, batch.deliveryRunId, batch.blueprintId, batch.wave, batch.basedOnCheckpointSha, JSON.stringify(batch.tasks), batch.createdAt);
+      // Inline version of createTasks keeps the batch row and task DAG one decision.
+      for (const task of tasks) {
+        assertRole(task.role); this.#validateTaskBlueprint(task);
+        if (this.getTask(task.id)) throw new Error("PlanBatch task ids must be unused");
+        const timestamp = now(), initialStatus = task.humanApprovalRequired ? "awaiting_human" : "queued";
+        this.db.prepare(`INSERT INTO tasks (id,parent_task_id,role,title,prompt,status,allowed_paths_json,acceptance_checks_json,dependencies_json,human_approval_required,token_budget,estimated_tokens,max_attempts,created_at,updated_at,risk_flags_json,supporting_domains_json,artifact_base_sha,artifact_dependencies_json,remediation_round,source_writer_task_id,delivery_run_id,blueprint_id,requirement_ids_json,plan_batch_id,wave,integration_barrier_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+          .run(task.id, task.parentTaskId ?? null, task.role, task.title, task.prompt, initialStatus, json(task.allowedPaths), json(task.acceptanceChecks), json(task.dependencies), task.humanApprovalRequired ? 1 : 0, task.tokenBudget, task.estimatedTokens ?? task.tokenBudget, task.maxAttempts ?? 1, timestamp, timestamp, json(task.riskFlags), json(task.supportingDomains), task.artifactBaseSha ?? null, json(task.artifactDependencies), task.remediationRound ?? 0, task.sourceWriterTaskId ?? null, task.deliveryRunId ?? null, task.blueprintId ?? null, json(task.requirementIds), batch.id, batch.wave, task.integrationBarrierId ?? null);
+        this.#insertEvent(task.id, `task/${initialStatus}`, { role: task.role, title: task.title, planBatchId: batch.id, wave: batch.wave });
+        for (const requirementId of task.requirementIds ?? []) this.#insertTraceability({ requirementId, blueprintId: task.blueprintId, taskId: task.id, checkpoint: "planned", payload: { planBatchId: batch.id, wave: batch.wave } });
+      }
+      if (replanId) {
+        const replan = this.scopedReplan(replanId);
+        if (!replan || !["planning", "pending"].includes(replan.status)) throw new Error(`Scoped replan ${replanId} is not materializable`);
+        this.db.prepare("UPDATE scoped_replans SET replacement_plan_batch_id = ?, status = 'materialized', updated_at = ? WHERE id = ? AND replacement_plan_batch_id IS NULL").run(batch.id, now(), replanId);
+        for (const item of replacements) this.db.prepare("INSERT OR IGNORE INTO task_replacements(replan_id,old_task_id,replacement_task_id,kind,created_at) VALUES (?,?,?,?,?)").run(replanId, item.oldTaskId, item.replacementTaskId ?? null, item.kind ?? "task", now());
+        this.#insertEvent(replan.plannerTaskId, "scoped-replan/materialized", { replanId, replacementPlanBatchId: batch.id, replacementTaskIds: tasks.map((task) => task.id) });
+      }
+      this.#insertEvent(null, "plan-batch/persisted", { planBatchId: batch.id, deliveryRunId: batch.deliveryRunId, wave: batch.wave, basedOnCheckpointSha: batch.basedOnCheckpointSha });
+      this.db.exec("COMMIT");
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    return this.planBatch(batch.id);
+  }
+
+  planBatch(id) { const row = this.db.prepare("SELECT * FROM plan_batches WHERE id = ?").get(id); return row ? { schemaVersion: row.schema_version, kind: row.kind, id: row.id, deliveryRunId: row.delivery_run_id, blueprintId: row.blueprint_id, wave: row.wave, basedOnCheckpointSha: row.based_on_checkpoint_sha, tasks: parse(row.tasks_json, []), createdAt: row.created_at } : null; }
+  planBatches(deliveryRunId) { return this.db.prepare("SELECT id FROM plan_batches WHERE delivery_run_id = ? ORDER BY wave, created_at").all(deliveryRunId).map((row) => this.planBatch(row.id)); }
+
+  createIntegrationBarrier(barrier) {
+    validateIntegrationBarrier(barrier);
+    if (this.db.prepare("SELECT id FROM integration_barriers WHERE id = ?").get(barrier.id)) throw new Error(`IntegrationBarrier ${barrier.id} is immutable and already persisted`);
+    this.db.prepare("INSERT INTO integration_barriers(id,schema_version,kind,delivery_run_id,blueprint_id,wave,base_sha,input_artifacts_json,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)")
+      .run(barrier.id, barrier.schemaVersion, barrier.kind, barrier.deliveryRunId, barrier.blueprintId, barrier.wave, barrier.baseSha, JSON.stringify(barrier.inputArtifacts), barrier.status, barrier.createdAt, barrier.createdAt);
+    return this.integrationBarrier(barrier.id);
+  }
+  integrationBarrier(id) { const row = this.db.prepare("SELECT * FROM integration_barriers WHERE id = ?").get(id); return row ? { schemaVersion: row.schema_version, kind: row.kind, id: row.id, deliveryRunId: row.delivery_run_id, blueprintId: row.blueprint_id, wave: row.wave, baseSha: row.base_sha, inputArtifacts: parse(row.input_artifacts_json, []), status: row.status, checkpointId: row.checkpoint_id, error: row.error, createdAt: row.created_at, updatedAt: row.updated_at } : null; }
+  setIntegrationBarrier(taskId, barrierId) { this.db.prepare("UPDATE tasks SET integration_barrier_id = ?, updated_at = ? WHERE id = ? AND status = 'queued'").run(barrierId, now(), taskId); return this.getTask(taskId); }
+  readyIntegrationBarriers(deliveryRunId = null) { const sql = deliveryRunId ? "SELECT id FROM integration_barriers WHERE delivery_run_id = ? AND status = 'pending' ORDER BY created_at" : "SELECT id FROM integration_barriers WHERE status = 'pending' ORDER BY created_at"; return this.db.prepare(sql).all(...(deliveryRunId ? [deliveryRunId] : [])).map((row) => this.integrationBarrier(row.id)).filter((barrier) => barrier.inputArtifacts.every((item) => Boolean(this.workerArtifact(item.artifactId)))); }
+  claimIntegrationBarrier(id) { const result = this.db.prepare("UPDATE integration_barriers SET status = 'running', updated_at = ? WHERE id = ? AND status = 'pending'").run(now(), id); return result.changes === 1 ? this.integrationBarrier(id) : null; }
+  failIntegrationBarrier(id, error) { this.db.prepare("UPDATE integration_barriers SET status = 'failed', error = ?, updated_at = ? WHERE id = ? AND status = 'running'").run(error, now(), id); return this.integrationBarrier(id); }
+  recordIntegrationCheckpoint(checkpoint, { barrierId } = {}) {
+    validateIntegrationCheckpoint(checkpoint);
+    if (this.db.prepare("SELECT id FROM integration_checkpoints WHERE id = ?").get(checkpoint.id)) throw new Error(`IntegrationCheckpoint ${checkpoint.id} is immutable and already persisted`);
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.prepare("INSERT INTO integration_checkpoints(id,schema_version,kind,delivery_run_id,blueprint_id,wave,base_sha,input_artifacts_json,output_sha,verification_results_json,status,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)").run(checkpoint.id, checkpoint.schemaVersion, checkpoint.kind, checkpoint.deliveryRunId, checkpoint.blueprintId, checkpoint.wave, checkpoint.baseSha, JSON.stringify(checkpoint.inputArtifacts), checkpoint.outputSha, JSON.stringify(checkpoint.verificationResults), checkpoint.status, checkpoint.createdAt);
+      if (barrierId) this.db.prepare("UPDATE integration_barriers SET status = 'passed', checkpoint_id = ?, updated_at = ? WHERE id = ? AND status = 'running'").run(checkpoint.id, now(), barrierId);
+      this.db.exec("COMMIT");
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    return this.integrationCheckpoint(checkpoint.id);
+  }
+  integrationCheckpoint(id) { const row = this.db.prepare("SELECT * FROM integration_checkpoints WHERE id = ?").get(id); return row ? { schemaVersion: row.schema_version, kind: row.kind, id: row.id, deliveryRunId: row.delivery_run_id, blueprintId: row.blueprint_id, wave: row.wave, baseSha: row.base_sha, inputArtifacts: parse(row.input_artifacts_json, []), outputSha: row.output_sha, verificationResults: parse(row.verification_results_json, []), status: row.status, createdAt: row.created_at } : null; }
+  reconcileWave({ deliveryRunId, wave, checkpointId }) { const checkpoint = this.integrationCheckpoint(checkpointId); if (!checkpoint || checkpoint.status !== "passed") throw new Error("Wave reconciliation requires a successful verified IntegrationCheckpoint"); this.db.prepare("INSERT INTO wave_reconciliations(delivery_run_id,wave,checkpoint_id,checkpoint_sha,status,created_at) VALUES (?,?,?,?,?,?)").run(deliveryRunId, wave, checkpointId, checkpoint.outputSha, "reconciled", now()); return this.currentCheckpoint(deliveryRunId); }
+  currentCheckpoint(deliveryRunId) { const row = this.db.prepare("SELECT checkpoint_id, checkpoint_sha, wave FROM wave_reconciliations WHERE delivery_run_id = ? AND status = 'reconciled' ORDER BY wave DESC LIMIT 1").get(deliveryRunId); return row ? { checkpointId: row.checkpoint_id, outputSha: row.checkpoint_sha, wave: row.wave } : null; }
+  recordScopedReplan(value) {
+    const timestamp = value.createdAt ?? now();
+    if (!value.idempotencyKey || !value.failureKind || !value.deliveryRunId || !value.blueprintId) throw new Error("Scoped replan v2 requires delivery, blueprint, failure taxonomy, and idempotency key");
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const existing = this.db.prepare("SELECT id FROM scoped_replans WHERE idempotency_key = ?").get(value.idempotencyKey);
+      if (existing) { this.db.exec("COMMIT"); return existing.id; }
+      this.db.prepare(`INSERT INTO scoped_replans(
+        id,schema_version,delivery_run_id,blueprint_id,failed_task_id,failure_kind,failure_detail,
+        affected_task_ids_json,invalidated_task_ids_json,preserved_artifacts_json,prior_plan_batch_id,
+        prior_checkpoint_id,prior_checkpoint_sha,remaining_requirement_ids_json,prior_context_json,
+        attempt,max_attempts,idempotency_key,planner_task_id,replacement_plan_batch_id,status,created_at,updated_at
+      ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+        value.id, 2, value.deliveryRunId, value.blueprintId, value.failedTaskId, value.failureKind, String(value.failureDetail ?? "").slice(0, 1200),
+        json(value.affectedTaskIds), json(value.invalidatedTaskIds), JSON.stringify(value.preservedArtifacts ?? []), value.priorPlanBatchId ?? null,
+        value.priorCheckpointId ?? null, value.priorCheckpointSha ?? null, json(value.remainingRequirementIds), JSON.stringify(value.priorContext ?? {}),
+        value.attempt ?? 0, value.maxAttempts ?? 2, value.idempotencyKey, value.plannerTaskId ?? null, null, value.status ?? "pending", timestamp, timestamp
+      );
+      for (const oldTaskId of value.invalidatedTaskIds ?? []) {
+        const task = this.getTask(oldTaskId); if (!task) continue;
+        if (["queued", "preparing", "awaiting_human", "awaiting_approval"].includes(task.status)) this.db.prepare("UPDATE tasks SET status = 'cancelled', error = ?, updated_at = ? WHERE id = ? AND status IN ('queued','preparing','awaiting_human','awaiting_approval')").run(`invalidated_by_scoped_replan:${value.id}`, timestamp, oldTaskId);
+        this.db.prepare("INSERT OR IGNORE INTO task_replacements(replan_id,old_task_id,replacement_task_id,kind,created_at) VALUES (?,?,?,?,?)").run(value.id, oldTaskId, null, "invalidated", timestamp);
+      }
+      this.db.prepare("INSERT OR IGNORE INTO task_replacements(replan_id,old_task_id,replacement_task_id,kind,created_at) VALUES (?,?,?,?,?)").run(value.id, value.failedTaskId, null, "failed", timestamp);
+      this.#insertEvent(value.failedTaskId, "scoped-replan/pending", { replanId: value.id, failureKind: value.failureKind, invalidatedTaskIds: value.invalidatedTaskIds ?? [] });
+      this.db.exec("COMMIT");
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    return value.id;
+  }
+
+  scopedReplan(id) { const row = this.db.prepare("SELECT * FROM scoped_replans WHERE id = ?").get(id); return row ? this.#mapScopedReplan(row) : null; }
+  scopedReplans(deliveryRunId = null) { const rows = this.db.prepare(deliveryRunId ? "SELECT * FROM scoped_replans WHERE delivery_run_id = ? ORDER BY created_at" : "SELECT * FROM scoped_replans ORDER BY created_at").all(...(deliveryRunId ? [deliveryRunId] : [])); return rows.map((row) => this.#mapScopedReplan(row)); }
+  activeScopedReplans(deliveryRunId) { return this.scopedReplans(deliveryRunId).filter((item) => ["pending", "planning", "materialized"].includes(item.status)); }
+  claimScopedReplan(id) { const changed = this.db.prepare("UPDATE scoped_replans SET status = 'planning', attempt = attempt + 1, updated_at = ? WHERE id = ? AND status = 'pending' AND attempt < max_attempts").run(now(), id); return changed.changes ? this.scopedReplan(id) : null; }
+  attachScopedReplanPlanner(id, plannerTaskId) { this.db.prepare("UPDATE scoped_replans SET planner_task_id = ?, updated_at = ? WHERE id = ? AND status = 'planning' AND planner_task_id IS NULL").run(plannerTaskId, now(), id); return this.scopedReplan(id); }
+  blockScopedReplan(id, status, detail = "") { if (!["blocked_specification", "blocked_quota", "blocked_budget", "fatal", "abandoned", "legacy_manual"].includes(status)) throw new Error("Invalid scoped replan terminal status"); this.db.prepare("UPDATE scoped_replans SET status = ?, failure_detail = ?, updated_at = ?, completed_at = ? WHERE id = ?").run(status, String(detail).slice(0, 1200), now(), now(), id); return this.scopedReplan(id); }
+  completeReadyScopedReplans(deliveryRunId) { const completed = []; for (const replan of this.activeScopedReplans(deliveryRunId).filter((item) => item.status === "materialized")) { const replacements = this.db.prepare("SELECT replacement_task_id FROM task_replacements WHERE replan_id = ? AND replacement_task_id IS NOT NULL").all(replan.id); if (replacements.length && replacements.every((item) => this.getTask(item.replacement_task_id)?.status === "done")) { this.db.prepare("UPDATE scoped_replans SET status = 'completed', completed_at = ?, updated_at = ? WHERE id = ? AND status = 'materialized'").run(now(), now(), replan.id); completed.push(replan.id); } } return completed; }
+  hasEffectiveInvalidatedWork(deliveryRunId) { return this.activeScopedReplans(deliveryRunId).length > 0; }
+  isHistoricalInvalidatedTask(taskId) { return Boolean(this.db.prepare("SELECT 1 FROM task_replacements WHERE old_task_id = ? AND kind IN ('invalidated','task','barrier-consumer') LIMIT 1").get(taskId)); }
+  isReplannedHistoricalTask(taskId) { return Boolean(this.db.prepare("SELECT 1 FROM task_replacements WHERE old_task_id = ? LIMIT 1").get(taskId)); }
+
   recordProductBlueprint({ blueprint, artifactPath, digest, bootstrapTaskId = null, deliveryRunId = null }) {
     const existing = this.db.prepare("SELECT artifact_path FROM product_blueprints WHERE blueprint_id = ?").get(blueprint.blueprintId);
     if (existing) throw new Error(`ProductBlueprint '${blueprint.blueprintId}' is immutable and already persisted at ${existing.artifact_path}`);
@@ -629,7 +785,8 @@ export class StateStore {
     this.db.exec("BEGIN IMMEDIATE");
     try {
       const current = this.deliveryRun(id); if (!current) throw new Error(`Delivery run not found: ${id}`);
-      if (!resumable.includes(current.state)) throw new Error(`Delivery run is not resumable: ${id} (${current.state})`);
+      const recoverableFailure = current.state === "failed" && this.activeScopedReplans(id).length > 0;
+      if (!resumable.includes(current.state) && !recoverableFailure) throw new Error(`Delivery run is not resumable: ${id} (${current.state})`);
       const timestamp = now();
       const changed = this.db.prepare("UPDATE delivery_runs SET state = 'running', owner_pid = ?, owner_session_id = ?, heartbeat_at = ?, interrupted_at = NULL, updated_at = ? WHERE id = ? AND owner_session_id IS NULL").run(ownerPid, ownerSessionId, timestamp, timestamp, id);
       if (!changed.changes) throw new Error(`Delivery already owned: ${id}`);
@@ -667,7 +824,6 @@ export class StateStore {
     const nextRecovery = { ...(current.recovery ?? {}), reason, ...(recovery ?? {}), interruptedAt: timestamp };
     this.db.exec("BEGIN IMMEDIATE");
     try {
-
       this.db.prepare("UPDATE delivery_runs SET state = 'interrupted', interrupted_at = ?, recovery_json = ?, owner_pid = NULL, owner_session_id = NULL, heartbeat_at = NULL, updated_at = ? WHERE id = ?").run(timestamp, JSON.stringify(nextRecovery), timestamp, id);
       const active = this.db.prepare("SELECT id, status, thread_id, turn_id, token_used FROM tasks WHERE (delivery_run_id = ? OR id = ?) AND status IN ('preparing','running','awaiting_approval')").all(id, current.bootstrapTaskId);
       for (const task of active) {
@@ -737,27 +893,6 @@ export class StateStore {
     return row ? JSON.parse(row.manifest_json) : null;
   }
 
-  recordProductAcceptanceReport(report) {
-    const run = this.deliveryRun(report.deliveryRunId); const blueprint = this.productBlueprint(report.blueprintId); const manifest = this.integrationManifest(report.integrationManifestPath);
-    if (!run || !blueprint || !manifest) throw new Error("Final acceptance requires persisted run, blueprint, and manifest");
-    validateProductAcceptanceReport(report, { blueprint: blueprint.blueprint, blueprintDigest: blueprint.digest, manifest, manifestPath: report.integrationManifestPath });
-    if (run.blueprintId !== report.blueprintId || run.candidate?.sha?.toLowerCase() !== report.candidateSha.toLowerCase()) throw new Error("Final acceptance identity does not match delivery run");
-    const id = report.id ?? `${report.deliveryRunId}:${report.integrationManifestId}:${report.candidateSha}`; const existing = this.productAcceptanceReport(id); if (existing) return existing;
-    const passing = productAcceptancePasses(report, { blueprint: blueprint.blueprint });
-    this.#mutate(run.bootstrapTaskId, "acceptance/persisted", { reportId: id, candidateSha: report.candidateSha, passing }, () => {
-      this.db.prepare("INSERT INTO product_acceptance_reports(id,schema_version,delivery_run_id,blueprint_id,blueprint_digest,manifest_id,manifest_path,candidate_sha,report_json,passing,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)").run(id, report.schemaVersion, report.deliveryRunId, report.blueprintId, report.blueprintDigest, report.integrationManifestId, report.integrationManifestPath, report.candidateSha, JSON.stringify(report), passing ? 1 : 0, now());
-      for (const result of report.results) this.#insertTraceability({ requirementId: result.requirementId, blueprintId: report.blueprintId, verificationPath: id, checkpoint: "final-acceptance", payload: { criterionId: result.criterionId ?? null, status: result.status, candidateSha: report.candidateSha, evidence: result.evidence } });
-    });
-    return this.productAcceptanceReport(id);
-  }
-  productAcceptanceReport(id) { const row = this.db.prepare("SELECT * FROM product_acceptance_reports WHERE id = ?").get(id); return row ? { id: row.id, report: parse(row.report_json, null), passing: Boolean(row.passing), createdAt: row.created_at } : null; }
-  productAcceptanceForRun(deliveryRunId, { candidateSha = null, manifestId = null } = {}) { return this.db.prepare("SELECT id FROM product_acceptance_reports WHERE delivery_run_id = ? ORDER BY created_at DESC").all(deliveryRunId).map((row) => this.productAcceptanceReport(row.id)).find((item) => (!candidateSha || item.report.candidateSha.toLowerCase() === candidateSha.toLowerCase()) && (!manifestId || item.report.integrationManifestId === manifestId)) ?? null; }
-  completeDeliveryWithAcceptance({ deliveryRunId, reportId, merge, publish = {} }) {
-    const run = this.deliveryRun(deliveryRunId); const accepted = this.productAcceptanceReport(reportId); if (!run || !accepted?.passing || merge?.status !== "merged" || !merge.mainSha || merge.targetVerified !== true) throw new Error("Completion requires passing persisted acceptance and verified merge");
-    const report = accepted.report; const manifest = this.integrationManifest(report.integrationManifestPath); if (run.blueprintId !== report.blueprintId || run.candidate?.sha?.toLowerCase() !== report.candidateSha.toLowerCase() || manifest?.id !== report.integrationManifestId || manifest.candidateSha?.toLowerCase() !== report.candidateSha.toLowerCase()) throw new Error("Completion acceptance identity mismatch");
-    this.db.prepare("UPDATE delivery_runs SET state='completed_merged', publish_json=?, completion_contract_version=2, owner_pid=NULL, owner_session_id=NULL, heartbeat_at=NULL, updated_at=? WHERE id=?").run(JSON.stringify({ ...publish, merge, acceptanceReportId: reportId, candidate: run.candidate }), now(), deliveryRunId); return this.deliveryRun(deliveryRunId);
-  }
-
   recordBudgetOverride({ taskId, reason, forecast }) {
     this.#mutate(taskId, "budget/override", { reason, forecast }, () => this.db.prepare(`INSERT OR REPLACE INTO budget_overrides(task_id, reason, forecast_json, created_at)
       VALUES (?, ?, ?, ?)`).run(taskId, reason, JSON.stringify(forecast), now()));
@@ -791,6 +926,60 @@ export class StateStore {
     return { id: row.id, schemaVersion: row.schema_version, state: row.state, source: row.source, bootstrapTaskId: row.bootstrap_task_id, blueprintId: row.blueprint_id, completionContractVersion: row.completion_contract_version ?? 0, integrationPath: row.integration_path, candidate: row.candidate_branch && row.candidate_sha ? { branch: row.candidate_branch, sha: row.candidate_sha } : null, publicationCheckpoint: parse(row.publication_checkpoint_json, null), publish: parse(row.publish_json, null), confirmRemotePush: Boolean(row.confirm_remote_push), ownerPid: row.owner_pid, ownerSessionId: row.owner_session_id, heartbeatAt: row.heartbeat_at, interruptedAt: row.interrupted_at, recovery: parse(row.recovery_json, null), createdAt: row.created_at, updatedAt: row.updated_at };
   }
 
+  #mapScopedReplan(row) {
+    return {
+      schemaVersion: row.schema_version, id: row.id, deliveryRunId: row.delivery_run_id, blueprintId: row.blueprint_id,
+      priorPlanBatchId: row.prior_plan_batch_id, failedTaskId: row.failed_task_id, failureKind: row.failure_kind,
+      failureDetail: row.failure_detail, affectedTaskIds: parse(row.affected_task_ids_json, []), invalidatedTaskIds: parse(row.invalidated_task_ids_json, []),
+      preservedArtifacts: parse(row.preserved_artifacts_json, []), priorCheckpointId: row.prior_checkpoint_id, priorCheckpointSha: row.prior_checkpoint_sha,
+      remainingRequirementIds: parse(row.remaining_requirement_ids_json, []), priorContext: parse(row.prior_context_json, {}),
+      attempt: row.attempt, maxAttempts: row.max_attempts, idempotencyKey: row.idempotency_key, plannerTaskId: row.planner_task_id,
+      replacementPlanBatchId: row.replacement_plan_batch_id, status: row.status, createdAt: row.created_at, updatedAt: row.updated_at, completedAt: row.completed_at
+    };
+  }
+
+  recordProductAcceptanceReport(report) {
+    const run = this.deliveryRun(report.deliveryRunId); if (!run) throw new Error("Final acceptance report requires an existing delivery run");
+    const blueprint = this.productBlueprint(report.blueprintId); const manifest = this.integrationManifest(report.integrationManifestPath);
+    if (!blueprint || !manifest) throw new Error("Final acceptance report requires persisted blueprint and integration manifest");
+    validateProductAcceptanceReport(report, { blueprint: blueprint.blueprint, blueprintDigest: blueprint.digest, manifest, manifestPath: report.integrationManifestPath });
+    if (run.blueprintId !== report.blueprintId || run.candidate?.sha?.toLowerCase() !== report.candidateSha.toLowerCase()) throw new Error("Final acceptance report identity does not match delivery run");
+    const id = report.id ?? `${report.deliveryRunId}:${report.integrationManifestId}:${report.candidateSha}`;
+    if (this.db.prepare("SELECT id FROM product_acceptance_reports WHERE id = ?").get(id)) return this.productAcceptanceReport(id);
+    const passing = productAcceptancePasses(report, { blueprint: blueprint.blueprint }) ? 1 : 0;
+    this.#mutate(run.bootstrapTaskId, "acceptance/persisted", { reportId: id, candidateSha: report.candidateSha, passing: Boolean(passing) }, () => {
+      this.db.prepare("INSERT INTO product_acceptance_reports(id,schema_version,delivery_run_id,blueprint_id,blueprint_digest,manifest_id,manifest_path,candidate_sha,report_json,passing,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)")
+        .run(id, report.schemaVersion, report.deliveryRunId, report.blueprintId, report.blueprintDigest, report.integrationManifestId, report.integrationManifestPath, report.candidateSha, JSON.stringify(report), passing, now());
+      for (const result of report.results) this.#insertTraceability({ requirementId: result.requirementId, blueprintId: report.blueprintId, verificationPath: id, checkpoint: "final-acceptance", payload: { criterionId: result.criterionId ?? null, status: result.status, candidateSha: report.candidateSha, manifestId: report.integrationManifestId, evidence: result.evidence } });
+    });
+    return this.productAcceptanceReport(id);
+  }
+
+  productAcceptanceReport(id) {
+    const row = this.db.prepare("SELECT * FROM product_acceptance_reports WHERE id = ?").get(id);
+    return row ? { id: row.id, report: parse(row.report_json, null), passing: Boolean(row.passing), createdAt: row.created_at } : null;
+  }
+
+  productAcceptanceForRun(deliveryRunId, { candidateSha = null, manifestId = null } = {}) {
+    const rows = this.db.prepare("SELECT id FROM product_acceptance_reports WHERE delivery_run_id = ? ORDER BY created_at DESC").all(deliveryRunId);
+    return rows.map((row) => this.productAcceptanceReport(row.id)).find((item) => (!candidateSha || item.report.candidateSha.toLowerCase() === candidateSha.toLowerCase()) && (!manifestId || item.report.integrationManifestId === manifestId)) ?? null;
+  }
+
+  completeDeliveryWithAcceptance({ deliveryRunId, reportId, merge, publish = {} }) {
+    const run = this.deliveryRun(deliveryRunId); const stored = this.productAcceptanceReport(reportId);
+    if (!run || !stored?.passing) throw new Error("Completion requires a persisted passing ProductAcceptanceReport");
+    const report = stored.report; const blueprint = this.productBlueprint(report.blueprintId); const manifest = this.integrationManifest(report.integrationManifestPath);
+    if (!blueprint || !manifest || run.blueprintId !== report.blueprintId || run.candidate?.sha?.toLowerCase() !== report.candidateSha.toLowerCase() || manifest.id !== report.integrationManifestId || manifest.candidateSha?.toLowerCase() !== report.candidateSha.toLowerCase()) throw new Error("Completion acceptance identity mismatch");
+    if (merge?.status !== "merged" || !merge.mainSha || merge.targetVerified !== true) throw new Error("Completion requires a verified merge result");
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.prepare("UPDATE delivery_runs SET state = 'completed_merged', publish_json = ?, completion_contract_version = 2, owner_pid = NULL, owner_session_id = NULL, heartbeat_at = NULL, updated_at = ? WHERE id = ?").run(JSON.stringify({ ...publish, merge, acceptanceReportId: reportId, candidate: run.candidate }), now(), deliveryRunId);
+      this.#insertEvent(run.bootstrapTaskId, "delivery/completed-merged", { deliveryRunId, reportId, candidateSha: report.candidateSha, mergeSha: merge.mainSha });
+      this.db.exec("COMMIT");
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    return this.deliveryRun(deliveryRunId);
+  }
+
   #addColumnIfMissing(table, column, definition) {
     const columns = this.db.prepare(`PRAGMA table_info(${table})`).all();
     if (!columns.some((item) => item.name === column)) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
@@ -806,6 +995,7 @@ export class StateStore {
   }
 
   #blockLegacyRunsWithoutBlueprint() {
+    this.db.prepare("UPDATE delivery_runs SET completion_contract_version = 0 WHERE state = 'completed_merged' AND completion_contract_version < 2 AND id NOT IN (SELECT delivery_run_id FROM product_acceptance_reports WHERE passing = 1)").run();
     const states = ["running", "awaiting_human", "awaiting_human_remote_handoff", "interrupted", "blocked_credentials", "blocked_ci", "blocked_branch_protection"];
     const rows = this.db.prepare(`SELECT id, bootstrap_task_id FROM delivery_runs WHERE blueprint_id IS NULL AND completion_contract_version = 0 AND state IN (${states.map(() => "?").join(",")})`).all(...states);
     if (!rows.length) return;

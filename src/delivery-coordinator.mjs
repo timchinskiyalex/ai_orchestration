@@ -21,8 +21,8 @@ export class DeliveryCoordinator {
   async begin({ source, ...adapters }) {
     this.router.recoverStaleDeliveries();
     const current = this.router.store.currentDeliveryRun();
-    if (current && ["running", "awaiting_human", "awaiting_human_remote_handoff"].includes(current.state)) throw new Error(`A delivery run is already active: ${current.id}. Use npm run deliver -- --resume.`);
-    if (current && ["interrupted", "blocked_credentials", "blocked_ci", "blocked_branch_protection"].includes(current.state)) throw new Error(`A persisted delivery run is resumable: ${current.id}. Use npm run deliver -- --resume instead of creating a new Bootstrap/DAG.`);
+    if (current && (["running", "awaiting_human", "awaiting_human_remote_handoff"].includes(current.state) || (this.router.store.activeScopedReplans?.(current.id).length ?? 0))) throw new Error(`A delivery run is already active or recovering: ${current.id}. Use npm run deliver -- --resume.`);
+    if (current && ["interrupted", "blocked_credentials", "blocked_ci", "blocked_branch_protection", "failed"].includes(current.state)) throw new Error(`A persisted delivery run is resumable: ${current.id}. Use npm run deliver -- --resume instead of creating a new Bootstrap/DAG.`);
     // A terminal controller run can still have never-claimed DAG rows. They are
     // historical work, not a live delivery: retain their evidence but never let
     // them block a deliberately fresh delivery.
@@ -42,8 +42,8 @@ export class DeliveryCoordinator {
     this.router.recoverStaleDeliveries();
     const run = this.router.store.currentDeliveryRun();
     if (!run) throw new Error("No delivery run exists; start with npm run deliver -- --source <docs-dir>");
-    if (["completed_merged", "completed_candidate_ready", "failed", "blocked_budget", "blocked_quota", "blocked_specification", "blocked_acceptance", "conflict_blocked"].includes(run.state)) return run;
-    const resumed = ["interrupted", "blocked_credentials", "blocked_ci", "blocked_branch_protection"].includes(run.state)
+    if (["completed_merged", "completed_candidate_ready", "blocked_budget", "blocked_quota", "blocked_specification", "blocked_acceptance", "conflict_blocked"].includes(run.state)) return run;
+    const resumed = ["interrupted", "blocked_credentials", "blocked_ci", "blocked_branch_protection", "failed"].includes(run.state)
       ? this.router.resumeDeliveryRun(run.id)
       : (this.router.activateDeliveryRun(run.id), run);
     if (resumed.integrationPath) return this.#publishPersisted(resumed, adapters);
@@ -76,12 +76,15 @@ export class DeliveryCoordinator {
     if (execution?.blockedQuota) return this.router.store.updateDeliveryRun(run.id, { state: "blocked_quota", publish: { reason: execution.quota?.reason ?? "App Server quota policy blocked new turns", quota: execution.quota } });
     if (execution?.interrupted) return this.router.store.deliveryRun(run.id);
     if (execution?.blockedBudget) return this.router.store.deliveryRun(run.id)?.state === "blocked_budget" ? this.router.store.deliveryRun(run.id) : this.router.store.updateDeliveryRun(run.id, { state: "blocked_budget", publish: { reason: "Budget watchdog interrupted an active turn" } });
+    this.router.store.completeReadyScopedReplans?.(run.id);
+    const activeReplans = this.router.store.activeScopedReplans?.(run.id) ?? [];
+    if (activeReplans.length) return this.router.store.updateDeliveryRun(run.id, { state: "running", publish: { reason: "Scoped recovery is still active", replans: activeReplans.map((item) => ({ id: item.id, status: item.status })) } });
     const tasks = this.router.list().filter((task) => task.deliveryRunId === run.id);
     if (!this.router.isAutonomous()) {
       const gate = manualGateFor(tasks);
       if (gate) return this.#awaiting(run, gate);
     }
-    const terminalTask = tasks.find((task) => ["failed", "cancelled", "blocked_budget", "blocked_specification", "interrupted", "awaiting_approval"].includes(task.status));
+    const terminalTask = tasks.find((task) => ["failed", "cancelled", "blocked_budget", "blocked_specification", "interrupted", "awaiting_approval"].includes(task.status) && !(this.router.store.isReplannedHistoricalTask?.(task.id) ?? false));
     if (terminalTask) {
       const terminal = terminalForTask(terminalTask);
       return this.router.store.updateDeliveryRun(run.id, { state: terminal.state, publish: { taskId: terminalTask.id, reason: terminal.reason, recovery: { action: "Inspect the task result/report and preserved worktree, correct the source condition, then start a fresh delivery run." } } });
@@ -94,6 +97,9 @@ export class DeliveryCoordinator {
     try { integration = await this.router.runToIntegration({ alreadyIdle: true, deliveryRunId: run.id }); }
     catch (error) { return this.router.store.updateDeliveryRun(run.id, { state: "conflict_blocked", publish: { reason: String(error.message).slice(0, 500), recovery: { action: "Inspect the retained candidate/worktree and verification results." } } }); }
     if (integration.integration.manifest.status !== "candidate_ready") return this.router.store.updateDeliveryRun(run.id, { state: "conflict_blocked", integrationPath: integration.integration.path, publish: { reason: integration.integration.manifest.blockedReason, recovery: integration.integration.manifest.recovery } });
+    // This transaction is intentionally before the first remote action.  A
+    // crash after a remote side effect can therefore only resume this exact
+    // candidate and its idempotency keys, never create a fresh DAG.
     this.router.store.updateDeliveryRun(run.id, { state: "running", integrationPath: integration.integration.path, candidate: { branch: integration.integration.manifest.branch, sha: integration.integration.manifest.candidateSha }, publicationCheckpoint: { stage: "publication-ready", candidate: { branch: integration.integration.manifest.branch, sha: integration.integration.manifest.candidateSha }, updatedAt: new Date().toISOString() } });
     return this.#publishWithAcceptance(run, integration.integration, context);
   }
@@ -101,12 +107,23 @@ export class DeliveryCoordinator {
   async #publishWithAcceptance(run, integration, adapters) {
     const preliminary = await this.router.publishCandidate(integration, adapters);
     if (preliminary.terminalState !== "awaiting_final_acceptance") return this.router.store.updateDeliveryRun(run.id, { state: preliminary.terminalState, integrationPath: integration.path, publish: preliminary, confirmRemotePush: this.router.isAutonomous() });
-    let accepted = this.router.store.productAcceptanceForRun(run.id, { candidateSha: integration.manifest.candidateSha, manifestId: integration.manifest.id });
-    if (!accepted) { const candidate = { branch: integration.manifest.branch, sha: integration.manifest.candidateSha }; const adapter = adapters.productEvidenceAdapter; const productEvidence = adapter ? (typeof adapter.verify === "function" ? await adapter.verify({ candidate, manifest: integration.manifest, deliveryRunId: run.id }) : await adapter({ candidate, manifest: integration.manifest, deliveryRunId: run.id })) : null; accepted = this.router.store.recordProductAcceptanceReport(this.router.buildProductAcceptanceReport({ integration, remoteCi: preliminary.remoteCi, productEvidence })); }
-    if (!accepted.passing) return this.router.store.updateDeliveryRun(run.id, { state: accepted.report.results.some((item) => item.status === "blocked") ? "blocked_specification" : "blocked_acceptance", integrationPath: integration.path, publish: { ...preliminary, acceptanceReportId: accepted.id, reason: "Final acceptance did not pass; candidate and evidence are retained." } });
-    const merged = await this.router.publishCandidate(integration, { ...adapters, acceptanceReportId: accepted.id });
-    if (merged.terminalState !== "merge_verified") return this.router.store.updateDeliveryRun(run.id, { state: merged.terminalState, integrationPath: integration.path, publish: merged });
-    return this.router.store.completeDeliveryWithAcceptance({ deliveryRunId: run.id, reportId: accepted.id, merge: merged.merge, publish: merged });
+    const existing = this.router.store.productAcceptanceForRun(run.id, { candidateSha: integration.manifest.candidateSha, manifestId: integration.manifest.id });
+    let acceptance = existing;
+    if (!acceptance) {
+      let productEvidence = null;
+      const adapter = adapters.productEvidenceAdapter;
+      const candidate = { branch: integration.manifest.branch, sha: integration.manifest.candidateSha };
+      if (adapter) productEvidence = typeof adapter.verify === "function" ? await adapter.verify({ candidate, manifest: integration.manifest, deliveryRunId: run.id }) : await adapter({ candidate, manifest: integration.manifest, deliveryRunId: run.id });
+      acceptance = this.router.store.recordProductAcceptanceReport(this.router.buildProductAcceptanceReport({ integration, remoteCi: preliminary.remoteCi, productEvidence }));
+    }
+    if (!acceptance.passing) {
+      const report = acceptance.report;
+      const specification = report.results.some((result) => result.status === "blocked");
+      return this.router.store.updateDeliveryRun(run.id, { state: specification ? "blocked_specification" : "blocked_acceptance", integrationPath: integration.path, publish: { ...preliminary, acceptanceReportId: acceptance.id, reason: specification ? "Final acceptance is blocked by a source/specification condition." : "Final acceptance did not pass; candidate and evidence are retained." }, confirmRemotePush: this.router.isAutonomous() });
+    }
+    const merged = await this.router.publishCandidate(integration, { ...adapters, acceptanceReportId: acceptance.id });
+    if (merged.terminalState !== "merge_verified") return this.router.store.updateDeliveryRun(run.id, { state: merged.terminalState, integrationPath: integration.path, publish: merged, confirmRemotePush: this.router.isAutonomous() });
+    return this.router.store.completeDeliveryWithAcceptance({ deliveryRunId: run.id, reportId: acceptance.id, merge: merged.merge, publish: merged });
   }
 
   #awaiting(run, gate) {

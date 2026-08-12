@@ -18,7 +18,7 @@ export function validateBootstrap(value, { sourceDocuments = null } = {}) {
   catch (error) { fail(error.message.replace(/^Invalid ProductBlueprint: /, "")); }
 }
 
-export function validatePlan(value, { maxTasks, productRoots = [], blueprint = null, requirePlanBatch = false } = {}) {
+export function validatePlan(value, { maxTasks, productRoots = [], blueprint = null, requirePlanBatch = false, allowPartialRequirementCoverage = false, recovery = false } = {}) {
   if (!value || typeof value !== "object" || !Array.isArray(value.tasks)) fail("PlanBatch must contain a tasks array");
   const hasBatchFields = ["schemaVersion", "kind", "id", "deliveryRunId", "wave", "basedOnCheckpointSha", "createdAt"].some((key) => key in value);
   if (requirePlanBatch || hasBatchFields) {
@@ -56,7 +56,7 @@ export function validatePlan(value, { maxTasks, productRoots = [], blueprint = n
       if (!ids.has(dependency) || dependency === task.id) fail(`task '${task.id}' has an invalid dependency '${dependency}'`);
     }
   }
-  if (productRoots.length) {
+  if (productRoots.length && !recovery) {
     const scaffold = value.tasks.find((task) => task.id === "scaffold-product");
     if (!scaffold) fail("greenfield multi-stack plan requires a scaffold-product task");
     if (scaffold.primaryDomain !== "devops") fail("scaffold-product must be a devops writer task");
@@ -82,12 +82,14 @@ export function validatePlan(value, { maxTasks, productRoots = [], blueprint = n
   for (const task of value.tasks) visit(task.id);
   try {
     const plan = enforceRoutingInvariants(value);
-    if (blueprint) assertMandatoryRequirementCoverage(plan, blueprint);
+    if (blueprint && !allowPartialRequirementCoverage) assertMandatoryRequirementCoverage(plan, blueprint);
     return plan;
   }
   catch (error) { fail(error.message.replace(/^Unsafe routing plan: /, "")); }
 }
 
+// Controller artifacts intentionally model a chain, never a graph.  Fan-in is
+// represented by IntegrationBarrier/IntegrationCheckpoint instead.
 export function validateWorkerArtifactContract(value) {
   if (!value || value.schemaVersion !== 1 || value.kind !== "WorkerArtifact") fail("WorkerArtifact has an invalid version or kind");
   const parents = value.parentArtifactId === undefined || value.parentArtifactId === null ? [] : [value.parentArtifactId];
@@ -97,13 +99,20 @@ export function validateWorkerArtifactContract(value) {
   if (!sha(value.baseSha) || !sha(value.headSha)) fail("WorkerArtifact must contain Git baseSha and headSha");
   return value;
 }
+
 export function validateIntegrationBarrier(value) {
   if (!value || value.schemaVersion !== 1 || value.kind !== "IntegrationBarrier") fail("IntegrationBarrier has an invalid version or kind");
   for (const key of ["id", "deliveryRunId", "blueprintId", "wave", "baseSha", "inputArtifacts", "status", "createdAt"]) if (!(key in value)) fail(`IntegrationBarrier is missing '${key}'`);
   if (!positive(value.wave) || !sha(value.baseSha) || !Array.isArray(value.inputArtifacts) || value.inputArtifacts.length < 2) fail("IntegrationBarrier has invalid wave, base SHA, or inputs");
-  const identities = new Set(); for (const item of value.inputArtifacts) { if (!item || typeof item.artifactId !== "string" || !item.artifactId || !sha(item.headSha)) fail("IntegrationBarrier input must identify a verified artifact and SHA"); if (identities.has(item.artifactId)) fail("IntegrationBarrier inputs must be ordered and unique"); identities.add(item.artifactId); }
+  const identities = new Set();
+  for (const item of value.inputArtifacts) {
+    if (!item || typeof item.artifactId !== "string" || !item.artifactId || !sha(item.headSha)) fail("IntegrationBarrier input must identify a verified artifact and SHA");
+    if (identities.has(item.artifactId)) fail("IntegrationBarrier inputs must be ordered and unique");
+    identities.add(item.artifactId);
+  }
   return value;
 }
+
 export function validateIntegrationCheckpoint(value) {
   if (!value || value.schemaVersion !== 1 || value.kind !== "IntegrationCheckpoint") fail("IntegrationCheckpoint has an invalid version or kind");
   for (const key of ["id", "deliveryRunId", "blueprintId", "wave", "baseSha", "inputArtifacts", "outputSha", "verificationResults", "status", "createdAt"]) if (!(key in value)) fail(`IntegrationCheckpoint is missing '${key}'`);
