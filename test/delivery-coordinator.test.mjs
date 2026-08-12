@@ -72,12 +72,14 @@ function setup(remote = true) {
   return { root, source, config };
 }
 
-function fakeRemote(calls) {
+const criterionEvidence = (candidate, results = [{ requirementId: "fix-value", criterionId: "value-test", status: "pass", testId: "e2e/value-test", reference: "deterministic-product-check" }]) => ({ candidateSha: candidate.sha, results: results.map((result) => ({ ...result, candidateSha: result.candidateSha ?? candidate.sha })) });
+
+function fakeRemote(calls, product = null) {
   return {
     remoteGitAdapter: { async pushCandidate({ sha }) { calls.push += 1; return { status: "pushed", verifiedSha: sha }; } },
     pullRequestAdapter: { async ensurePullRequest({ sha }) { calls.pr += 1; return { status: "open", number: 1, url: "https://example.test/pr/1", headSha: sha }; } },
     remoteCiAdapter: { async waitForChecks() { calls.ci += 1; return { status: "passed", checkRuns: [{ name: "test", status: "completed", conclusion: "success" }] }; } },
-    productEvidenceAdapter: { async verify({ candidate }) { return { status: "pass", candidateSha: candidate.sha, reference: "deterministic-product-check" }; } },
+    productEvidenceAdapter: { async verify({ candidate }) { return typeof product === "function" ? product(candidate) : product ?? criterionEvidence(candidate); } },
     mergeAdapter: { async merge() { calls.merge += 1; return { status: "merged", mainSha: "b".repeat(40), mergeSha: "b".repeat(40), targetVerified: true }; } }
   };
 }
@@ -105,6 +107,44 @@ test("green exact-candidate CI without available product E2E evidence is blocked
     assert.equal(final.state, "blocked_acceptance"); assert.equal(calls.merge, 0);
     const report = router.store.productAcceptanceForRun(final.id);
     assert.equal(report.passing, false); assert.equal(report.report.evidence.productE2e.status, "not_verified");
+  } finally { router.close(); rmSync(fixture.root, { recursive: true, force: true }); }
+});
+
+test("a global product pass without criterion results closes no mandatory criterion", async () => {
+  const fixture = setup(true); const router = new SwarmRouter(fixture.config); const coordinator = new DeliveryCoordinator(router); const calls = { push: 0, pr: 0, ci: 0, merge: 0 };
+  try {
+    const final = await coordinator.begin({ source: fixture.source, ...fakeRemote(calls, (candidate) => ({ status: "pass", candidateSha: candidate.sha, reference: "global-pass-only" })) });
+    const acceptance = router.store.productAcceptanceForRun(final.id);
+    assert.equal(final.state, "blocked_acceptance"); assert.equal(calls.merge, 0);
+    assert.equal(acceptance.report.results.find((result) => result.criterionId === "value-test").status, "not_verified");
+  } finally { router.close(); rmSync(fixture.root, { recursive: true, force: true }); }
+});
+
+test("missing, wrong-SHA, malformed, or failed criterion evidence blocks publication", async () => {
+  const cases = [
+    ["missing", (candidate) => ({ candidateSha: candidate.sha, results: [] })],
+    ["other SHA", (candidate) => criterionEvidence({ ...candidate, sha: "c".repeat(40) })],
+    ["unknown criterion", (candidate) => criterionEvidence(candidate, [{ requirementId: "unknown", criterionId: "value-test", status: "pass", testId: "e2e/unknown", reference: "unknown" }])],
+    ["duplicate criterion", (candidate) => criterionEvidence(candidate, [{ requirementId: "fix-value", criterionId: "value-test", status: "pass", testId: "e2e/value-test", reference: "one" }, { requirementId: "fix-value", criterionId: "value-test", status: "pass", testId: "e2e/value-test-repeat", reference: "two" }])],
+    ["failed criterion masked by global pass", (candidate) => ({ status: "pass", ...criterionEvidence(candidate, [{ requirementId: "fix-value", criterionId: "value-test", status: "failed", testId: "e2e/value-test", reference: "failed-test" }]) })]
+  ];
+  for (const [label, product] of cases) {
+    const fixture = setup(true); const router = new SwarmRouter(fixture.config); const coordinator = new DeliveryCoordinator(router); const calls = { push: 0, pr: 0, ci: 0, merge: 0 };
+    try {
+      const final = await coordinator.begin({ source: fixture.source, ...fakeRemote(calls, product) });
+      const acceptance = router.store.productAcceptanceForRun(final.id);
+      assert.equal(final.state, "blocked_acceptance", label); assert.equal(calls.merge, 0, label); assert.equal(acceptance.passing, false, label);
+    } finally { router.close(); rmSync(fixture.root, { recursive: true, force: true }); }
+  }
+});
+
+test("restart idempotency cannot replace an incomplete acceptance report with a merge", async () => {
+  const fixture = setup(true); const router = new SwarmRouter(fixture.config); const coordinator = new DeliveryCoordinator(router); const calls = { push: 0, pr: 0, ci: 0, merge: 0 };
+  try {
+    const incomplete = await coordinator.begin({ source: fixture.source, ...fakeRemote(calls, (candidate) => ({ candidateSha: candidate.sha, results: [] })) });
+    assert.equal(incomplete.state, "blocked_acceptance");
+    const resumed = await coordinator.resume(fakeRemote(calls));
+    assert.equal(resumed.state, "blocked_acceptance"); assert.equal(calls.merge, 0);
   } finally { router.close(); rmSync(fixture.root, { recursive: true, force: true }); }
 });
 

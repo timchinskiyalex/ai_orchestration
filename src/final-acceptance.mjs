@@ -3,7 +3,7 @@ import { specificationBlockers } from "./product-blueprint.mjs";
 
 export const PRODUCT_ACCEPTANCE_SCHEMA_VERSION = 1;
 export const PRODUCT_ACCEPTANCE_KIND = "ProductAcceptanceReport";
-export const ACCEPTANCE_STATUSES = new Set(["pass", "partial", "missing", "not_verified", "blocked"]);
+export const ACCEPTANCE_STATUSES = new Set(["pass", "failed", "partial", "missing", "not_verified", "blocked"]);
 const sha = (value) => /^[a-f0-9]{40,64}$/i.test(value ?? "");
 const fail = (message) => { throw new Error(`Invalid ProductAcceptanceReport: ${message}`); };
 export const acceptanceDigest = (value) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
@@ -22,6 +22,16 @@ function validateResult(result, knownRequirements, knownCriteria, candidateSha) 
   for (const evidence of result.evidence) validateEvidence(evidence, candidateSha, "result evidence");
 }
 
+function validateCriterionResult(result, candidateSha) {
+  const productEvidence = result.evidence.filter((evidence) => evidence.kind === "product-e2e");
+  if (productEvidence.length !== 1) fail(`criterion '${result.criterionId}' requires exactly one product-e2e evidence item`);
+  const evidence = productEvidence[0];
+  if (evidence.requirementId !== result.requirementId || evidence.criterionId !== result.criterionId) fail(`criterion '${result.criterionId}' product evidence does not match its requirement and criterion ids`);
+  if (!stable(evidence.testId)) fail(`criterion '${result.criterionId}' product evidence requires a stable testId`);
+  if (result.status === "pass" && evidence.status !== "pass") fail(`criterion '${result.criterionId}' cannot pass without passed product evidence`);
+  validateEvidence(evidence, candidateSha, `criterion '${result.criterionId}' product evidence`);
+}
+
 export function validateProductAcceptanceReport(report, { blueprint, blueprintDigest, manifest, manifestPath = null } = {}) {
   if (!report || typeof report !== "object") fail("must be an object");
   for (const key of ["schemaVersion", "kind", "deliveryRunId", "blueprintId", "blueprintDigest", "documentSetDigest", "integrationManifestPath", "integrationManifestId", "candidateSha", "generatedAt", "results", "evidence"]) if (!(key in report)) fail(`missing '${key}'`);
@@ -33,11 +43,23 @@ export function validateProductAcceptanceReport(report, { blueprint, blueprintDi
   const knownRequirements = new Set(blueprint.requirements.map((item) => item.requirementId));
   const knownCriteria = new Set(blueprint.requirements.flatMap((item) => item.acceptanceCriteria.map((criterion) => `${item.requirementId}:${criterion.criterionId}`)));
   for (const category of ["integration", "qa", "security", "productE2e", "ci"]) validateEvidence(report.evidence[category], report.candidateSha, `${category} evidence`);
-  for (const result of report.results) validateResult(result, knownRequirements, knownCriteria, report.candidateSha);
+  const resultKeys = new Set();
+  for (const result of report.results) {
+    validateResult(result, knownRequirements, knownCriteria, report.candidateSha);
+    const key = `${result.requirementId}:${result.criterionId ?? "@requirement"}`;
+    if (resultKeys.has(key)) fail(`duplicate result mapping '${key}'`);
+    resultKeys.add(key);
+    if (result.criterionId !== null && result.criterionId !== undefined) validateCriterionResult(result, report.candidateSha);
+  }
   for (const requirement of blueprint.requirements) {
     const requirementResult = report.results.find((item) => item.requirementId === requirement.requirementId && (item.criterionId === null || item.criterionId === undefined));
     if (!requirementResult) fail(`missing requirement result '${requirement.requirementId}'`);
-    for (const criterion of requirement.acceptanceCriteria) if (!report.results.some((item) => item.requirementId === requirement.requirementId && item.criterionId === criterion.criterionId)) fail(`missing criterion result '${criterion.criterionId}'`);
+    const criterionResults = requirement.acceptanceCriteria.map((criterion) => {
+      const result = report.results.find((item) => item.requirementId === requirement.requirementId && item.criterionId === criterion.criterionId);
+      if (!result) fail(`missing criterion result '${criterion.criterionId}'`);
+      return result;
+    });
+    if (requirement.mandatory && requirementResult.status === "pass" && criterionResults.some((result) => result.status !== "pass")) fail(`mandatory requirement '${requirement.requirementId}' cannot pass while a criterion is not pass`);
   }
   return structuredClone(report);
 }
@@ -45,5 +67,9 @@ export function validateProductAcceptanceReport(report, { blueprint, blueprintDi
 export function productAcceptancePasses(report, { blueprint }) {
   const blockers = specificationBlockers(blueprint);
   if (blockers.length || report.evidence.integration?.status !== "pass" || report.evidence.qa?.status !== "pass" || report.evidence.security?.status !== "pass" || report.evidence.productE2e?.status !== "pass" || report.evidence.ci?.status !== "pass") return false;
-  return blueprint.requirements.filter((item) => item.mandatory).every((requirement) => report.results.filter((item) => item.requirementId === requirement.requirementId).every((item) => item.status === "pass"));
+  if (report.results.some((result) => result.criterionId !== null && result.criterionId !== undefined && ["failed", "not_verified"].includes(result.status))) return false;
+  return blueprint.requirements.filter((item) => item.mandatory).every((requirement) => {
+    const requirementResult = report.results.find((item) => item.requirementId === requirement.requirementId && (item.criterionId === null || item.criterionId === undefined));
+    return requirementResult?.status === "pass" && requirement.acceptanceCriteria.every((criterion) => report.results.find((item) => item.requirementId === requirement.requirementId && item.criterionId === criterion.criterionId)?.status === "pass");
+  });
 }
