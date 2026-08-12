@@ -35,7 +35,17 @@ export class DeliveryCoordinator {
     const overlay = await this.router.ensureProjectOverlay();
     // Brownfield identity is captured before Bootstrap creates the ProductBlueprint.
     // The immutable draft is finalized only after that persisted blueprint exists.
-    const baselineDraft = this.router.captureRepositoryBaselineDraft(overlay);
+    let baselineDraft;
+    try { baselineDraft = this.router.captureRepositoryBaselineDraft(overlay); }
+    catch (error) {
+      // A malformed or missing brownfield declaration must become a persisted,
+      // redacted delivery stop.  Queueing Bootstrap is harmless here: the run
+      // is blocked before the scheduler can ever create an App Server turn.
+      const bootstrap = this.router.startProject();
+      const run = this.router.createDeliveryRun({ id: randomUUID(), source, bootstrapTaskId: bootstrap.id, confirmRemotePush: this.router.isAutonomous(), sourceClaimManifestId: this.router.sourceClaimManifestIdentity(), repositoryMode: this.router.config.project.repositoryMode, repositoryBaseSha: null });
+      this.router.store.linkTaskToDelivery(bootstrap.id, run.id);
+      return this.router.blockRunForRepositoryBaseline(run, error);
+    }
     // Intake is verified before Bootstrap is even queued; no blueprint is
     // required at this phase because Bootstrap is the operation that creates it.
     const sourceClaimManifestId = this.router.sourceClaimManifestIdentity();

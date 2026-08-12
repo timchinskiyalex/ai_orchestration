@@ -225,7 +225,7 @@ export class SwarmRouter extends EventEmitter {
     return { task, threadRead, ...this.appServerDiagnostics() };
   }
 
-  enqueue({ role, title, prompt, parentTaskId = null, allowedPaths = [], acceptanceChecks = [], dependencies = [], estimatedTokens = null, humanApprovalRequired = false, riskFlags = [], supportingDomains = [], artifactBaseSha = null, artifactDependencies = [], remediationRound = 0, sourceWriterTaskId = null, blueprintId = null, requirementIds = [], deliveryRunId = this.activeDeliveryRunId }) {
+  enqueue({ role, title, prompt, parentTaskId = null, allowedPaths = [], acceptanceChecks = [], dependencies = [], estimatedTokens = null, humanApprovalRequired = false, riskFlags = [], supportingDomains = [], artifactBaseSha = null, artifactDependencies = [], remediationRound = 0, sourceWriterTaskId = null, blueprintId = null, requirementIds = [], baselineBehaviorIds = [], deliveryRunId = this.activeDeliveryRunId }) {
     assertRole(role);
     if (!title?.trim() || !prompt?.trim()) throw new Error("title and prompt are required");
     const roleConfig = this.config.roles[role];
@@ -236,7 +236,7 @@ export class SwarmRouter extends EventEmitter {
     return this.store.createTask({
       id: randomUUID(), parentTaskId, role, title: title.trim(), prompt: prompt.trim(),
       allowedPaths, acceptanceChecks, dependencies, humanApprovalRequired, estimatedTokens: estimate, tokenBudget: roleConfig.tokenBudget, maxAttempts: 1,
-      riskFlags, supportingDomains, artifactBaseSha, artifactDependencies, remediationRound, sourceWriterTaskId, blueprintId, requirementIds, deliveryRunId
+      riskFlags, supportingDomains, artifactBaseSha, artifactDependencies, remediationRound, sourceWriterTaskId, blueprintId, requirementIds, baselineBehaviorIds, deliveryRunId
     });
   }
 
@@ -1144,7 +1144,7 @@ export class SwarmRouter extends EventEmitter {
       remediationRound: nextRound,
       sourceWriterTaskId: null,
       blueprintId: writer.blueprintId,
-      requirementIds: writer.requirementIds,
+      requirementIds: writer.requirementIds, baselineBehaviorIds: writer.baselineBehaviorIds,
       deliveryRunId: writer.deliveryRunId
     });
     const security = this.enqueue({
@@ -1152,14 +1152,14 @@ export class SwarmRouter extends EventEmitter {
       prompt: `Review the finalized remediation artifact for '${writer.title}'. Do not expand scope; report only concrete security findings.`,
       allowedPaths, acceptanceChecks: report.findings.map((finding) => finding.verification), dependencies: [remediation.id],
       estimatedTokens: Math.min(this.config.roles.security.tokenBudget, Math.max(1, Math.ceil(remediation.estimatedTokens * 0.35))),
-      riskFlags: writer.riskFlags, supportingDomains: ["security"], sourceWriterTaskId: remediation.id, blueprintId: writer.blueprintId, requirementIds: writer.requirementIds, deliveryRunId: writer.deliveryRunId
+      riskFlags: writer.riskFlags, supportingDomains: ["security"], sourceWriterTaskId: remediation.id, blueprintId: writer.blueprintId, requirementIds: writer.requirementIds, baselineBehaviorIds: writer.baselineBehaviorIds, deliveryRunId: writer.deliveryRunId
     });
     this.enqueue({
       role: "qa", parentTaskId: security.id, title: `QA: ${remediation.title}`,
       prompt: `Verify the finalized remediation artifact for '${writer.title}'. Return the required QualityGateReport only.`,
       allowedPaths, acceptanceChecks: report.findings.map((finding) => finding.verification), dependencies: [security.id],
       estimatedTokens: Math.min(this.config.roles.qa.tokenBudget, Math.max(1, Math.ceil(remediation.estimatedTokens * 0.4))),
-      riskFlags: writer.riskFlags, supportingDomains: ["qa"], sourceWriterTaskId: remediation.id, blueprintId: writer.blueprintId, requirementIds: writer.requirementIds, deliveryRunId: writer.deliveryRunId
+      riskFlags: writer.riskFlags, supportingDomains: ["qa"], sourceWriterTaskId: remediation.id, blueprintId: writer.blueprintId, requirementIds: writer.requirementIds, baselineBehaviorIds: writer.baselineBehaviorIds, deliveryRunId: writer.deliveryRunId
     });
     this.store.transition(task.id, "done");
     this.#lifecycle("remediation queued", { taskId: remediation.id, writerTaskId: writer.id, remediationRound: nextRound });
@@ -1191,9 +1191,9 @@ export class SwarmRouter extends EventEmitter {
     const predecessor = this.store.workerArtifactRecord(writer.id);
     if (!predecessor?.artifact) throw new Error(`Security remediation requires finalized artifact for ${writer.id}`);
     const allowedPaths = remediationScope(report, writer);
-    const remediation = this.enqueue({ role: writer.role, parentTaskId: task.id, title: `Remediate ${writer.title} (security round ${nextRound})`, prompt: `Apply only these validated SecurityGate findings. Do not expand scope or risk: ${JSON.stringify(report.findings.map((finding) => ({ id: finding.id, path: finding.path, requiredFix: finding.requiredFix, verification: finding.verification })))}.`, allowedPaths, acceptanceChecks: report.findings.map((finding) => finding.verification), dependencies: [task.id], estimatedTokens: Math.min(this.config.roles[writer.role].tokenBudget, writer.estimatedTokens), riskFlags: writer.riskFlags, supportingDomains: ["security", "qa"], artifactBaseSha: predecessor.artifact.headSha, artifactDependencies: [writer.id], remediationRound: nextRound, blueprintId: writer.blueprintId, requirementIds: writer.requirementIds, deliveryRunId: writer.deliveryRunId });
-    const security = this.enqueue({ role: "security", parentTaskId: remediation.id, title: `Security review: ${remediation.title}`, prompt: `Review the finalized security remediation artifact for '${writer.title}'. Return the required SecurityGateReport only.`, allowedPaths, acceptanceChecks: remediation.acceptanceChecks, dependencies: [remediation.id], estimatedTokens: Math.min(this.config.roles.security.tokenBudget, Math.max(1, Math.ceil(remediation.estimatedTokens * 0.35))), riskFlags: writer.riskFlags, supportingDomains: ["security"], sourceWriterTaskId: remediation.id, blueprintId: writer.blueprintId, requirementIds: writer.requirementIds, deliveryRunId: writer.deliveryRunId });
-    this.enqueue({ role: "qa", parentTaskId: security.id, title: `QA: ${remediation.title}`, prompt: `Verify the finalized security remediation artifact for '${writer.title}'. Return the required QualityGateReport only.`, allowedPaths, acceptanceChecks: remediation.acceptanceChecks, dependencies: [security.id], estimatedTokens: Math.min(this.config.roles.qa.tokenBudget, Math.max(1, Math.ceil(remediation.estimatedTokens * 0.4))), riskFlags: writer.riskFlags, supportingDomains: ["qa"], sourceWriterTaskId: remediation.id, blueprintId: writer.blueprintId, requirementIds: writer.requirementIds, deliveryRunId: writer.deliveryRunId });
+    const remediation = this.enqueue({ role: writer.role, parentTaskId: task.id, title: `Remediate ${writer.title} (security round ${nextRound})`, prompt: `Apply only these validated SecurityGate findings. Do not expand scope or risk: ${JSON.stringify(report.findings.map((finding) => ({ id: finding.id, path: finding.path, requiredFix: finding.requiredFix, verification: finding.verification })))}.`, allowedPaths, acceptanceChecks: report.findings.map((finding) => finding.verification), dependencies: [task.id], estimatedTokens: Math.min(this.config.roles[writer.role].tokenBudget, writer.estimatedTokens), riskFlags: writer.riskFlags, supportingDomains: ["security", "qa"], artifactBaseSha: predecessor.artifact.headSha, artifactDependencies: [writer.id], remediationRound: nextRound, blueprintId: writer.blueprintId, requirementIds: writer.requirementIds, baselineBehaviorIds: writer.baselineBehaviorIds, deliveryRunId: writer.deliveryRunId });
+    const security = this.enqueue({ role: "security", parentTaskId: remediation.id, title: `Security review: ${remediation.title}`, prompt: `Review the finalized security remediation artifact for '${writer.title}'. Return the required SecurityGateReport only.`, allowedPaths, acceptanceChecks: remediation.acceptanceChecks, dependencies: [remediation.id], estimatedTokens: Math.min(this.config.roles.security.tokenBudget, Math.max(1, Math.ceil(remediation.estimatedTokens * 0.35))), riskFlags: writer.riskFlags, supportingDomains: ["security"], sourceWriterTaskId: remediation.id, blueprintId: writer.blueprintId, requirementIds: writer.requirementIds, baselineBehaviorIds: writer.baselineBehaviorIds, deliveryRunId: writer.deliveryRunId });
+    this.enqueue({ role: "qa", parentTaskId: security.id, title: `QA: ${remediation.title}`, prompt: `Verify the finalized security remediation artifact for '${writer.title}'. Return the required QualityGateReport only.`, allowedPaths, acceptanceChecks: remediation.acceptanceChecks, dependencies: [security.id], estimatedTokens: Math.min(this.config.roles.qa.tokenBudget, Math.max(1, Math.ceil(remediation.estimatedTokens * 0.4))), riskFlags: writer.riskFlags, supportingDomains: ["qa"], sourceWriterTaskId: remediation.id, blueprintId: writer.blueprintId, requirementIds: writer.requirementIds, baselineBehaviorIds: writer.baselineBehaviorIds, deliveryRunId: writer.deliveryRunId });
     this.store.transition(task.id, "done");
     this.#lifecycle("security remediation queued", { taskId: remediation.id, writerTaskId: writer.id, remediationRound: nextRound });
   }
@@ -1422,12 +1422,12 @@ export class SwarmRouter extends EventEmitter {
         const estimate = Math.min(this.config.roles.security?.tokenBudget ?? 0, Math.max(1000, Math.ceil(item.estimatedTokens * 0.35)));
         const security = assertRoute("security", estimate);
         predecessorId = randomUUID();
-        specs.push({ id: predecessorId, role: "security", parentTaskId: primaryId, title: `Security review: ${item.title}`, prompt: `Review finalized writer artifact '${item.title}' for declared risk flags: ${item.riskFlags.join(", ") || "none"}. Return the required SecurityGateReport only.`, allowedPaths: item.allowedPaths, acceptanceChecks: item.acceptanceChecks, dependencies: [primaryId], executionDependencies: [], executionTopologyVersion: 1, executionIsWriter: false, estimatedTokens: estimate, tokenBudget: security.tokenBudget, maxAttempts: 1, humanApprovalRequired: false, riskFlags: item.riskFlags, supportingDomains: ["security"], sourceWriterTaskId: primaryId, blueprintId: stored.blueprint.blueprintId, requirementIds: item.requirementIds, deliveryRunId: planRunId, planBatchId: plan.id, wave: plan.wave });
+        specs.push({ id: predecessorId, role: "security", parentTaskId: primaryId, title: `Security review: ${item.title}`, prompt: `Review finalized writer artifact '${item.title}' for declared risk flags: ${item.riskFlags.join(", ") || "none"}. Return the required SecurityGateReport only.`, allowedPaths: item.allowedPaths, acceptanceChecks: item.acceptanceChecks, baselineBehaviorIds: item.baselineBehaviorIds ?? [], dependencies: [primaryId], executionDependencies: [], executionTopologyVersion: 1, executionIsWriter: false, estimatedTokens: estimate, tokenBudget: security.tokenBudget, maxAttempts: 1, humanApprovalRequired: false, riskFlags: item.riskFlags, supportingDomains: ["security"], sourceWriterTaskId: primaryId, blueprintId: stored.blueprint.blueprintId, requirementIds: item.requirementIds, deliveryRunId: planRunId, planBatchId: plan.id, wave: plan.wave });
       }
       if (mandatoryReview || item.supportingDomains.includes("qa")) {
         const estimate = Math.min(this.config.roles.qa?.tokenBudget ?? 0, Math.max(1000, Math.ceil(item.estimatedTokens * 0.4)));
         const qa = assertRoute("qa", estimate);
-        specs.push({ id: randomUUID(), role: "qa", parentTaskId: predecessorId, title: `QA: ${item.title}`, prompt: `Verify finalized writer artifact '${item.title}' against acceptance checks. Return the required QualityGateReport only.`, allowedPaths: item.allowedPaths, acceptanceChecks: item.acceptanceChecks, dependencies: [predecessorId], executionDependencies: [], executionTopologyVersion: 1, executionIsWriter: false, estimatedTokens: estimate, tokenBudget: qa.tokenBudget, maxAttempts: 1, humanApprovalRequired: false, riskFlags: item.riskFlags, supportingDomains: ["qa"], sourceWriterTaskId: primaryId, blueprintId: stored.blueprint.blueprintId, requirementIds: item.requirementIds, deliveryRunId: planRunId, planBatchId: plan.id, wave: plan.wave });
+        specs.push({ id: randomUUID(), role: "qa", parentTaskId: predecessorId, title: `QA: ${item.title}`, prompt: `Verify finalized writer artifact '${item.title}' against acceptance checks. Return the required QualityGateReport only.`, allowedPaths: item.allowedPaths, acceptanceChecks: item.acceptanceChecks, baselineBehaviorIds: item.baselineBehaviorIds ?? [], dependencies: [predecessorId], executionDependencies: [], executionTopologyVersion: 1, executionIsWriter: false, estimatedTokens: estimate, tokenBudget: qa.tokenBudget, maxAttempts: 1, humanApprovalRequired: false, riskFlags: item.riskFlags, supportingDomains: ["qa"], sourceWriterTaskId: primaryId, blueprintId: stored.blueprint.blueprintId, requirementIds: item.requirementIds, deliveryRunId: planRunId, planBatchId: plan.id, wave: plan.wave });
       }
     }
     const replacements = scopedReplan ? scopedReplan.affectedTaskIds.map((oldTaskId) => {
