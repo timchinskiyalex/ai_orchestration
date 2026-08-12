@@ -77,7 +77,7 @@ export class SwarmRouter extends EventEmitter {
     this.config = config;
     this.store = new StateStore(join(config.runtimeDir, "swarm.sqlite"), { readOnly });
     this.governor = new BudgetGovernor(config.router);
-    this.worktrees = new WorktreeManager(config);
+    this.worktrees = new WorktreeManager({ ...config, store: this.store, readOnly });
     this.threadTasks = new Map();
     this.account = new BudgetAccountAdapter(this.store);
     this.processRunner = config.processRunner ?? runManagedProcess;
@@ -143,6 +143,9 @@ export class SwarmRouter extends EventEmitter {
       try { process.kill(pid, 0); return true; } catch { return false; }
     } });
     for (const run of recovered) this.#lifecycle("stale delivery recovered", { deliveryRunId: run.id, state: run.state, recovery: run.recovery });
+    // Git/filesystem facts are authoritative. This only classifies and
+    // preserves records; it never prunes, resets, or recreates a worktree.
+    this.worktrees.reconcile({ taskForRecord: (record) => record.taskId ? this.store.getTask(record.taskId) : null }).catch((error) => this.#lifecycle("managed worktree reconciliation failed", { error: String(error.message).slice(0, 300) }));
     return recovered;
   }
 
@@ -256,6 +259,7 @@ export class SwarmRouter extends EventEmitter {
       deliveryRun: this.store.currentDeliveryRun(),
       repositoryBaseline: repositoryBaselineStatus(this.store.currentDeliveryRun() ? this.store.repositoryBaselineForRun(this.store.currentDeliveryRun().id) : null),
       finalAcceptance: this.store.currentDeliveryRun() ? this.store.productAcceptanceForRun(this.store.currentDeliveryRun().id) : null,
+      managedWorktrees: this.store.listManagedWorktrees({ limit: 50 }).map((record) => ({ recordId: record.recordId, kind: record.kind, phase: record.phase, classification: record.classification, taskId: record.taskId, deliveryRunId: record.deliveryRunId, barrierId: record.barrierId, candidateId: record.candidateId, branch: record.branch, lastVerifiedHead: record.lastVerifiedHead, updatedAt: record.updatedAt })),
       lifecycle: this.store.recentEvents(20)
     };
   }
@@ -327,7 +331,7 @@ export class SwarmRouter extends EventEmitter {
     });
     const resolved = this.#resolveEffectiveLineage(selected.map((item) => item.task.id));
     const { overlay } = loadProjectOverlay(this.config.repository, this.config.project.generatedDir);
-    const result = await new Integrator({ ...this.config, processRunner: this.processRunner }).integrate({ artifacts: resolved.artifacts, overlay, baseSha: resolved.baseSha, allowedBaseShas: resolved.allowedBaseShas, lineage: resolved.lineage });
+    const result = await new Integrator({ ...this.config, processRunner: this.processRunner, worktrees: this.worktrees, deliveryRunId: this.activeDeliveryRunId }).integrate({ artifacts: resolved.artifacts, overlay, baseSha: resolved.baseSha, allowedBaseShas: resolved.allowedBaseShas, lineage: resolved.lineage });
     this.store.recordIntegrationManifest(result.path, result.manifest);
     return result;
   }
@@ -630,7 +634,8 @@ export class SwarmRouter extends EventEmitter {
     let branch = task.branch;
     if (roleConfig.sandbox === "workspace-write") this._assertWriterArtifactLineage(task);
     if (task.artifactBaseSha && roleConfig.sandbox === "workspace-write") {
-      ({ worktree, branch } = await this.worktrees.create(task.id, { baseSha: task.artifactBaseSha }));
+      const adopted = await this.worktrees.adoptPreparedWorker(task);
+      ({ worktree, branch } = adopted ? { worktree: adopted.canonicalPath, branch: adopted.branch } : await this.worktrees.create(task.id, { baseSha: task.artifactBaseSha, task, sessionId: this.activeDeliverySessionId }));
     } else if (task.sourceWriterTaskId) {
       const writer = this.store.getTask(task.sourceWriterTaskId);
       if (!writer?.worktree || !writer?.branch) throw new Error(`Review task ${task.id} has no finalized writer worktree`);
@@ -638,7 +643,10 @@ export class SwarmRouter extends EventEmitter {
     } else if (roleConfig.usesWorktree) {
       const inherited = this.#inheritedWorktree(task);
       if (inherited) ({ worktree, branch } = inherited);
-      else ({ worktree, branch } = await this.worktrees.create(task.id));
+      else {
+        const adopted = await this.worktrees.adoptPreparedWorker(task);
+        ({ worktree, branch } = adopted ? { worktree: adopted.canonicalPath, branch: adopted.branch } : await this.worktrees.create(task.id, { task, sessionId: this.activeDeliverySessionId }));
+      }
     }
     this.store.transition(task.id, "running", { worktree, branch });
     this.store.setRuntimeBudget(task.id, runtimeBudget);
@@ -763,6 +771,7 @@ export class SwarmRouter extends EventEmitter {
         ({ overlayContext, resultText, finalized: finalizedArtifact } = await this.#finalizeWriterWithRepair(client, task, threadId, worktree, branch, overlayContext, resultText));
         const finalized = finalizedArtifact;
         this.store.recordWorkerArtifact(task.id, finalized.path, finalized.artifact);
+        this.#finalizeManagedWorker(task.id, finalized.artifact.headSha);
         this.#connectArtifactDependents(task, finalized.artifact);
       }
       this.store.transition(task.id, finalStatusForRole(task.role, { autonomous: this.isAutonomous() }));
@@ -906,6 +915,7 @@ export class SwarmRouter extends EventEmitter {
     this.store.setResultPath(task.id, resultPath);
     const finalized = await this.finalizer.finalize({ task, worktree, branch, overlay: refreshed.overlay, overlayPath: refreshed.path });
     this.store.recordWorkerArtifact(task.id, finalized.path, finalized.artifact);
+    this.#finalizeManagedWorker(task.id, finalized.artifact.headSha);
     this.#connectArtifactDependents(task, finalized.artifact);
     this.store.transition(task.id, finalStatusForRole(task.role, { autonomous: this.isAutonomous() }));
     this.#lifecycle("deterministic scaffold completed", { taskId: task.id, artifactPath: finalized.path, components: provision.provisioned.map((item) => item.root) });
@@ -917,6 +927,11 @@ export class SwarmRouter extends EventEmitter {
       this.#structuredOutputContract(task.role),
       "Bounded execution: do only the required scoped work, do not create child agents, avoid long explanations, and return the required structured result. Do not merge, push, modify Router configuration, or bypass approval/sandbox policy."
     ].join("\n");
+  }
+
+  #finalizeManagedWorker(taskId, headSha) {
+    const record = this.store.listManagedWorktrees({ limit: 100 }).find((item) => item.kind === "worker" && item.taskId === taskId && item.phase !== "preserved");
+    if (record) this.store.updateManagedWorktree(record.recordId, { phase: "finalized", classification: "active", lastVerifiedHead: headSha, finalized: true });
   }
 
   #workerOverlayContext() {
@@ -1513,7 +1528,7 @@ export class SwarmRouter extends EventEmitter {
       progressed = true;
       const artifacts = barrier.inputArtifacts.map((item) => this.store.workerArtifact(item.artifactId));
       const resolved = this.#resolveEffectiveLineage(barrier.inputArtifacts.map((item) => item.artifactId), { baseSha: barrier.baseSha });
-      const result = await new Integrator({ ...this.config, processRunner: this.processRunner }).integrateBarrier({ barrier, artifacts, effectiveArtifacts: resolved.artifacts, effectiveLineage: resolved.lineage, allowedBaseShas: resolved.allowedBaseShas, overlay: this.#workerOverlayContext().overlay });
+      const result = await new Integrator({ ...this.config, processRunner: this.processRunner, worktrees: this.worktrees, deliveryRunId: barrier.deliveryRunId }).integrateBarrier({ barrier, artifacts, effectiveArtifacts: resolved.artifacts, effectiveLineage: resolved.lineage, allowedBaseShas: resolved.allowedBaseShas, overlay: this.#workerOverlayContext().overlay });
       if (result.status !== "passed") {
         this.store.failIntegrationBarrier(barrier.id, result.error);
         const consumer = this.store.listTasks().find((item) => item.integrationBarrierId === barrier.id);

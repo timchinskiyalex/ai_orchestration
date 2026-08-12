@@ -20,7 +20,7 @@ const sensitiveArea = (path) => /(^|\/)(migrations?|infra|terraform|k8s|helm|\.g
 const checksum = (value) => createHash("sha256").update(value).digest("hex");
 
 export class Integrator {
-  constructor({ repository, runtimeDir, generatedDir, project = {}, integration = {}, runtimeIdentity = RUNTIME_GIT_IDENTITY, processRunner = runManagedProcess }) {
+  constructor({ repository, runtimeDir, generatedDir, project = {}, integration = {}, runtimeIdentity = RUNTIME_GIT_IDENTITY, processRunner = runManagedProcess, worktrees = null, deliveryRunId = null }) {
     this.repository = repository;
     this.runtimeDir = runtimeDir;
     // Router owns generatedDir under the project contract, while direct callers
@@ -31,6 +31,8 @@ export class Integrator {
     this.integration = integration;
     this.runtimeIdentity = runtimeIdentity;
     this.processRunner = processRunner;
+    this.worktrees = worktrees;
+    this.deliveryRunId = deliveryRunId;
   }
 
   async integrate({ artifacts, overlay, baseSha = overlay.repository.baseSha, allowedBaseShas = [], lineage = null }) {
@@ -55,15 +57,17 @@ export class Integrator {
     const effective = effectiveOrder.artifacts;
     const permittedBases = new Set([barrier.baseSha, ...allowedBaseShas]);
     await this.#validateEffectiveBases(effective, { permittedBases, label: "Barrier artifact" });
-    const root = resolve(this.runtimeDir, "integrations"); mkdirSync(root, { recursive: true }); const id = barrier.id, worktree = join(root, `barrier-${id}`), branch = `swarm/barrier/${id}`;
+    const root = resolve(this.runtimeDir, "integrations"); const id = barrier.id;
+    let worktree = join(root, `barrier-${id}`), branch = `swarm/barrier/${id}`, managed = null;
     try {
-      const existing = await git(this.repository, ["branch", "--list", branch]); if (!existing) await exec("git", ["-C", this.repository, "worktree", "add", "-b", branch, worktree, barrier.baseSha]); else await exec("git", ["-C", this.repository, "worktree", "add", worktree, branch]);
+      if (this.worktrees) { managed = await this.worktrees.createManaged({ kind: "integration_barrier", barrierId: id, deliveryRunId: barrier.deliveryRunId, planBatchId: barrier.planBatchId ?? null, baseSha: barrier.baseSha }); worktree = managed.canonicalPath; branch = managed.branch; }
+      else { mkdirSync(root, { recursive: true }); const existing = await git(this.repository, ["branch", "--list", branch]); if (!existing) await exec("git", ["-C", this.repository, "worktree", "add", "-b", branch, worktree, barrier.baseSha]); else await exec("git", ["-C", this.repository, "worktree", "add", worktree, branch]); }
       for (const artifact of effective) await this.#gitWithRuntimeIdentity(worktree, ["cherry-pick", artifact.headSha]);
       const verificationResults = [], verificationPlan = commandsForPaths(overlay, (overlay.components ?? []).filter((component) => component.state === "scaffolded").map((component) => component.root));
       if (verificationPlan.missing.length) throw new Error("Barrier verification unavailable for a scaffolded component");
       for (const command of verificationPlan.commands) { try { const result = await this.processRunner({ executable: command.executable, args: command.args, cwd: commandCwd(worktree, command), timeoutMs: command.timeoutMs ?? 120_000 }); verificationResults.push({ id: command.id, status: "passed", pid: result.pid, stdout: result.stdout.slice(-4000), stderr: result.stderr.slice(-4000) }); } catch (error) { verificationResults.push({ id: command.id, status: "failed", error: error.message }); throw Object.assign(new Error(`Barrier verification failed: ${command.id}`), { verificationResults }); } }
-      const [outputSha, clean] = await Promise.all([git(worktree, ["rev-parse", "HEAD"]), gitRaw(worktree, ["status", "--porcelain=v1", "-z", "--untracked-files=all"])]); if (clean) throw new Error("Barrier worktree is not clean"); await git(this.repository, ["rev-parse", "--verify", `${outputSha}^{commit}`]); return { status: "passed", id, worktree, branch, outputSha, verificationResults };
-    } catch (error) { try { await git(worktree, ["cherry-pick", "--abort"]); } catch {} return { status: "failed", id, worktree, branch, error: error.message, verificationResults: error.verificationResults ?? [] }; }
+      const [outputSha, clean] = await Promise.all([git(worktree, ["rev-parse", "HEAD"]), gitRaw(worktree, ["status", "--porcelain=v1", "-z", "--untracked-files=all"])]); if (clean) throw new Error("Barrier worktree is not clean"); await git(this.repository, ["rev-parse", "--verify", `${outputSha}^{commit}`]); if (managed) this.worktrees.store.updateManagedWorktree(managed.recordId, { phase: "finalized", classification: "active", lastVerifiedHead: outputSha, finalized: true }); return { status: "passed", id, worktree, branch, outputSha, verificationResults };
+    } catch (error) { /* A conflicted or failed worktree is evidence; never abort/reset it here. */ if (managed) this.worktrees.store.updateManagedWorktree(managed.recordId, { phase: "preserved", classification: "preserved-failure" }); return { status: "failed", id, worktree, branch, error: error.message, verificationResults: error.verificationResults ?? [] }; }
   }
 
   async #integrateUnlocked({ artifacts, overlay, baseSha, allowedBaseShas, lineage }) {
@@ -79,12 +83,15 @@ export class Integrator {
         return this.#blocked(overlay, sorted, `CONFLICT_BLOCKED: semantic/security/migration/infrastructure path overlap between ${sorted[j].taskId} and ${sorted[i].taskId}`);
       }
     }
-    const id = randomUUID();
+    // A delivery retry must address the same candidate ownership record, not
+    // manufacture a second candidate worktree for identical durable inputs.
+    const id = this.deliveryRunId ? `candidate-${checksum(JSON.stringify({ run: this.deliveryRunId, baseSha, lineage: lineage ?? sorted.map((artifact) => [artifact.taskId, artifact.headSha]) })).slice(0, 32)}` : randomUUID();
     const root = resolve(this.runtimeDir, "integrations");
-    const worktree = join(root, id);
-    const branch = `swarm/candidate/${id}`;
-    mkdirSync(root, { recursive: true });
-    await exec("git", ["-C", this.repository, "worktree", "add", "-b", branch, worktree, baseSha]);
+    let worktree = join(root, id);
+    let branch = `swarm/candidate/${id}`;
+    let managed = null;
+    if (this.worktrees) { managed = await this.worktrees.createManaged({ kind: "candidate_integration", candidateId: id, deliveryRunId: this.deliveryRunId, baseSha }); worktree = managed.canonicalPath; branch = managed.branch; }
+    else { mkdirSync(root, { recursive: true }); await exec("git", ["-C", this.repository, "worktree", "add", "-b", branch, worktree, baseSha]); }
     const applied = [];
     try {
       for (const artifact of sorted) {
@@ -100,8 +107,9 @@ export class Integrator {
       }
       const [headSha, clean] = await Promise.all([git(worktree, ["rev-parse", "HEAD"]), gitRaw(worktree, ["status", "--porcelain=v1", "-z", "--untracked-files=all"])]);
       if (clean) throw new Error("Integration worktree is not clean");
+      if (managed) this.worktrees.store.updateManagedWorktree(managed.recordId, { phase: "finalized", classification: "active", lastVerifiedHead: headSha, finalized: true });
       return this.#writeManifest({ id, status: "candidate_ready", branch, worktree, baseSha, candidateSha: headSha, headSha, appliedArtifacts: applied, effectiveLineage: lineage ?? sorted.map((artifact) => ({ kind: "artifact", id: artifact.taskId, sha: artifact.headSha })), verificationResults, localVerification: { status: "passed", commands: verificationResults }, remoteCi: this.#extensionStatus("remote CI", this.integration.remoteCiExtension), pullRequest: this.#extensionStatus("pull request", this.integration.pullRequestExtension), blockedReason: null, rollback: { baseSha, resetCommand: `git switch ${branch} && git reset --hard ${baseSha}` }, recovery: { mode: "preserved-worktree", worktree, action: "Candidate worktree is retained for diagnosis and can be removed after merge verification." }, humanMergeGate: { required: false, targetBranch: overlay.repository.branch, candidateSha: headSha, action: "autonomous PR and merge when remote checks pass" } });
-    } catch (error) { return this.#blocked(overlay, sorted, `CONFLICT_BLOCKED: integration exception: ${error.message}`, { id, branch, worktree, applied }); }
+    } catch (error) { if (managed) this.worktrees.store.updateManagedWorktree(managed.recordId, { phase: "preserved", classification: "preserved-failure" }); return this.#blocked(overlay, sorted, `CONFLICT_BLOCKED: integration exception: ${error.message}`, { id, branch, worktree, applied }); }
   }
 
   #blocked(overlay, artifacts, reason, details = {}) {

@@ -21,6 +21,7 @@ export class StateStore {
     this.hasResolutionAuthorityEvidence = this.#hasTable("specification_resolution_evidence");
     this.hasSourceClaimManifests = this.#hasTable("source_claim_manifests");
     this.hasRepositoryBaselines = this.#hasTable("repository_baselines") && this.#hasColumn("delivery_runs", "repository_mode");
+    this.hasManagedWorktrees = this.#hasTable("managed_worktrees");
     if (readOnly) return;
     // Switching journal mode takes an exclusive SQLite lock. Do it once at
     // database creation, never in every short-lived status/watch reader.
@@ -258,6 +259,39 @@ export class StateStore {
         PRIMARY KEY(replan_id, old_task_id),
         FOREIGN KEY(replan_id) REFERENCES scoped_replans(id)
       );
+      -- v2 ownership is deliberately independent from the old tasks.worktree
+      -- columns.  Old paths remain audit evidence and are never inferred to be
+      -- controller-owned by this migration.
+      CREATE TABLE IF NOT EXISTS managed_worktrees (
+        record_id TEXT PRIMARY KEY,
+        schema_version INTEGER NOT NULL,
+        kind TEXT NOT NULL,
+        repository_common_dir TEXT NOT NULL,
+        repository_root TEXT NOT NULL,
+        canonical_path TEXT,
+        intended_path TEXT NOT NULL,
+        task_id TEXT,
+        delivery_run_id TEXT,
+        plan_batch_id TEXT,
+        barrier_id TEXT,
+        candidate_id TEXT,
+        branch TEXT NOT NULL,
+        intended_base_sha TEXT NOT NULL,
+        last_verified_head TEXT,
+        creation_session_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        attempt INTEGER NOT NULL,
+        protocol_version INTEGER NOT NULL,
+        owner_version TEXT NOT NULL,
+        phase TEXT NOT NULL,
+        classification TEXT NOT NULL,
+        verification_json TEXT NOT NULL DEFAULT '{}',
+        linked_at TEXT,
+        finalized_at TEXT,
+        updated_at TEXT NOT NULL
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_managed_worktrees_canonical_path ON managed_worktrees(canonical_path) WHERE canonical_path IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS idx_managed_worktrees_controller ON managed_worktrees(task_id, barrier_id, candidate_id, created_at);
       CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status, created_at);
       CREATE INDEX IF NOT EXISTS idx_tasks_thread ON tasks(thread_id);
       CREATE INDEX IF NOT EXISTS idx_events_task ON events(task_id, sequence);
@@ -265,6 +299,7 @@ export class StateStore {
     this.hasResolutionAuthorityEvidence = true;
     this.hasSourceClaimManifests = true;
     this.hasRepositoryBaselines = true;
+    this.hasManagedWorktrees = true;
     this.#addColumnIfMissing("tasks", "dependencies_json", "TEXT NOT NULL DEFAULT '[]'");
     this.#addColumnIfMissing("tasks", "result_path", "TEXT");
     this.#addColumnIfMissing("tasks", "estimated_tokens", "INTEGER NOT NULL DEFAULT 0");
@@ -344,6 +379,59 @@ export class StateStore {
   }
 
   close() { this.db.close(); }
+
+  // ManagedWorktreeRecord v2 is a durable ownership claim, not a convenient
+  // reconstruction of a pathname.  Every update is explicit so a crash can be
+  // reconciled from this record and Git's registered-worktree facts.
+  recordManagedWorktreeIntent(record) {
+    if (!this.hasManagedWorktrees) throw new Error("Managed worktree records are unavailable in this legacy read-only database");
+    const required = ["recordId", "kind", "repositoryCommonDir", "repositoryRoot", "intendedPath", "branch", "intendedBaseSha", "creationSessionId"];
+    if (required.some((key) => typeof record[key] !== "string" || !record[key])) throw new Error("Managed worktree intent is incomplete");
+    if (!["worker", "integration_barrier", "candidate_integration"].includes(record.kind)) throw new Error("Managed worktree intent has an invalid kind");
+    const timestamp = now();
+    this.db.prepare(`INSERT INTO managed_worktrees (
+      record_id, schema_version, kind, repository_common_dir, repository_root, canonical_path, intended_path,
+      task_id, delivery_run_id, plan_batch_id, barrier_id, candidate_id, branch, intended_base_sha, last_verified_head,
+      creation_session_id, created_at, attempt, protocol_version, owner_version, phase, classification, verification_json, linked_at, finalized_at, updated_at
+    ) VALUES (?, 2, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, 2, ?, 'intent_recorded', 'active', '{}', NULL, NULL, ?)`)
+      .run(record.recordId, record.kind, record.repositoryCommonDir, record.repositoryRoot, record.intendedPath,
+        record.taskId ?? null, record.deliveryRunId ?? null, record.planBatchId ?? null, record.barrierId ?? null, record.candidateId ?? null,
+        record.branch, record.intendedBaseSha, record.creationSessionId, timestamp, record.attempt ?? 1, record.ownerVersion ?? "managed-worktree/v2", timestamp);
+    return this.managedWorktree(record.recordId);
+  }
+
+  managedWorktree(recordId) {
+    if (!this.hasManagedWorktrees) return null;
+    const row = this.db.prepare("SELECT * FROM managed_worktrees WHERE record_id = ?").get(recordId);
+    return row ? this.#mapManagedWorktree(row) : null;
+  }
+
+  listManagedWorktrees({ limit = 100 } = {}) {
+    if (!this.hasManagedWorktrees) return [];
+    return this.db.prepare("SELECT * FROM managed_worktrees ORDER BY created_at DESC LIMIT ?").all(Math.max(1, Math.min(100, limit))).map((row) => this.#mapManagedWorktree(row));
+  }
+
+  linkManagedWorktree(recordId, { canonicalPath, lastVerifiedHead, verification = {}, taskId = undefined, phase = "linked", classification = "active" } = {}) {
+    const current = this.managedWorktree(recordId); if (!current) throw new Error("Managed worktree record not found");
+    const timestamp = now();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.prepare("UPDATE managed_worktrees SET canonical_path = ?, last_verified_head = ?, verification_json = ?, phase = ?, classification = ?, linked_at = COALESCE(linked_at, ?), updated_at = ? WHERE record_id = ?")
+        .run(canonicalPath ?? current.canonicalPath, lastVerifiedHead ?? current.lastVerifiedHead, json(verification), phase, classification, timestamp, timestamp, recordId);
+      const effectiveTaskId = taskId === undefined ? current.taskId : taskId;
+      if (effectiveTaskId) this.db.prepare("UPDATE tasks SET worktree = ?, branch = ?, updated_at = ? WHERE id = ?").run(canonicalPath ?? current.canonicalPath, current.branch, timestamp, effectiveTaskId);
+      this.db.exec("COMMIT");
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    return this.managedWorktree(recordId);
+  }
+
+  updateManagedWorktree(recordId, { phase, classification, lastVerifiedHead, verification, canonicalPath, finalized = false } = {}) {
+    const current = this.managedWorktree(recordId); if (!current) throw new Error("Managed worktree record not found");
+    const timestamp = now();
+    this.db.prepare("UPDATE managed_worktrees SET phase = ?, classification = ?, last_verified_head = ?, canonical_path = ?, verification_json = ?, finalized_at = ?, updated_at = ? WHERE record_id = ?")
+      .run(phase ?? current.phase, classification ?? current.classification, lastVerifiedHead ?? current.lastVerifiedHead, canonicalPath ?? current.canonicalPath, verification === undefined ? json(current.verification) : json(verification), finalized ? timestamp : current.finalizedAt, timestamp, recordId);
+    return this.managedWorktree(recordId);
+  }
 
   createTask(task) {
     assertRole(task.role);
@@ -1113,6 +1201,20 @@ export class StateStore {
       remediationRound: row.remediation_round, sourceWriterTaskId: row.source_writer_task_id,
       deliveryRunId: row.delivery_run_id, blueprintId: row.blueprint_id, requirementIds: parse(row.requirement_ids_json, []), baselineBehaviorIds: parse(row.baseline_behavior_ids_json, []), interruptThresholdTokens: row.interrupt_threshold_tokens, configuredBudgetCap: row.configured_budget_cap,
       budgetInterrupt: this.budgetInterruption(row.id)
+    };
+  }
+
+  #mapManagedWorktree(row) {
+    return {
+      recordId: row.record_id, schemaVersion: row.schema_version, kind: row.kind,
+      repositoryCommonDir: row.repository_common_dir, repositoryRoot: row.repository_root,
+      canonicalPath: row.canonical_path, intendedPath: row.intended_path, taskId: row.task_id,
+      deliveryRunId: row.delivery_run_id, planBatchId: row.plan_batch_id, barrierId: row.barrier_id, candidateId: row.candidate_id,
+      branch: row.branch, intendedBaseSha: row.intended_base_sha, lastVerifiedHead: row.last_verified_head,
+      creationSessionId: row.creation_session_id, createdAt: row.created_at, attempt: row.attempt,
+      protocolVersion: row.protocol_version, ownerVersion: row.owner_version, phase: row.phase,
+      classification: row.classification, verification: parse(row.verification_json, {}), linkedAt: row.linked_at,
+      finalizedAt: row.finalized_at, updatedAt: row.updated_at
     };
   }
 
