@@ -9,6 +9,7 @@ import { execFileSync } from "node:child_process";
 import { SwarmRouter } from "../src/router.mjs";
 import { fakeBlueprint, fakePlan } from "./product-blueprint-fixture.mjs";
 import { documentIdForPath, documentSetDigest } from "../src/product-blueprint.mjs";
+import { provider } from "./execution-provider-test-adapter.mjs";
 
 const git = (cwd, args) => execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8" }).trim();
 class FakeAppServer extends EventEmitter {
@@ -32,7 +33,7 @@ test("quota-free autonomous flow materializes DAG, Security/QA, finalizes writer
     const roles = Object.fromEntries(["bootstrap", "planner", "backend", "frontend", "database", "qa", "security", "devops"].map((role) => [role, { sandbox: role === "backend" ? "workspace-write" : "read-only", approvalPolicy: "never", tokenBudget: 100, usesWorktree: role === "backend" }]));
     const processRunnerCalls = [];
     const processRunner = async (command) => { processRunnerCalls.push(command); return { pid: 717, stdout: "fake declared verification", stderr: "" }; };
-    router = new SwarmRouter({ repository: root, runtimeDir: join(root, "runtime"), baseRef: "main", model: "fake", processRunner, project: { name: "fake", documentationDir: "docs/orchestration-input", generatedDir: "docs/orchestration-generated" }, router: { maxConcurrentTasks: 1, maxChildrenPerTask: 5, maxDelegationDepth: 4, maxPlanTasks: 5, defaultParentBudget: 1000, turnTimeoutMs: 1000, approvalMode: "deny" }, autonomy: { mode: "autonomous", autoApproveWorkflowGates: true, autoRemediate: true, autoPush: true, autoCreatePullRequest: true, autoMerge: true, maxRemediationRounds: 3 }, budget: { weeklyTokenLimit: 10000, weeklyWindowDays: 7 }, quota: { throttleAtUsedPercent: 90, throttleWhenUnavailable: false }, roles, appServerClientFactory: () => new FakeAppServer() });
+    router = new SwarmRouter({ repository: root, runtimeDir: join(root, "runtime"), baseRef: "main", model: "fake", processRunner, project: { name: "fake", documentationDir: "docs/orchestration-input", generatedDir: "docs/orchestration-generated" }, router: { maxConcurrentTasks: 1, maxChildrenPerTask: 5, maxDelegationDepth: 4, maxPlanTasks: 5, defaultParentBudget: 1000, turnTimeoutMs: 1000, approvalMode: "deny" }, autonomy: { mode: "autonomous", autoApproveWorkflowGates: true, autoRemediate: true, autoPush: true, autoCreatePullRequest: true, autoMerge: true, maxRemediationRounds: 3 }, budget: { weeklyTokenLimit: 10000, weeklyWindowDays: 7 }, quota: { throttleAtUsedPercent: 90, throttleWhenUnavailable: false }, roles, executionProviderFactory: () => provider(new FakeAppServer()) });
     await router.ensureProjectOverlay(); router.startProject(); await router.runUntilIdle();
     const tasks = router.list(); const backend = tasks.find((task) => task.role === "backend"); const security = tasks.find((task) => task.role === "security"); const qa = tasks.find((task) => task.role === "qa");
     assert.ok(backend && security && qa, JSON.stringify(tasks.map((task) => ({ role: task.role, status: task.status, error: task.error })))); assert.equal(backend.status, "done"); assert.deepEqual(security.dependencies, [backend.id]); assert.deepEqual(qa.dependencies, [security.id]);

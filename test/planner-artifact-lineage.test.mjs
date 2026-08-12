@@ -9,6 +9,7 @@ import { join } from "node:path";
 import { SwarmRouter } from "../src/router.mjs";
 import { fakeBlueprint } from "./product-blueprint-fixture.mjs";
 import { documentIdForPath, documentSetDigest } from "../src/product-blueprint.mjs";
+import { provider } from "./execution-provider-test-adapter.mjs";
 
 const git = (cwd, args) => execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8" }).trim();
 
@@ -49,7 +50,7 @@ class LineageClient extends EventEmitter {
 const writer = (id, title, dependsOn = []) => ({ id, title, prompt: title, primaryDomain: "backend", supportingDomains: [], riskFlags: [], humanApprovalRequired: false, estimatedTokens: 20, dependsOn, allowedPaths: [`src/${id.replace("writer-", "")}.mjs`], acceptanceChecks: [], requirementIds: ["fix-value"] });
 function config(root, client) {
   const roles = Object.fromEntries(["bootstrap", "planner", "backend", "frontend", "database", "qa", "security", "devops"].map((role) => [role, { sandbox: role === "backend" ? "workspace-write" : "read-only", approvalPolicy: "never", tokenBudget: 100, usesWorktree: role === "backend" }]));
-  return { repository: root, runtimeDir: join(root, "runtime"), baseRef: "main", model: "fake", project: { name: "lineage", documentationDir: "docs/orchestration-input", generatedDir: "docs/orchestration-generated", productRoots: [] }, router: { maxConcurrentTasks: 1, maxChildrenPerTask: 10, maxDelegationDepth: 5, maxPlanTasks: 10, defaultParentBudget: 1000, turnTimeoutMs: 1000, approvalMode: "deny" }, autonomy: { mode: "autonomous", autoApproveWorkflowGates: true, autoRemediate: true }, budget: { weeklyTokenLimit: 10000, weeklyWindowDays: 7 }, quota: { throttleAtUsedPercent: 90, throttleWhenUnavailable: false }, roles, appServerClientFactory: () => client };
+  return { repository: root, runtimeDir: join(root, "runtime"), baseRef: "main", model: "fake", project: { name: "lineage", documentationDir: "docs/orchestration-input", generatedDir: "docs/orchestration-generated", productRoots: [] }, router: { maxConcurrentTasks: 1, maxChildrenPerTask: 10, maxDelegationDepth: 5, maxPlanTasks: 10, defaultParentBudget: 1000, turnTimeoutMs: 1000, approvalMode: "deny" }, autonomy: { mode: "autonomous", autoApproveWorkflowGates: true, autoRemediate: true }, budget: { weeklyTokenLimit: 10000, weeklyWindowDays: 7 }, quota: { throttleAtUsedPercent: 90, throttleWhenUnavailable: false }, roles, executionProviderFactory: () => provider(client) };
 }
 function setup(client) {
   const root = mkdtempSync(join(tmpdir(), "planner-lineage-"));

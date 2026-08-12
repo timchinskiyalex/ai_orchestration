@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 import { SwarmRouter } from "../src/router.mjs";
 import { DeliveryCoordinator } from "../src/delivery-coordinator.mjs";
+import { provider } from "./execution-provider-test-adapter.mjs";
 
 const git = (cwd, args) => execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8" });
 const roles = Object.fromEntries(["bootstrap", "planner", "backend", "frontend", "database", "qa", "security", "devops"].map((role) => [role, {
@@ -50,7 +51,7 @@ function fixture({ usage = null, hardRunTokenLimit = 500, weeklyTokenLimit = 100
   const root = mkdtempSync(join(tmpdir(), "orchestration-budget-"));
   git(root, ["init", "-b", "main"]); writeFileSync(join(root, "README.md"), "# test\n"); git(root, ["add", "."]); git(root, ["-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "base"]);
   const client = new UsageFakeAppServer({ usage, exit, resolvedTurnId, completeAfterUsage, failSetGoal });
-  const router = new SwarmRouter({ repository: root, runtimeDir: join(root, "runtime"), baseRef: "main", model: "fake", project: { name: "test", documentationDir: "docs/in", generatedDir: "docs/out", productRoots: [] }, router: { maxConcurrentTasks, maxChildrenPerTask: 10, maxDelegationDepth: 4, maxPlanTasks: 5, defaultParentBudget: 1000, turnTimeoutMs: 1000, approvalMode: "deny" }, autonomy: { mode: "autonomous", autoApproveWorkflowGates: true, autoRemediate: true, autoPush: true, autoCreatePullRequest: true, autoMerge: true, maxRemediationRounds: 3 }, budget: { weeklyTokenLimit, weeklyWindowDays: 7, hardRunTokenLimit, interruptSafetyMarginTokens: 10, enforceLocalLimits }, quota: { throttleAtUsedPercent: 90, throttleWhenUnavailable: false }, delivery: { maxRemediationRounds: 3, leaseHeartbeatMs: 250, staleLeaseMs: 250, shutdownGraceMs: 250 }, roles, appServerClientFactory: () => client });
+  const router = new SwarmRouter({ repository: root, runtimeDir: join(root, "runtime"), baseRef: "main", model: "fake", project: { name: "test", documentationDir: "docs/in", generatedDir: "docs/out", productRoots: [] }, router: { maxConcurrentTasks, maxChildrenPerTask: 10, maxDelegationDepth: 4, maxPlanTasks: 5, defaultParentBudget: 1000, turnTimeoutMs: 1000, approvalMode: "deny" }, autonomy: { mode: "autonomous", autoApproveWorkflowGates: true, autoRemediate: true, autoPush: true, autoCreatePullRequest: true, autoMerge: true, maxRemediationRounds: 3 }, budget: { weeklyTokenLimit, weeklyWindowDays: 7, hardRunTokenLimit, interruptSafetyMarginTokens: 10, enforceLocalLimits }, quota: { throttleAtUsedPercent: 90, throttleWhenUnavailable: false }, delivery: { maxRemediationRounds: 3, leaseHeartbeatMs: 250, staleLeaseMs: 250, shutdownGraceMs: 250 }, roles, executionProviderFactory: () => provider(client) });
   return { root, router, client, dispose: () => { router.close(); rmSync(root, { recursive: true, force: true }); } };
 }
 
@@ -188,7 +189,7 @@ test("turn timeout preserves independent tasks for scoped recovery", async () =>
 test("a second coordinator cannot steal a fresh delivery lease before App Server startup", async () => {
   const first = fixture();
   let starts = 0;
-  const second = new SwarmRouter({ ...first.router.config, appServerClientFactory: () => { starts += 1; return new UsageFakeAppServer(); } });
+  const second = new SwarmRouter({ ...first.router.config, executionProviderFactory: () => { starts += 1; return provider(new UsageFakeAppServer()); } });
   try {
     const task = first.router.enqueue({ role: "bootstrap", title: "owned", prompt: "bounded" }); const run = createRun(first.router, task);
     await assert.rejects(new DeliveryCoordinator(second).resume(), /Delivery already owned/);

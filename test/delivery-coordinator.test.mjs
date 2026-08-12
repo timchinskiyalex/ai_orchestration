@@ -11,6 +11,7 @@ import { fakeBlueprint, fakePlan } from "./product-blueprint-fixture.mjs";
 import { createHash } from "node:crypto";
 import { documentIdForPath, documentSetDigest } from "../src/product-blueprint.mjs";
 import { sourceFragmentDigest } from "../src/source-evidence.mjs";
+import { provider } from "./execution-provider-test-adapter.mjs";
 
 const git = (cwd, args) => execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8" }).trim();
 class DeliveryClient extends EventEmitter {
@@ -83,7 +84,7 @@ class LegacySourceRefClient extends DeliveryClient {
 function setup(remote = true) {
   const root = mkdtempSync(join(tmpdir(), "delivery-coordinator-")); git(root, ["init", "-b", "main"]); mkdirSync(join(root, "src")); mkdirSync(join(root, "test")); const source = join(root, "requirements"); mkdirSync(source); const text = "# Requirement\nFix value.\n"; const file = { documentId: documentIdForPath("requirements.md"), path: "requirements.md", sha256: createHash("sha256").update(text).digest("hex") }; const ref = (line) => ({ documentId: file.documentId, startLine: line, endLine: line, excerptDigest: sourceFragmentDigest(text, line, line) }); writeFileSync(join(source, "requirements.md"), text); writeFileSync(join(source, "source-claims.json"), JSON.stringify({ schemaVersion: 1, kind: "SourceClaimsDeclaration", documentSetDigest: documentSetDigest([file]), documents: [{ ...file, coverage: [{ claimId: "fix-value-claim", ...ref(1) }, { claimId: "context-claim", ...ref(2) }] }], claims: [{ claimId: "fix-value-claim", classification: "mandatory", sourceRefs: [ref(1)] }, { claimId: "context-claim", classification: "non_mandatory", sourceRefs: [ref(2)] }] })); writeFileSync(join(root, "package.json"), JSON.stringify({ packageManager: "npm@10", scripts: { test: "node --test" } })); writeFileSync(join(root, "package-lock.json"), "{}"); writeFileSync(join(root, "src", "value.mjs"), "export const value = 1;\n"); writeFileSync(join(root, "test", "value.test.mjs"), "import test from 'node:test'; import assert from 'node:assert/strict'; import { value } from '../src/value.mjs'; test('value',()=>assert.equal(value,2));\n"); git(root, ["add", "."]); git(root, ["-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "base"]);
   const roles = Object.fromEntries(["bootstrap", "planner", "backend", "frontend", "database", "qa", "security", "devops"].map((role) => [role, { sandbox: role === "backend" ? "workspace-write" : "read-only", approvalPolicy: "never", tokenBudget: 200, usesWorktree: role === "backend" }]));
-  const config = { repository: root, runtimeDir: join(root, "runtime"), baseRef: "main", model: "fake", project: { name: "test", documentationDir: "docs/orchestration-input", generatedDir: "docs/orchestration-generated" }, router: { maxConcurrentTasks: 10, maxChildrenPerTask: 20, maxDelegationDepth: 5, maxPlanTasks: 12, defaultParentBudget: 10000, turnTimeoutMs: 1000, approvalMode: "deny" }, autonomy: { mode: "autonomous", autoApproveWorkflowGates: true, autoRemediate: true, autoPush: true, autoCreatePullRequest: true, autoMerge: true, maxRemediationRounds: 3 }, budget: { weeklyTokenLimit: 10000, weeklyWindowDays: 7 }, quota: { throttleAtUsedPercent: 90, throttleWhenUnavailable: false }, delivery: { maxRemediationRounds: 3 }, remote: { enabled: remote, remoteName: "origin", allowedRemotes: ["origin"], candidateBranchPrefix: "swarm/candidate/", requireCi: true, mergeMethod: "merge" }, roles, appServerClientFactory: () => new DeliveryClient() };
+  const config = { repository: root, runtimeDir: join(root, "runtime"), baseRef: "main", model: "fake", project: { name: "test", documentationDir: "docs/orchestration-input", generatedDir: "docs/orchestration-generated" }, router: { maxConcurrentTasks: 10, maxChildrenPerTask: 20, maxDelegationDepth: 5, maxPlanTasks: 12, defaultParentBudget: 10000, turnTimeoutMs: 1000, approvalMode: "deny" }, autonomy: { mode: "autonomous", autoApproveWorkflowGates: true, autoRemediate: true, autoPush: true, autoCreatePullRequest: true, autoMerge: true, maxRemediationRounds: 3 }, budget: { weeklyTokenLimit: 10000, weeklyWindowDays: 7 }, quota: { throttleAtUsedPercent: 90, throttleWhenUnavailable: false }, delivery: { maxRemediationRounds: 3 }, remote: { enabled: remote, remoteName: "origin", allowedRemotes: ["origin"], candidateBranchPrefix: "swarm/candidate/", requireCi: true, mergeMethod: "merge" }, roles, executionProviderFactory: () => provider(new DeliveryClient()) };
   return { root, source, config };
 }
 
@@ -115,7 +116,7 @@ test("completed autonomous delivery is restart-idempotent", async () => {
 });
 
 test("interrupted legacy Bootstrap without a manifest is blocked before an App Server turn and remains blocked after restart", async () => {
-  const fixture = setup(); const client = new DeliveryClient(); fixture.config.appServerClientFactory = () => client; let router = new SwarmRouter(fixture.config);
+  const fixture = setup(); const client = new DeliveryClient(); fixture.config.executionProviderFactory = () => provider(client); let router = new SwarmRouter(fixture.config);
   try {
     const bootstrap = router.enqueue({ role: "bootstrap", title: "Legacy Bootstrap", prompt: "legacy", estimatedTokens: 20 });
     const run = router.createDeliveryRun({ id: "legacy-bootstrap", source: "legacy", bootstrapTaskId: bootstrap.id }); router.store.linkTaskToDelivery(bootstrap.id, run.id);
@@ -129,7 +130,7 @@ test("interrupted legacy Bootstrap without a manifest is blocked before an App S
 });
 
 test("legacy Blueprint and scoped replan without a manifest cannot start Planner work or materialize a replacement", async () => {
-  const fixture = setup(); const client = new DeliveryClient(); fixture.config.appServerClientFactory = () => client; const router = new SwarmRouter(fixture.config);
+  const fixture = setup(); const client = new DeliveryClient(); fixture.config.executionProviderFactory = () => provider(client); const router = new SwarmRouter(fixture.config);
   try {
     const run = router.createDeliveryRun({ id: "legacy-planner", bootstrapTaskId: null });
     const blueprint = { schemaVersion: 1, blueprintId: "legacy-blueprint", documentSetDigest: "d".repeat(64), requirements: [{ requirementId: "legacy-requirement" }] };
@@ -192,7 +193,7 @@ test("restart idempotency cannot replace an incomplete acceptance report with a 
 });
 
 test("only a persisted source-specification blocker yields blocked_specification", async () => {
-  const fixture = setup(true); fixture.config.appServerClientFactory = () => new SourceBlockedClient(); const router = new SwarmRouter(fixture.config); const coordinator = new DeliveryCoordinator(router); const calls = { push: 0, pr: 0, ci: 0, merge: 0 };
+  const fixture = setup(true); fixture.config.executionProviderFactory = () => provider(new SourceBlockedClient()); const router = new SwarmRouter(fixture.config); const coordinator = new DeliveryCoordinator(router); const calls = { push: 0, pr: 0, ci: 0, merge: 0 };
   try {
     const final = await coordinator.begin({ source: fixture.source, ...fakeRemote(calls) });
     assert.equal(final.state, "blocked_specification"); assert.deepEqual(calls, { push: 0, pr: 0, ci: 0, merge: 0 });
@@ -200,7 +201,7 @@ test("only a persisted source-specification blocker yields blocked_specification
 });
 
 test("unsupported Bootstrap policy claims block autonomous delivery before Planner", async () => {
-  const fixture = setup(true); const client = new SelfAuthorizedPolicyClient(); fixture.config.appServerClientFactory = () => client; const router = new SwarmRouter(fixture.config); const coordinator = new DeliveryCoordinator(router);
+  const fixture = setup(true); const client = new SelfAuthorizedPolicyClient(); fixture.config.executionProviderFactory = () => provider(client); const router = new SwarmRouter(fixture.config); const coordinator = new DeliveryCoordinator(router);
   try {
     const final = await coordinator.begin({ source: fixture.source, ...fakeRemote({ push: 0, pr: 0, ci: 0, merge: 0 }) }); const bootstrap = router.list().find((task) => task.role === "bootstrap");
     assert.equal(final.state, "blocked_specification"); assert.equal(bootstrap.status, "blocked_specification"); assert.match(bootstrap.error, /missing_mandatory_fact:claimed-policy/); assert.equal(client.plannerReads, 0); assert.equal(router.list().some((task) => task.role === "planner"), false);
@@ -208,7 +209,7 @@ test("unsupported Bootstrap policy claims block autonomous delivery before Plann
 });
 
 test("legacy SourceRef fails closed as blocked_specification before autonomous planning", async () => {
-  const fixture = setup(); fixture.config.appServerClientFactory = () => new LegacySourceRefClient(); const router = new SwarmRouter(fixture.config); const coordinator = new DeliveryCoordinator(router);
+  const fixture = setup(); fixture.config.executionProviderFactory = () => provider(new LegacySourceRefClient()); const router = new SwarmRouter(fixture.config); const coordinator = new DeliveryCoordinator(router);
   try {
     const final = await coordinator.begin({ source: fixture.source, ...fakeRemote({ push: 0, pr: 0, ci: 0, merge: 0 }) });
     const bootstrap = router.list().find((task) => task.role === "bootstrap");
@@ -217,7 +218,7 @@ test("legacy SourceRef fails closed as blocked_specification before autonomous p
 });
 
 test("persisted candidate resumes CI blockers and interruptions without a new intake, Bootstrap, or DAG", async () => {
-  const fixture = setup(true); const client = new DeliveryClient(); fixture.config.appServerClientFactory = () => client;
+  const fixture = setup(true); const client = new DeliveryClient(); fixture.config.executionProviderFactory = () => provider(client);
   const router = new SwarmRouter(fixture.config); const coordinator = new DeliveryCoordinator(router); const calls = { push: 0, pr: 0, ci: 0, merge: 0 };
   try {
     const blockedAdapters = { ...fakeRemote(calls), remoteCiAdapter: { async waitForChecks() { calls.ci += 1; return { status: "timed_out", reason: "required build pending" }; } } };
@@ -246,7 +247,7 @@ test("a fresh delivery cancels stranded historical tasks but preserves their rec
 
 test("tracking-only delivery keeps worker goals uncapped while bounding planning goals", async () => {
   const fixture = setup(false); fixture.config.budget.enforceLocalLimits = false;
-  const client = new DeliveryClient(); fixture.config.appServerClientFactory = () => client;
+  const client = new DeliveryClient(); fixture.config.executionProviderFactory = () => provider(client);
   const router = new SwarmRouter(fixture.config); const coordinator = new DeliveryCoordinator(router);
   try {
     await coordinator.begin({ source: fixture.source });
@@ -257,7 +258,7 @@ test("tracking-only delivery keeps worker goals uncapped while bounding planning
 });
 
 test("planner validation is repaired in the same delivery run without a new Bootstrap", async () => {
-  const fixture = setup(false); const client = new CorrectingPlannerClient(); fixture.config.appServerClientFactory = () => client;
+  const fixture = setup(false); const client = new CorrectingPlannerClient(); fixture.config.executionProviderFactory = () => provider(client);
   const router = new SwarmRouter(fixture.config); const coordinator = new DeliveryCoordinator(router);
   try {
     await coordinator.begin({ source: fixture.source });
@@ -268,7 +269,7 @@ test("planner validation is repaired in the same delivery run without a new Boot
 });
 
 test("writer verification failure is repaired in the same worker thread before finalization", async () => {
-  const fixture = setup(false); const client = new RepairingWriterClient(); fixture.config.appServerClientFactory = () => client;
+  const fixture = setup(false); const client = new RepairingWriterClient(); fixture.config.executionProviderFactory = () => provider(client);
   const router = new SwarmRouter(fixture.config); const coordinator = new DeliveryCoordinator(router);
   try {
     await coordinator.begin({ source: fixture.source });

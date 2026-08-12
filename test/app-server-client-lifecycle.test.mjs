@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import { AppServerClient } from "../src/app-server-client.mjs";
-import { agentResultForTurn } from "../src/router.mjs";
+import { agentResultForTurn } from "../src/app-server-execution-provider.mjs";
 
 function clientWithWritableStdin({ fallbackReadTimeoutMs = 10, onWrite = null } = {}) {
   const client = new AppServerClient({ cwd: process.cwd(), requestTimeoutMs: fallbackReadTimeoutMs, fallbackReadTimeoutMs });
