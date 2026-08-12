@@ -114,6 +114,34 @@ test("completed autonomous delivery is restart-idempotent", async () => {
   } finally { router.close(); rmSync(fixture.root, { recursive: true, force: true }); }
 });
 
+test("interrupted legacy Bootstrap without a manifest is blocked before an App Server turn and remains blocked after restart", async () => {
+  const fixture = setup(); const client = new DeliveryClient(); fixture.config.appServerClientFactory = () => client; let router = new SwarmRouter(fixture.config);
+  try {
+    const bootstrap = router.enqueue({ role: "bootstrap", title: "Legacy Bootstrap", prompt: "legacy", estimatedTokens: 20 });
+    const run = router.createDeliveryRun({ id: "legacy-bootstrap", source: "legacy", bootstrapTaskId: bootstrap.id }); router.store.linkTaskToDelivery(bootstrap.id, run.id);
+    router.store.transition(bootstrap.id, "interrupted", { error: "legacy interruption" }); router.store.interruptDeliveryRun(run.id, { reason: "legacy interruption" });
+    const blocked = await new DeliveryCoordinator(router).resume();
+    assert.equal(blocked.state, "blocked_specification"); assert.equal(router.store.getTask(bootstrap.id).status, "blocked_specification"); assert.equal(blocked.publish.reason, "source_claim_contract:persisted_run_manifest_missing"); assert.deepEqual(client.goals, []);
+    router.close(); router = new SwarmRouter(fixture.config);
+    const restarted = await new DeliveryCoordinator(router).resume();
+    assert.equal(restarted.state, "blocked_specification"); assert.equal(restarted.publish.reason, "source_claim_contract:persisted_run_manifest_missing"); assert.deepEqual(client.goals, []);
+  } finally { router.close(); rmSync(fixture.root, { recursive: true, force: true }); }
+});
+
+test("legacy Blueprint and scoped replan without a manifest cannot start Planner work or materialize a replacement", async () => {
+  const fixture = setup(); const client = new DeliveryClient(); fixture.config.appServerClientFactory = () => client; const router = new SwarmRouter(fixture.config);
+  try {
+    const run = router.createDeliveryRun({ id: "legacy-planner", bootstrapTaskId: null });
+    const blueprint = { schemaVersion: 1, blueprintId: "legacy-blueprint", documentSetDigest: "d".repeat(64), requirements: [{ requirementId: "legacy-requirement" }] };
+    router.store.recordProductBlueprint({ blueprint, artifactPath: "docs/orchestration-generated/legacy.json", digest: "e".repeat(64), deliveryRunId: run.id }); router.store.linkBlueprintToDelivery(run.id, blueprint.blueprintId);
+    const planner = router.enqueue({ role: "planner", title: "Legacy Planner", prompt: "legacy", estimatedTokens: 20, blueprintId: blueprint.blueprintId, requirementIds: [], deliveryRunId: run.id });
+    router.store.recordScopedReplan({ id: "legacy-replan", idempotencyKey: "legacy-replan", deliveryRunId: run.id, blueprintId: blueprint.blueprintId, failedTaskId: planner.id, failureKind: "worker_failure", failureDetail: "legacy", affectedTaskIds: [planner.id], invalidatedTaskIds: [], remainingRequirementIds: ["legacy-requirement"] });
+    const execution = await router.runUntilIdle({ deliveryRunId: run.id });
+    assert.equal(execution.sourceBlocked, true); assert.equal(router.store.getTask(planner.id).status, "blocked_specification"); assert.equal(router.store.scopedReplan("legacy-replan").status, "blocked_specification"); assert.equal(router.store.scopedReplan("legacy-replan").plannerTaskId, null); assert.equal(router.store.planBatches(run.id).length, 0); assert.deepEqual(client.goals, []);
+    const status = router.store.deliveryRun(run.id); assert.equal(status.publish.reason, "source_claim_contract:persisted_run_manifest_missing"); assert.deepEqual(status.publish.codes, ["source_claim_contract:persisted_run_manifest_missing"]);
+  } finally { router.close(); rmSync(fixture.root, { recursive: true, force: true }); }
+});
+
 test("green exact-candidate CI without available product E2E evidence is blocked_acceptance and never merges", async () => {
   const fixture = setup(true); const router = new SwarmRouter(fixture.config); const coordinator = new DeliveryCoordinator(router); const calls = { push: 0, pr: 0, ci: 0, merge: 0 };
   try {
@@ -257,6 +285,7 @@ test("delivery coordinator refuses completion while any task remains running", a
   let integrationAttempted = false;
   const router = {
     recoverStaleDeliveries() { return []; }, activateDeliveryRun() {}, isAutonomous() { return true; },
+    assertBootstrapSourceIntake() {}, blockRunForSourceCompleteness() { throw new Error("source completeness should not be evaluated by this fixture"); },
     list() { return [{ id: "still-running", role: "bootstrap", status: "running", deliveryRunId: run.id }]; },
     async runUntilIdle() { return { blockedQuota: false, blockedBudget: false, interrupted: false, failed: false }; },
     async runToIntegration() { integrationAttempted = true; throw new Error("must not integrate"); },

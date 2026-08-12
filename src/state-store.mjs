@@ -658,6 +658,22 @@ export class StateStore {
     return this.deliveryRun(id);
   }
 
+  blockDeliveryForSpecification(id, { reason, recovery } = {}) {
+    const current = this.deliveryRun(id); if (!current) throw new Error(`Delivery run not found: ${id}`);
+    const safeReason = String(reason ?? "source_claim_contract:source_completeness_validation_failed").slice(0, 160);
+    const publish = { reason: safeReason, codes: [safeReason], recovery: recovery ?? { action: "Start a fresh documentation intake and Bootstrap delivery; historical records remain readable." } };
+    const timestamp = now();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.prepare("UPDATE delivery_runs SET state = 'blocked_specification', publish_json = ?, owner_pid = NULL, owner_session_id = NULL, heartbeat_at = NULL, updated_at = ? WHERE id = ?").run(JSON.stringify(publish), timestamp, id);
+      this.db.prepare("UPDATE tasks SET status = 'blocked_specification', error = ?, updated_at = ? WHERE delivery_run_id = ? AND status IN ('queued','preparing','running','awaiting_approval','awaiting_human','interrupted')").run(safeReason, timestamp, id);
+      this.db.prepare("UPDATE scoped_replans SET status = 'blocked_specification', failure_detail = ?, updated_at = ?, completed_at = ? WHERE delivery_run_id = ? AND status IN ('pending','planning','materialized')").run(safeReason, timestamp, timestamp, id);
+      this.#insertEvent(current.bootstrapTaskId, "delivery/blocked_specification", { deliveryRunId: id, reason: safeReason });
+      this.db.exec("COMMIT");
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    return this.deliveryRun(id);
+  }
+
   claimDeliveryLease(id, { ownerPid, ownerSessionId }) {
     const timestamp = now();
     if (!Number.isInteger(ownerPid) || ownerPid < 1 || typeof ownerSessionId !== "string" || !ownerSessionId) throw new Error("Delivery lease requires owner pid and session");
@@ -1135,13 +1151,13 @@ export class StateStore {
   #blockLegacyRunsWithoutBlueprint() {
     this.db.prepare("UPDATE delivery_runs SET completion_contract_version = 0 WHERE state = 'completed_merged' AND completion_contract_version < 2 AND id NOT IN (SELECT delivery_run_id FROM product_acceptance_reports WHERE passing = 1)").run();
     const states = ["running", "awaiting_human", "awaiting_human_remote_handoff", "interrupted", "blocked_credentials", "blocked_ci", "blocked_branch_protection"];
-    const rows = this.db.prepare(`SELECT id, bootstrap_task_id FROM delivery_runs WHERE (blueprint_id IS NULL OR source_claim_manifest_id IS NULL) AND completion_contract_version = 0 AND state IN (${states.map(() => "?").join(",")})`).all(...states);
+    const rows = this.db.prepare(`SELECT id, bootstrap_task_id FROM delivery_runs WHERE source_claim_manifest_id IS NULL AND state IN (${states.map(() => "?").join(",")})`).all(...states);
     if (!rows.length) return;
     const timestamp = now();
     this.db.exec("BEGIN IMMEDIATE");
     try {
       for (const row of rows) {
-        const reason = "legacy_source_claim_manifest_incomplete: persisted resumable/in-progress run lacks a strict source claim manifest";
+        const reason = "source_claim_contract:persisted_run_manifest_missing";
         this.db.prepare("UPDATE delivery_runs SET state = 'blocked_specification', publish_json = ?, owner_pid = NULL, owner_session_id = NULL, heartbeat_at = NULL, updated_at = ? WHERE id = ?").run(JSON.stringify({ reason, recovery: { action: "Start a fresh delivery from source documentation; historical artifacts and tasks remain retained." } }), timestamp, row.id);
         this.db.prepare("UPDATE tasks SET status = 'blocked_specification', error = ?, updated_at = ? WHERE delivery_run_id = ? AND status IN ('queued','preparing','running','awaiting_approval','awaiting_human','interrupted')").run(reason, timestamp, row.id);
         this.#insertEvent(row.bootstrap_task_id, "delivery/blocked_specification", { deliveryRunId: row.id, reason });

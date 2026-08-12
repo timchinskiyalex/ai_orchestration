@@ -33,8 +33,11 @@ export class DeliveryCoordinator {
     if (cancelled.length) this.router.store.recordEvent(null, "delivery/fresh-start-cleanup", { previousDeliveryRunId: current?.id ?? null, cancelledTaskIds: cancelled.map((task) => task.id) });
     const intake = ingestDocumentation({ source, repository: this.router.config.repository, destinationRelative: this.router.config.project.documentationDir });
     const overlay = await this.router.ensureProjectOverlay();
+    // Intake is verified before Bootstrap is even queued; no blueprint is
+    // required at this phase because Bootstrap is the operation that creates it.
+    const sourceClaimManifestId = this.router.sourceClaimManifestIdentity();
     const bootstrap = this.router.startProject();
-    const run = this.router.createDeliveryRun({ id: randomUUID(), source, bootstrapTaskId: bootstrap.id, confirmRemotePush: this.router.isAutonomous(), sourceClaimManifestId: this.router.sourceClaimManifestIdentity() });
+    const run = this.router.createDeliveryRun({ id: randomUUID(), source, bootstrapTaskId: bootstrap.id, confirmRemotePush: this.router.isAutonomous(), sourceClaimManifestId });
     this.router.store.linkTaskToDelivery(bootstrap.id, run.id);
     return this.#advance(run, { intake, overlayPath: overlay.path, ...adapters });
   }
@@ -47,14 +50,21 @@ export class DeliveryCoordinator {
     const resumed = ["interrupted", "blocked_credentials", "blocked_ci", "blocked_branch_protection", "failed"].includes(run.state)
       ? this.router.resumeDeliveryRun(run.id)
       : (this.router.activateDeliveryRun(run.id), run);
+    const sourceControlledDelivery = Boolean(resumed.source || resumed.sourceClaimManifestId || resumed.blueprintId);
+    if (sourceControlledDelivery) {
+      try {
+        if (resumed.blueprintId) this.router.assertRunSourceCompleteness(resumed);
+        else this.router.assertBootstrapSourceIntake(resumed);
+      } catch (error) { return this.router.blockRunForSourceCompleteness(resumed, error); }
+    }
     if (resumed.integrationPath) return this.#publishPersisted(resumed, adapters);
     if (run.state === "interrupted") this.router.store.resumeInterruptedTasks(resumed.id);
     return this.#advance(resumed, adapters);
   }
 
   async #publishPersisted(run, adapters) {
-    try { this.router.assertRunSourceCompleteness?.(run); }
-    catch (error) { return this.router.store.updateDeliveryRun(run.id, { state: "blocked_specification", publish: { reason: "source_completeness_validation_failed", codes: ["source_claim_manifest_stale_or_invalid"] } }); }
+    try { this.router.assertRunSourceCompleteness(run); }
+    catch (error) { return this.router.blockRunForSourceCompleteness(run, error); }
     const manifest = this.router.store.integrationManifest(run.integrationPath);
     if (!manifest) return this.router.store.updateDeliveryRun(run.id, { state: "failed", publish: { reason: "Persisted delivery integration manifest is missing", recovery: { action: "Restore the generated integration manifest before resuming." } } });
     if (run.candidate && (run.candidate.branch !== manifest.branch || run.candidate.sha.toLowerCase() !== manifest.candidateSha?.toLowerCase())) return this.router.store.updateDeliveryRun(run.id, { state: "failed", publish: { reason: "Persisted candidate identity does not match the integration manifest", recovery: { action: "Do not publish; inspect the preserved candidate and delivery checkpoint." } } });
@@ -64,11 +74,12 @@ export class DeliveryCoordinator {
 
   async #advance(run, context = {}) {
     this.router.activateDeliveryRun(run.id);
-    if (run.blueprintId) {
-      try { this.router.assertRunSourceCompleteness(run); }
-      catch (error) {
-        return this.router.store.updateDeliveryRun(run.id, { state: "blocked_specification", publish: { reason: "source_completeness_validation_failed", codes: ["source_claim_manifest_stale_or_invalid"] } });
-      }
+    const sourceControlledDelivery = Boolean(run.source || run.sourceClaimManifestId || run.blueprintId);
+    if (sourceControlledDelivery) {
+      try {
+        if (run.blueprintId) this.router.assertRunSourceCompleteness(run);
+        else this.router.assertBootstrapSourceIntake(run);
+      } catch (error) { return this.router.blockRunForSourceCompleteness(run, error); }
     }
     if (!this.router.isAutonomous()) {
       const existingGate = manualGateFor(this.router.list());

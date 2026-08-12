@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SwarmRouter } from "../src/router.mjs";
 import { documentIdForPath, documentSetDigest } from "../src/product-blueprint.mjs";
+import { sourceFragmentDigest } from "../src/source-evidence.mjs";
 
 const git = (cwd, args) => execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8" }).trim();
 const digest = (value) => createHash("sha256").update(value).digest("hex");
@@ -20,10 +21,10 @@ const waitFor = async (predicate, label) => {
 };
 
 function blueprint(root) {
-  const path = "requirements.md";
-  const source = { documentId: documentIdForPath(path), path, sha256: digest("Scoped recovery.\n") };
-  const requirement = (id) => ({ requirementId: id, type: "functional", priority: "must", mandatory: true, description: id, sourceRefs: [{ documentId: source.documentId, startLine: 1, endLine: 1, excerptDigest: digest("Scoped recovery.") }], acceptanceCriteria: [{ criterionId: `${id}-check`, description: `${id} works`, verificationHint: "npm test" }], constraints: [] });
-  return { schemaVersion: 1, kind: "ProductBlueprint", blueprintId: "pb-scoped", createdAt: "2026-01-01T00:00:00.000Z", documentSetDigest: documentSetDigest([source]), sourceDocuments: [source], requirements: [requirement("req-a"), requirement("req-b"), requirement("req-c")], nfrs: [], modules: [], integrations: [], dataModel: {}, constraints: [], assumptions: [], decisions: [], unresolvedQuestions: [], contradictions: [] };
+  const path = "requirements.md"; const sourceText = "Scoped recovery A.\nScoped recovery B.\nScoped recovery C.\n";
+  const source = { documentId: documentIdForPath(path), path, sha256: digest(sourceText) };
+  const requirement = (id, line) => ({ requirementId: id, type: "functional", priority: "must", mandatory: true, description: id, sourceClaimIds: [`scoped-recovery-claim-${line}`], sourceRefs: [{ documentId: source.documentId, startLine: line, endLine: line, excerptDigest: sourceFragmentDigest(sourceText, line, line) }], acceptanceCriteria: [{ criterionId: `${id}-check`, description: `${id} works`, verificationHint: "npm test" }], constraints: [] });
+  return { schemaVersion: 1, kind: "ProductBlueprint", blueprintId: "pb-scoped", createdAt: "2026-01-01T00:00:00.000Z", documentSetDigest: documentSetDigest([source]), sourceDocuments: [source], requirements: [requirement("req-a", 1), requirement("req-b", 2), requirement("req-c", 3)], nfrs: [], modules: [], integrations: [], dataModel: {}, constraints: [], assumptions: [], decisions: [], unresolvedQuestions: [], contradictions: [] };
 }
 
 const task = (id, title, requirementIds, dependsOn = []) => ({ id, title, prompt: title, primaryDomain: "backend", supportingDomains: [], riskFlags: [], humanApprovalRequired: false, estimatedTokens: 20, dependsOn, allowedPaths: [`src/${id}.mjs`], acceptanceChecks: [], requirementIds });
@@ -64,9 +65,12 @@ class ScopedRecoveryClient extends EventEmitter {
 function setup(client) {
   const root = mkdtempSync(join(tmpdir(), "scoped-replan-"));
   git(root, ["init", "-b", "main"]); mkdirSync(join(root, "src")); mkdirSync(join(root, "docs", "orchestration-input"), { recursive: true });
-  const source = { documentId: documentIdForPath("requirements.md"), path: "requirements.md", sha256: digest("Scoped recovery.\n") };
-  writeFileSync(join(root, "docs", "orchestration-input", "requirements.md"), "Scoped recovery.\n");
+  const source = { documentId: documentIdForPath("requirements.md"), path: "requirements.md", sha256: digest("Scoped recovery A.\nScoped recovery B.\nScoped recovery C.\n") };
+  const sourceText = "Scoped recovery A.\nScoped recovery B.\nScoped recovery C.\n";
+  writeFileSync(join(root, "docs", "orchestration-input", "requirements.md"), sourceText);
   writeFileSync(join(root, "docs", "orchestration-input", "inventory.json"), JSON.stringify({ files: [source], documentSetDigest: documentSetDigest([source]) }));
+  const sourceRefs = [1, 2, 3].map((line) => ({ documentId: source.documentId, startLine: line, endLine: line, excerptDigest: sourceFragmentDigest(sourceText, line, line) }));
+  writeFileSync(join(root, "docs", "orchestration-input", "source-claims.json"), JSON.stringify({ schemaVersion: 1, kind: "SourceClaimsDeclaration", documentSetDigest: documentSetDigest([source]), documents: [{ ...source, coverage: sourceRefs.map((sourceRef, index) => ({ claimId: `scoped-recovery-claim-${index + 1}`, ...sourceRef })) }], claims: sourceRefs.map((sourceRef, index) => ({ claimId: `scoped-recovery-claim-${index + 1}`, classification: "mandatory", sourceRefs: [sourceRef] })) }));
   writeFileSync(join(root, "src", "base.mjs"), "export const base = true;\n"); writeFileSync(join(root, "package.json"), JSON.stringify({ packageManager: "npm@10", scripts: {} })); writeFileSync(join(root, "package-lock.json"), "{}");
   git(root, ["add", "."]); git(root, ["-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "base"]);
   const roles = Object.fromEntries(["bootstrap", "planner", "backend", "frontend", "database", "qa", "security", "devops"].map((role) => [role, { sandbox: role === "backend" ? "workspace-write" : "read-only", approvalPolicy: "never", tokenBudget: 100, usesWorktree: role === "backend" }]));
@@ -77,7 +81,7 @@ function setup(client) {
 test("scoped implementation recovery preserves upstream evidence, materializes one replacement wave, and stays idempotent", async () => {
   const client = new ScopedRecoveryClient(); const { root, router } = setup(client);
   try {
-    await router.ensureProjectOverlay(); const bootstrap = router.startProject(); const run = router.createDeliveryRun({ id: "run-scoped", bootstrapTaskId: bootstrap.id }); router.store.linkTaskToDelivery(bootstrap.id, run.id);
+    await router.ensureProjectOverlay(); const bootstrap = router.startProject(); const run = router.createDeliveryRun({ id: "run-scoped", bootstrapTaskId: bootstrap.id, sourceClaimManifestId: router.sourceClaimManifestIdentity() }); router.store.linkTaskToDelivery(bootstrap.id, run.id);
     const execution = router.runUntilIdle();
     await waitFor(() => router.store.activeScopedReplans(run.id).length === 1, "active scoped replan planner");
     const [replan] = router.store.scopedReplans(run.id); const tasks = router.list(); const a = tasks.find((item) => item.title === "Write A"); const b = tasks.find((item) => item.title === "Write B"); const c = tasks.find((item) => item.title === "Write C");
@@ -99,7 +103,7 @@ test("scoped implementation recovery preserves upstream evidence, materializes o
 test("scoped planner specification_gap blocks the replan without an unsafe automatic replacement", async () => {
   const client = new ScopedRecoveryClient({ specificationGap: true }); const { root, router } = setup(client);
   try {
-    await router.ensureProjectOverlay(); const bootstrap = router.startProject(); const run = router.createDeliveryRun({ id: "run-spec-gap", bootstrapTaskId: bootstrap.id }); router.store.linkTaskToDelivery(bootstrap.id, run.id);
+    await router.ensureProjectOverlay(); const bootstrap = router.startProject(); const run = router.createDeliveryRun({ id: "run-spec-gap", bootstrapTaskId: bootstrap.id, sourceClaimManifestId: router.sourceClaimManifestIdentity() }); router.store.linkTaskToDelivery(bootstrap.id, run.id);
     await router.runUntilIdle();
     const [replan] = router.store.scopedReplans(run.id); const planner = router.store.getTask(replan.plannerTaskId);
     assert.equal(replan.failureKind, "worker_failure"); assert.equal(replan.status, "blocked_specification"); assert.equal(planner.status, "blocked_specification"); assert.match(planner.error, /specification_gap/); assert.equal(replan.replacementPlanBatchId, null); assert.equal(router.store.planBatches(run.id).length, 1); assert.equal(router.store.deliveryRun(run.id).state, "blocked_specification");
