@@ -1,0 +1,49 @@
+{
+  "schemaVersion": 1,
+  "kind": "SourceClaimsDeclaration",
+  "documentSetDigest": "49eeff990b41efe90f8053766c26acf09efc47ba4d9ccc36c7fd500959acb4c8",
+  "documents": [
+    {
+      "documentId": "doc-6947e27ed262bb968555",
+      "path": "TECH_SPEC.md",
+      "sha256": "2d49ebf236439d7aaba508990b01c5962e50f442d19d208b4755d29a10876413",
+      "coverage": [
+        { "claimId": "tech-spec-01", "documentId": "doc-6947e27ed262bb968555", "startLine": 1, "endLine": 6, "excerptDigest": "71ed2f6b48b0e922832908d1077c8d71a584ab35450a57efc8885da3ffc82e91" },
+        { "claimId": "tech-spec-02", "documentId": "doc-6947e27ed262bb968555", "startLine": 7, "endLine": 13, "excerptDigest": "8bd12bdb1a84047ba00d707c0b9a99c2514b881c32291270ce2dd62ffa7f0b04" },
+        { "claimId": "tech-spec-03", "documentId": "doc-6947e27ed262bb968555", "startLine": 14, "endLine": 30, "excerptDigest": "b312979f2515f1baa84fbb944ab7725456a9c932b4d58d139255c8d9a772060e" },
+        { "claimId": "tech-spec-04", "documentId": "doc-6947e27ed262bb968555", "startLine": 31, "endLine": 67, "excerptDigest": "8b29acb79fb47dc0569273ee02ac4221a60766166928a56ad7d342a77c08917d" },
+        { "claimId": "tech-spec-05", "documentId": "doc-6947e27ed262bb968555", "startLine": 68, "endLine": 79, "excerptDigest": "e96bec4cc3bc18e3f74836c1be647d7ec00f7547e5c6fc31cc59df3ba8f86d47" },
+        { "claimId": "tech-spec-06", "documentId": "doc-6947e27ed262bb968555", "startLine": 80, "endLine": 109, "excerptDigest": "a8b5c9fccb4a304c12870fe21371d26296f34d62cba597997b81091b8a4ff1a5" },
+        { "claimId": "tech-spec-07", "documentId": "doc-6947e27ed262bb968555", "startLine": 110, "endLine": 123, "excerptDigest": "996212e291e5014d03d4243edcc44e0ef589581421de441b54e7180dfb5994bf" },
+        { "claimId": "tech-spec-08", "documentId": "doc-6947e27ed262bb968555", "startLine": 124, "endLine": 133, "excerptDigest": "8c0bef8e85d2ee3ef485b2570212802eeb03bfa1fdc93aaa52755f8f8c055b99" },
+        { "claimId": "tech-spec-09", "documentId": "doc-6947e27ed262bb968555", "startLine": 134, "endLine": 174, "excerptDigest": "82a970c3931595603d16953ced8b8abec355bfcc0d3e1df3a6bac9fde3e0eeb3" },
+        { "claimId": "tech-spec-10", "documentId": "doc-6947e27ed262bb968555", "startLine": 175, "endLine": 181, "excerptDigest": "9a5ee463ed17bc50faae6aab8b41458498b2990ab563d2e6a1e0103db335cb8b" }
+      ]
+    },
+    {
+      "documentId": "doc-5cafd0ac9cc3e044bb42",
+      "path": "agency_manifesto.md",
+      "sha256": "8ffe1b64206cea446a4d29cf11c778b3b170f11bb7fde3f506dfae4df00d1bf6",
+      "coverage": [
+        { "claimId": "agency-manifesto-01", "documentId": "doc-5cafd0ac9cc3e044bb42", "startLine": 1, "endLine": 2, "excerptDigest": "4826cb74390f00dc46508e7f20ac999a3151957bb0097ef9de439e49b6f8f0fa" },
+        { "claimId": "agency-manifesto-02", "documentId": "doc-5cafd0ac9cc3e044bb42", "startLine": 3, "endLine": 13, "excerptDigest": "7bc73a7cc892e3d8c94f43202b51b8395eaf47a633e0eb2f767791c8c2ece2e9" },
+        { "claimId": "agency-manifesto-03", "documentId": "doc-5cafd0ac9cc3e044bb42", "startLine": 14, "endLine": 30, "excerptDigest": "e6492c5dc04f15846d6715d704c63533c8b0f8dbc7d60d86c9ad942959d9fd02" }
+      ]
+    }
+  ],
+  "claims": [
+    { "claimId": "tech-spec-01", "classification": "mandatory", "sourceRefs": [{ "documentId": "doc-6947e27ed262bb968555", "startLine": 1, "endLine": 6, "excerptDigest": "71ed2f6b48b0e922832908d1077c8d71a584ab35450a57efc8885da3ffc82e91" }] },
+    { "claimId": "tech-spec-02", "classification": "mandatory", "sourceRefs": [{ "documentId": "doc-6947e27ed262bb968555", "startLine": 7, "endLine": 13, "excerptDigest": "8bd12bdb1a84047ba00d707c0b9a99c2514b881c32291270ce2dd62ffa7f0b04" }] },
+    { "claimId": "tech-spec-03", "classification": "mandatory", "sourceRefs": [{ "documentId": "doc-6947e27ed262bb968555", "startLine": 14, "endLine": 30, "excerptDigest": "b312979f2515f1baa84fbb944ab7725456a9c932b4d58d139255c8d9a772060e" }] },
+    { "claimId": "tech-spec-04", "classification": "mandatory", "sourceRefs": [{ "documentId": "doc-6947e27ed262bb968555", "startLine": 31, "endLine": 67, "excerptDigest": "8b29acb79fb47dc0569273ee02ac4221a60766166928a56ad7d342a77c08917d" }] },
+    { "claimId": "tech-spec-05", "classification": "mandatory", "sourceRefs": [{ "documentId": "doc-6947e27ed262bb968555", "startLine": 68, "endLine": 79, "excerptDigest": "e96bec4cc3bc18e3f74836c1be647d7ec00f7547e5c6fc31cc59df3ba8f86d47" }] },
+    { "claimId": "tech-spec-06", "classification": "mandatory", "sourceRefs": [{ "documentId": "doc-6947e27ed262bb968555", "startLine": 80, "endLine": 109, "excerptDigest": "a8b5c9fccb4a304c12870fe21371d26296f34d62cba597997b81091b8a4ff1a5" }] },
+    { "claimId": "tech-spec-07", "classification": "mandatory", "sourceRefs": [{ "documentId": "doc-6947e27ed262bb968555", "startLine": 110, "endLine": 123, "excerptDigest": "996212e291e5014d03d4243edcc44e0ef589581421de441b54e7180dfb5994bf" }] },
+    { "claimId": "tech-spec-08", "classification": "mandatory", "sourceRefs": [{ "documentId": "doc-6947e27ed262bb968555", "startLine": 124, "endLine": 133, "excerptDigest": "8c0bef8e85d2ee3ef485b2570212802eeb03bfa1fdc93aaa52755f8f8c055b99" }] },
+    { "claimId": "tech-spec-09", "classification": "mandatory", "sourceRefs": [{ "documentId": "doc-6947e27ed262bb968555", "startLine": 134, "endLine": 174, "excerptDigest": "82a970c3931595603d16953ced8b8abec355bfcc0d3e1df3a6bac9fde3e0eeb3" }] },
+    { "claimId": "tech-spec-10", "classification": "mandatory", "sourceRefs": [{ "documentId": "doc-6947e27ed262bb968555", "startLine": 175, "endLine": 181, "excerptDigest": "9a5ee463ed17bc50faae6aab8b41458498b2990ab563d2e6a1e0103db335cb8b" }] },
+    { "claimId": "agency-manifesto-01", "classification": "mandatory", "sourceRefs": [{ "documentId": "doc-5cafd0ac9cc3e044bb42", "startLine": 1, "endLine": 2, "excerptDigest": "4826cb74390f00dc46508e7f20ac999a3151957bb0097ef9de439e49b6f8f0fa" }] },
+    { "claimId": "agency-manifesto-02", "classification": "mandatory", "sourceRefs": [{ "documentId": "doc-5cafd0ac9cc3e044bb42", "startLine": 3, "endLine": 13, "excerptDigest": "7bc73a7cc892e3d8c94f43202b51b8395eaf47a633e0eb2f767791c8c2ece2e9" }] },
+    { "claimId": "agency-manifesto-03", "classification": "mandatory", "sourceRefs": [{ "documentId": "doc-5cafd0ac9cc3e044bb42", "startLine": 14, "endLine": 30, "excerptDigest": "e6492c5dc04f15846d6715d704c63533c8b0f8dbc7d60d86c9ad942959d9fd02" }] }
+  ]
+}

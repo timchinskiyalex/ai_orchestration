@@ -1,0 +1,21 @@
+name: Orchestrator CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - pilot/european-trip-guide
+
+permissions:
+  contents: read
+
+jobs:
+  orchestrator:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm test
