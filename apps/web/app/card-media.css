@@ -1,0 +1,10 @@
+.place-media { position:relative; height:300px; color:white; }
+.place-media > img { width:100%; height:100%; object-fit:cover; }
+.place-media-gradient { position:absolute; inset:0; background:linear-gradient(180deg,transparent 20%,#000d 100%); }
+.place-media-copy { position:absolute; right:24px; bottom:22px; left:24px; }
+.place-media .place-number { color:#ffffffcf; }
+.place-media h3 { margin:8px 0; color:white; font:600 34px/1.08 'Playfair Display',serif; letter-spacing:-.045em; }
+.place-media .why-go { max-width:560px; margin:0; color:white; font-size:13px; font-weight:600; line-height:1.45; }
+.buy-to-unlock { margin-top:16px; padding:10px 16px; background:white; color:var(--ink); }
+
+@media (max-width:760px) { .place-media { height:250px; }.place-media-copy { right:20px; bottom:18px; left:20px; } }
