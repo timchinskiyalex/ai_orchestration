@@ -1,0 +1,10 @@
+"use client";
+import Link from "next/link";
+import { useEffect, useState } from "react";
+import { api, citySlug, GuideSummary, photoFor } from "../lib/api";
+
+export default function HomePage() {
+  const [guides, setGuides] = useState<GuideSummary[]>([]); const [error, setError] = useState("");
+  useEffect(() => { api<GuideSummary[]>("/guides").then(setGuides).catch(() => setError("The guides are taking the scenic route. Please start the API and try again.")); }, []);
+  return <main><section className="hero"><div className="hero-copy"><p className="eyebrow">Two cities, lingered over</p><h1>Where the <em>city</em> meets you.</h1><p className="hero-text">Slow down. Look closer. Let a thoughtful guide turn a weekend into a small collection of perfect moments.</p><a className="button button-light" href="#guides">Choose a city <span>↓</span></a></div></section><section className="statement"><p className="eyebrow">Made for wandering</p><h2>Not a checklist. A more <em>memorable</em> way through.</h2><p>Local-feeling routes, museum pauses, late lunches and the details that make a first visit feel less like one.</p></section><section id="guides" className="guide-list"><div className="section-heading"><div><p className="eyebrow">The collection</p><h2>Start with a city.</h2></div><p>Two deeply considered guides, each with three places to explore before you decide to unlock the full story.</p></div>{error && <p className="form-error">{error}</p>}<div className="guide-grid">{guides.map((guide) => <article className="city-card" key={guide.city}><img src={photoFor(guide.city)} alt={`A view of ${guide.city}`} /><div className="card-shade" /><div className="city-card-content"><div className="card-top"><span>{guide.purchased ? "Purchased" : "Not unlocked"}</span><span>€{guide.price.toFixed(2)}</span></div><div><h3>{guide.city}</h3><p>{guide.intro}</p><Link className="button button-light" href={`/guides/${citySlug(guide.city)}`}>{guide.purchased ? "Open guide" : "Buy guide"}</Link></div></div></article>)}</div></section></main>;
+}

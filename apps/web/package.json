@@ -1,0 +1,7 @@
+{
+  "name": "european-trip-guides-web",
+  "private": true,
+  "scripts": { "dev": "next dev", "build": "next build", "start": "next start", "lint": "next lint" },
+  "dependencies": { "leaflet": "^1.9.4", "next": "^15.3.0", "react": "^19.0.0", "react-dom": "^19.0.0" },
+  "devDependencies": { "@types/leaflet": "^1.9.16", "@types/node": "^22.0.0", "@types/react": "^19.0.0", "@types/react-dom": "^19.0.0", "typescript": "^5.8.0" }
+}
