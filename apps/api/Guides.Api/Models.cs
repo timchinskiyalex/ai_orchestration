@@ -48,6 +48,24 @@ public sealed class GuidesDbContext(DbContextOptions<GuidesDbContext> options)
     protected override void OnModelCreating(ModelBuilder builder)
     {
         base.OnModelCreating(builder);
+        builder.Entity<Purchase>()
+            .HasOne<ApplicationUser>()
+            .WithMany()
+            .HasForeignKey(x => x.UserId)
+            .IsRequired()
+            .OnDelete(DeleteBehavior.Cascade);
+        builder.Entity<Favorite>()
+            .HasOne<ApplicationUser>()
+            .WithMany()
+            .HasForeignKey(x => x.UserId)
+            .IsRequired()
+            .OnDelete(DeleteBehavior.Cascade);
+        builder.Entity<Rating>()
+            .HasOne<ApplicationUser>()
+            .WithMany()
+            .HasForeignKey(x => x.UserId)
+            .IsRequired()
+            .OnDelete(DeleteBehavior.Cascade);
         builder.Entity<Purchase>().HasIndex(x => new { x.UserId, x.City }).IsUnique();
         builder.Entity<Favorite>().HasIndex(x => new { x.UserId, x.City, x.PlaceSlug }).IsUnique();
         builder.Entity<Rating>().HasIndex(x => new { x.UserId, x.City, x.PlaceSlug }).IsUnique();
@@ -57,6 +75,8 @@ public sealed class GuidesDbContext(DbContextOptions<GuidesDbContext> options)
         builder.Entity<Rating>().Property(x => x.City).HasMaxLength(80);
         builder.Entity<Rating>().Property(x => x.PlaceSlug).HasMaxLength(160);
         builder.Entity<Rating>().Property(x => x.Comment).HasMaxLength(2000);
+        builder.Entity<Rating>().ToTable(table =>
+            table.HasCheckConstraint("CK_Ratings_Stars", "Stars >= 1 AND Stars <= 5"));
     }
 }
 

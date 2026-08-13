@@ -3,8 +3,11 @@ using System.Net.Http.Json;
 using System.Text.Json;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.Data.Sqlite;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Xunit;
+using Guides.Api;
 
 namespace Guides.Api.Tests;
 
@@ -119,4 +122,107 @@ public sealed class ApiFactory : WebApplicationFactory<Program>, IDisposable
             // The operating system will clean this uniquely named test database.
         }
     }
+}
+
+public sealed class PersistenceTests
+{
+    [Fact]
+    public void SaveChanges_rejects_a_purchase_for_an_unknown_user()
+    {
+        using var database = new SqliteGuidesDatabase();
+        using var db = database.CreateContext();
+        db.Purchases.Add(new Purchase { UserId = "missing-user", City = "Paris", PurchasedAt = DateTime.UtcNow });
+
+        Assert.Throws<DbUpdateException>(() => db.SaveChanges());
+    }
+
+    [Fact]
+    public void SaveChanges_rejects_a_favorite_for_an_unknown_user()
+    {
+        using var database = new SqliteGuidesDatabase();
+        using var db = database.CreateContext();
+        db.Favorites.Add(new Favorite { UserId = "missing-user", City = "Paris", PlaceSlug = "eiffel-tower", CreatedAt = DateTime.UtcNow });
+
+        Assert.Throws<DbUpdateException>(() => db.SaveChanges());
+    }
+
+    [Fact]
+    public void SaveChanges_rejects_a_rating_for_an_unknown_user()
+    {
+        using var database = new SqliteGuidesDatabase();
+        using var db = database.CreateContext();
+        db.Ratings.Add(new Rating { UserId = "missing-user", City = "Paris", PlaceSlug = "eiffel-tower", Stars = 3, CreatedAt = DateTime.UtcNow });
+
+        Assert.Throws<DbUpdateException>(() => db.SaveChanges());
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(6)]
+    public void SaveChanges_rejects_ratings_outside_the_allowed_star_range(int stars)
+    {
+        using var database = new SqliteGuidesDatabase();
+        using var db = database.CreateContext();
+        var user = CreateUser();
+        db.Users.Add(user);
+        db.SaveChanges();
+        db.Ratings.Add(new Rating { UserId = user.Id, City = "Paris", PlaceSlug = "eiffel-tower", Stars = stars, CreatedAt = DateTime.UtcNow });
+
+        Assert.Throws<DbUpdateException>(() => db.SaveChanges());
+    }
+
+    [Fact]
+    public void SaveChanges_accepts_all_valid_star_values_for_an_existing_user()
+    {
+        using var database = new SqliteGuidesDatabase();
+        using var db = database.CreateContext();
+        var user = CreateUser();
+        db.Users.Add(user);
+        db.SaveChanges();
+
+        foreach (var stars in Enumerable.Range(1, 5))
+        {
+            db.Ratings.Add(new Rating
+            {
+                UserId = user.Id,
+                City = "Paris",
+                PlaceSlug = $"place-{stars}",
+                Stars = stars,
+                CreatedAt = DateTime.UtcNow
+            });
+        }
+
+        db.SaveChanges();
+        Assert.Equal(5, db.Ratings.Count());
+    }
+
+    private static ApplicationUser CreateUser()
+    {
+        var id = Guid.NewGuid().ToString("N");
+        return new ApplicationUser
+        {
+            Id = id,
+            UserName = $"user-{id}",
+            NormalizedUserName = $"USER-{id.ToUpperInvariant()}"
+        };
+    }
+}
+
+internal sealed class SqliteGuidesDatabase : IDisposable
+{
+    private readonly SqliteConnection _connection = new("Data Source=:memory:;Foreign Keys=True");
+
+    public SqliteGuidesDatabase()
+    {
+        _connection.Open();
+        using var db = CreateContext();
+        db.Database.EnsureCreated();
+    }
+
+    public GuidesDbContext CreateContext() => new(
+        new DbContextOptionsBuilder<GuidesDbContext>()
+            .UseSqlite(_connection)
+            .Options);
+
+    public void Dispose() => _connection.Dispose();
 }
